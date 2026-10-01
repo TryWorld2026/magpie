@@ -1,0 +1,44 @@
+{
+  "summary": "新增 MAGPIE_PUBLIC_URL：设置页「关于」里的「网关地址」、网关页顶部的地址与「接入」一节（Base URL、密钥、示例代码）改为显示对外公布的地址；网关页的密钥与示例在开启局域网共享且地址不是回环地址时改用局域网密钥，而不是固定的 magpie。",
+  "scenes": [
+    {
+      "title": "设置页显示的网关地址",
+      "shots": [
+        {
+          "file": "01-settings-gateway-address.png",
+          "caption": "设置页「关于」里的「网关地址」一行与复制按钮",
+          "width": 2560
+        }
+      ]
+    },
+    {
+      "title": "网关页的地址与接入信息",
+      "shots": [
+        {
+          "file": "02-gateway-address.png",
+          "caption": "网关页顶部卡片上的网关地址",
+          "width": 2560
+        },
+        {
+          "file": "03-gateway-connect-openai.png",
+          "caption": "「接入」一节：Base URL、API 密钥、示例代码（OpenAI）",
+          "width": 2560
+        },
+        {
+          "file": "04-gateway-connect-anthropic.png",
+          "caption": "切到 Anthropic 后的「接入」一节",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒没有设置 MAGPIE_PUBLIC_URL，也没有开启局域网共享，所以设置页与网关页公布的都是本机地址 http://127.0.0.1:3430，示例里的密钥仍是 magpie——公开地址与局域网密钥这两处只有在设置了 MAGPIE_PUBLIC_URL（以及开启局域网共享并对外访问）时才会与改动前不同；命令行（web、models、serve）打印的地址不属于这些页面，录屏中看不到。",
+  "interactive": true,
+  "pages": 2
+}

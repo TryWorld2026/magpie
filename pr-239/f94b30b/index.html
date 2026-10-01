@@ -1,0 +1,19 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>#239 界面预览 · f94b30b</title>
+<style>:root{color-scheme:light dark;--bg:#f6f6f7;--fg:#1d1d1f;--muted:#6e6e73;--card:#fff;--line:#e5e5ea}
+@media (prefers-color-scheme:dark){:root{--bg:#111113;--fg:#f2f2f4;--muted:#9a9aa0;--card:#1c1c1f;--line:#2c2c30}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Noto Sans CJK SC",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:28px 16px 60px}h1{font-size:20px;margin:0 0 4px}.m{color:var(--muted);font-size:13px;margin:0 0 20px}
+video,img{display:block;width:100%;border-radius:10px;border:1px solid var(--line);background:var(--card)}figure{margin:0 0 28px}figcaption{color:var(--muted);font-size:13px;margin-top:8px}
+a{color:inherit}</style>
+<main><h1>#239 界面预览</h1><p class="m">commit f94b30b · <a href="https://github.com/yetone/magpie/pull/239">回到 PR</a> · 用量页的「请求」标签新增四项汇总、按 token/费用/请求数 × 模型/供应商/Agent 拆分的趋势图与排行、供应商筛选，以及可展开的请求详情（请求 ID、接口路径、错误原文、从 Agent 会话文件读到的输入输出），行上还有来源徽标与耗时配色；用量页头部新增刷新周期选择与立即刷新按钮，默认周期从 30 天改为「今天」、图表默认按模型拆分；托盘面板新增「用量」标签，用同一份接口画汇总、紧凑图表与排行，并可「打开用量」跳到对应供应商的请求。</p>
+<figure><video src="preview.mp4" controls autoplay muted playsinline poster="poster.png"></video><figcaption>红线是鼠标走过的轨迹，红色圆环是一次点击；底部文字是这一步在做什么。空格暂停，← → 逐段查看。</figcaption></figure>
+<figure><img src="01-requests-dashboard.png" alt="用量页的「请求」：汇总、趋势图与排行"><figcaption>请求页的汇总、图表与拆分 · 用量页的「请求」：汇总、趋势图与排行</figcaption></figure>
+<figure><img src="02-chart-tooltip.png" alt="指针停在趋势图上时的浮层"><figcaption>请求页的汇总、图表与拆分 · 指针停在趋势图上时的浮层</figcaption></figure>
+<figure><img src="03-split-by-provider.png" alt="拆分维度切到「供应商」后的图表与排行"><figcaption>请求页的汇总、图表与拆分 · 拆分维度切到「供应商」后的图表与排行</figcaption></figure>
+<figure><img src="04-refresh-period-menu.png" alt="「刷新周期」选择器展开时的用量页头部"><figcaption>刷新周期与请求详情 · 「刷新周期」选择器展开时的用量页头部</figcaption></figure>
+<figure><img src="05-request-detail.png" alt="展开的请求详情：请求 ID、接口路径与内容"><figcaption>刷新周期与请求详情 · 展开的请求详情：请求 ID、接口路径与内容</figcaption></figure>
+<figure><img src="06-request-detail-collapsed.png" alt="收起后的请求列表"><figcaption>刷新周期与请求详情 · 收起后的请求列表</figcaption></figure>
+<figure><img src="07-panel-usage-today.png" alt="面板「用量」标签：汇总、紧凑图表与排行"><figcaption>托盘面板的用量标签 · 面板「用量」标签：汇总、紧凑图表与排行</figcaption></figure>
+<figure><img src="08-panel-usage-7d.png" alt="切到 7 天后的面板「用量」标签"><figcaption>托盘面板的用量标签 · 切到 7 天后的面板「用量」标签</figcaption></figure>
+</main></html>

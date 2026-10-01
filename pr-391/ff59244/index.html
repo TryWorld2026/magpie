@@ -1,0 +1,16 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>#391 界面预览 · ff59244</title>
+<style>:root{color-scheme:light dark;--bg:#f6f6f7;--fg:#1d1d1f;--muted:#6e6e73;--card:#fff;--line:#e5e5ea}
+@media (prefers-color-scheme:dark){:root{--bg:#111113;--fg:#f2f2f4;--muted:#9a9aa0;--card:#1c1c1f;--line:#2c2c30}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Noto Sans CJK SC",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:28px 16px 60px}h1{font-size:20px;margin:0 0 4px}.m{color:var(--muted);font-size:13px;margin:0 0 20px}
+video,img{display:block;width:100%;border-radius:10px;border:1px solid var(--line);background:var(--card)}figure{margin:0 0 28px}figcaption{color:var(--muted);font-size:13px;margin-top:8px}
+a{color:inherit}</style>
+<main><h1>#391 界面预览</h1><p class="m">commit ff59244 · <a href="https://github.com/yetone/magpie/pull/391">回到 PR</a> · 这次改动只作用于浏览器里的 web 模式：小屏/触屏下顶栏导航独占一行并可横向滚动、控件放大到约 44px，用量页筛选换行、请求搜索独占一行，设置偏好、供应商表单、接入表单和路由组编辑器在窄屏改为单列堆叠，路由组标签在 web 下不再隐藏；另外模型选择浮层限制在视口内、触屏上不再自动聚焦搜索框，触屏 web 保留原生惯性滚动，移动端不再收缩顶栏。没有新增页面、标签或按钮。</p>
+<figure><video src="preview.mp4" controls autoplay muted playsinline poster="poster.png"></video><figcaption>红线是鼠标走过的轨迹，红色圆环是一次点击；底部文字是这一步在做什么。空格暂停，← → 逐段查看。</figcaption></figure>
+<figure><img src="01-model-picker.png" alt="打开后的模型选择器浮层"><figcaption>模型选择器浮层 · 打开后的模型选择器浮层</figcaption></figure>
+<figure><img src="02-model-picker-filtered.png" alt="输入过滤词后的模型列表"><figcaption>模型选择器浮层 · 输入过滤词后的模型列表</figcaption></figure>
+<figure><img src="03-usage-requests-head.png" alt="请求标签下的筛选行与搜索框"><figcaption>用量页的请求筛选 · 请求标签下的筛选行与搜索框</figcaption></figure>
+<figure><img src="04-usage-requests-list.png" alt="滚动后的请求列表"><figcaption>用量页的请求筛选 · 滚动后的请求列表</figcaption></figure>
+<figure><img src="05-routing-group-editor.png" alt="打开后的路由组编辑器"><figcaption>路由组编辑器 · 打开后的路由组编辑器</figcaption></figure>
+</main></html>

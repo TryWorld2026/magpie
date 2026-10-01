@@ -1,0 +1,54 @@
+{
+  "summary": "这次改动只作用于浏览器里的 web 模式：小屏/触屏下顶栏导航独占一行并可横向滚动、控件放大到约 44px，用量页筛选换行、请求搜索独占一行，设置偏好、供应商表单、接入表单和路由组编辑器在窄屏改为单列堆叠，路由组标签在 web 下不再隐藏；另外模型选择浮层限制在视口内、触屏上不再自动聚焦搜索框，触屏 web 保留原生惯性滚动，移动端不再收缩顶栏。没有新增页面、标签或按钮。",
+  "scenes": [
+    {
+      "title": "模型选择器浮层",
+      "shots": [
+        {
+          "file": "01-model-picker.png",
+          "caption": "打开后的模型选择器浮层",
+          "width": 1120
+        },
+        {
+          "file": "02-model-picker-filtered.png",
+          "caption": "输入过滤词后的模型列表",
+          "width": 1120
+        }
+      ]
+    },
+    {
+      "title": "用量页的请求筛选",
+      "shots": [
+        {
+          "file": "03-usage-requests-head.png",
+          "caption": "请求标签下的筛选行与搜索框",
+          "width": 2560
+        },
+        {
+          "file": "04-usage-requests-list.png",
+          "caption": "滚动后的请求列表",
+          "width": 2560
+        }
+      ]
+    },
+    {
+      "title": "路由组编辑器",
+      "shots": [
+        {
+          "file": "05-routing-group-editor.png",
+          "caption": "打开后的路由组编辑器",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "录屏环境是 1280×800 的桌面浏览器、精确指针，两个媒体查询（max-width: 760px / pointer: coarse and max-width: 1024px）都不成立，所以本次看不到：顶栏导航独占一行的横向滚动、安全区内边距与 44px 触摸目标、设置偏好行/供应商表单/网关接入表单/模态编辑器的单列堆叠、用量筛选换行与请求搜索独占一行、模型选择器触屏下不自动聚焦、触摸惯性滚动不回跳、移动端不收缩顶栏。沙盒里也还没有已存在的路由组（路由页显示「还没有路由组」），因此 .rt-group 卡片在窄屏下的网格布局同样无法展示。",
+  "interactive": true,
+  "pages": 3
+}
