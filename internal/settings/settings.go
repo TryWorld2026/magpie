@@ -38,6 +38,10 @@ type Settings struct {
 	// rate (see internal/fx). A vendor's own balance, already in its own
 	// currency (a Chinese relay's ¥), is never touched by this.
 	Currency string `json:"currency,omitempty"`
+	// WesternUnits shortens a large count in K, M and B even when magpie
+	// speaks Chinese, which otherwise says it in 万 and 亿 (8000 万
+	// rather than 80M). It means nothing in English.
+	WesternUnits bool `json:"westernUnits,omitempty"`
 	// Dock keeps magpie in the Mac's Dock as well as the menu bar, for a
 	// menu bar too full to show its icon.
 	Dock bool `json:"dock,omitempty"`
@@ -146,6 +150,11 @@ type Settings struct {
 	// (#335) — but for two in one list that would read the same, which keep
 	// it (see provider.Labels).
 	PlainNames bool `json:"plainNames,omitempty"`
+	// PlainOwnNames, with PlainNames off, has those lists name a model the
+	// user gave a name of their own by that name alone, just as they wrote
+	// it (#92: "Opus 5.5", not "Opus 5.5 · Claude Code"), the vendor's names
+	// keeping their provider's after them (see provider.Labels).
+	PlainOwnNames bool `json:"plainOwnNames,omitempty"`
 	// TextSize is how large the window's and the tray panel's pages are
 	// drawn, in percent (one of TextSizes): the webviews' own zoom, as a
 	// browser's, so the text and everything around it grow together.
