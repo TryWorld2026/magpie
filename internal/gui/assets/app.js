@@ -11423,7 +11423,9 @@ function fitTop() {
   const top = $(".top"), nav = $("#nav"), brand = $(".brand"), actions = $(".actions");
   const fits = () => {
     const a = actions.getBoundingClientRect();
-    if (a.right > top.getBoundingClientRect().right - parseFloat(getComputedStyle(top).paddingRight)) return false;
+    // WebView2's fractional rectangles can put a fitting edge just past the
+    // padding boundary. Do not keep a wider window in its compact layout.
+    if (a.right > top.getBoundingClientRect().right - parseFloat(getComputedStyle(top).paddingRight) + 0.5) return false;
     const left = brand.offsetParent ? brand.getBoundingClientRect().right
       : top.getBoundingClientRect().left + parseFloat(getComputedStyle(top).paddingLeft);
     if (!nav?.offsetParent) return left + 8 <= a.left;
