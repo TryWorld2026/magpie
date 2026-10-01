@@ -16,7 +16,7 @@ func TestOptionalFieldValueErrorNotRetried(t *testing.T) {
 		}{
 			{"metadata-type", "metadata", `"invalid"`, `{"session":"synthetic"}`, `{"error":{"message":"Invalid value for \"metadata\": expected an object","type":"invalid_request_error"}}`, 400},
 			{"metadata-dict", "metadata", `"invalid"`, `{"session":"synthetic"}`, `{"message":{"detail":[{"type":"dict_type","loc":["body","metadata"],"msg":"Input should be a valid dictionary","input":"invalid"}]}}`, 422},
-			{"metadata-dict-status-prefix", "metadata", `"invalid"`, `{"session":"synthetic"}`, `[400] {"detail":[{"type":"dict_type","loc":["body","metadata"],"msg":"Input should be a valid dictionary","input":"Unknown name 'metadata': Cannot find field."}]}`, 400},
+			{"metadata-dict-status-prefix", "metadata", `"Unknown name 'metadata': Cannot find field."`, `{"session":"synthetic"}`, `[400] {"detail":[{"type":"dict_type","loc":["body","metadata"],"msg":"Input should be a valid dictionary","input":"Unknown name 'metadata': Cannot find field."}]}`, 400},
 			{"metadata-dict-litellm", "metadata", `"invalid"`, `{"session":"synthetic"}`, optionalFieldProxyFault("litellm", `{"detail":[{"type":"dict_type","loc":["body","metadata"],"msg":"Input should be a valid dictionary","input":"invalid"}]}`), 400},
 			{"metadata-dict-openrouter", "metadata", `"invalid"`, `{"session":"synthetic"}`, optionalFieldProxyFault("openrouter", `{"detail":[{"type":"dict_type","loc":["body","metadata"],"msg":"Input should be a valid dictionary","input":"invalid"}]}`), 400},
 			{"tier-value", "service_tier", `"priority"`, `"default"`, `{"error":{"message":"Unsupported value: 'service_tier' does not support 'priority' with this model.","param":"service_tier","code":"unsupported_value"}}`, 400},
