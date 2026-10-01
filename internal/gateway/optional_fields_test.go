@@ -16,6 +16,8 @@ func TestOptionalFieldValueErrorNotRetried(t *testing.T) {
 		}{
 			{"metadata-type", "metadata", `"invalid"`, `{"session":"synthetic"}`, `{"error":{"message":"Invalid value for \"metadata\": expected an object","type":"invalid_request_error"}}`, 400},
 			{"metadata-dict", "metadata", `"invalid"`, `{"session":"synthetic"}`, `{"message":{"detail":[{"type":"dict_type","loc":["body","metadata"],"msg":"Input should be a valid dictionary","input":"invalid"}]}}`, 422},
+			{"metadata-dict-litellm", "metadata", `"invalid"`, `{"session":"synthetic"}`, optionalFieldProxyFault("litellm", `{"detail":[{"type":"dict_type","loc":["body","metadata"],"msg":"Input should be a valid dictionary","input":"invalid"}]}`), 400},
+			{"metadata-dict-openrouter", "metadata", `"invalid"`, `{"session":"synthetic"}`, optionalFieldProxyFault("openrouter", `{"detail":[{"type":"dict_type","loc":["body","metadata"],"msg":"Input should be a valid dictionary","input":"invalid"}]}`), 400},
 			{"tier-value", "service_tier", `"priority"`, `"default"`, `{"error":{"message":"Unsupported value: 'service_tier' does not support 'priority' with this model.","param":"service_tier","code":"unsupported_value"}}`, 400},
 		} {
 			t.Run(string(proto)+"/"+tt.name, func(t *testing.T) {
@@ -57,6 +59,8 @@ func TestOptionalFieldUnsupportedRetried(t *testing.T) {
 			status      int
 		}{
 			{"mistral", `{"message":{"detail":[{"type":"extra_forbidden","loc":["body","store"],"msg":"Extra inputs are not permitted","input":false}]}}`, 422},
+			{"mistral-litellm", optionalFieldProxyFault("litellm", `{"object":"error","message":{"detail":[{"type":"extra_forbidden","loc":["body","store"],"msg":"Extra inputs are not permitted","input":false}]},"type":"invalid_request_error","param":null,"code":null}`), 400},
+			{"mistral-openrouter", optionalFieldProxyFault("openrouter", `{"object":"error","message":{"detail":[{"type":"extra_forbidden","loc":["body","store"],"msg":"Extra inputs are not permitted","input":false}]},"type":"invalid_request_error","param":null,"code":null}`), 400},
 			{"gemini", `{"error":{"message":"Invalid JSON payload received. Unknown name \"store\": Cannot find field.","code":400}}`, 400},
 			{"groq", `{"error":{"message":"The property 'store' is not supported","type":"invalid_request_error"}}`, 400},
 			{"openai", `{"error":{"message":"Unsupported parameter: 'store' is not supported with this model.","param":"store","code":"unsupported_parameter"}}`, 400},
@@ -167,12 +171,36 @@ func TestRefusedOptionalNamesOnlyUnsupportedFields(t *testing.T) {
 		{"server-error", `{"error":{"message":"Unknown name \"store\": Cannot find field."}}`, 500, nil},
 		{"required-field", `{"error":{"message":"Unknown name \"messages\": Cannot find field."}}`, 400, nil},
 	} {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := refusedOptional(tt.status, []byte(tt.reply), request); !slices.Equal(got, tt.want) {
-				t.Errorf("refused %v, want %v", got, tt.want)
-			}
-		})
+		for _, proxy := range []string{"direct", "litellm", "openrouter"} {
+			t.Run(tt.name+"/"+proxy, func(t *testing.T) {
+				reply := tt.reply
+				if proxy != "direct" {
+					reply = optionalFieldProxyFault(proxy, reply)
+				}
+				if got := refusedOptional(tt.status, []byte(reply), request); !slices.Equal(got, tt.want) {
+					t.Errorf("refused %v, want %v", got, tt.want)
+				}
+			})
+		}
 	}
+}
+
+// Proxies carry the vendor's JSON error as text, sometimes with prose after it.
+func optionalFieldProxyFault(proxy, raw string) string {
+	if proxy == "litellm" {
+		return string(mustJSON(map[string]any{"error": map[string]any{
+			"message": "litellm.BadRequestError: MistralException - " + raw + "\nSee provider docs.",
+			"type":    "invalid_request_error",
+		}}))
+	}
+	return string(mustJSON(map[string]any{"error": map[string]any{
+		"message": "Provider returned error",
+		"code":    400,
+		"metadata": map[string]any{
+			"provider_name": "synthetic",
+			"raw":           raw,
+		},
+	}}))
 }
 
 func optionalFieldAsk(proto provider.Protocol) (string, string) {

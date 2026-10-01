@@ -2107,6 +2107,15 @@ var rejectedOptionalField = regexp.MustCompile("(?i)(?:^|\\b(?:parameter|field|p
 func unsupportedOptionalField(fault any, field string) bool {
 	switch v := fault.(type) {
 	case string:
+		// A proxy can embed the vendor's JSON error in prose. Prefer its
+		// structure to text matching, which could mistake an input echo
+		// or a different parameter's error for a refusal.
+		if i := strings.IndexAny(v, "{["); i >= 0 {
+			var inner any
+			if json.NewDecoder(strings.NewReader(v[i:])).Decode(&inner) == nil {
+				return unsupportedOptionalField(inner, field)
+			}
+		}
 		for _, match := range unknownOptionalField.FindAllStringSubmatchIndex(v, -1) {
 			if v[match[2]:match[3]] != field {
 				continue
@@ -2150,7 +2159,7 @@ func unsupportedOptionalField(fault any, field string) bool {
 		if v["code"] == "unsupported_parameter" && param == field {
 			return true
 		}
-		for _, key := range []string{"error", "message", "detail", "details", "errors", "description"} {
+		for _, key := range []string{"error", "message", "detail", "details", "errors", "description", "metadata", "raw"} {
 			if unsupportedOptionalField(v[key], field) {
 				return true
 			}
