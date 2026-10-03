@@ -12,7 +12,6 @@ func TestUpdateAutoKeepsCorruptSettings(t *testing.T) {
 	for _, tc := range []struct{ name, body string }{
 		{"truncated", `{"theme":"dark","githubToken":"SYNTHETIC_PRIVATE_TOKEN"`},
 		{"theme type", `{"theme":7,"githubToken":"SYNTHETIC_PRIVATE_TOKEN"}`},
-		{"empty", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			groupsHome(t)
@@ -30,6 +29,45 @@ func TestUpdateAutoKeepsCorruptSettings(t *testing.T) {
 				t.Errorf("the command overwrote the corrupt settings: %v", err)
 			}
 		})
+	}
+}
+
+func TestUpdateAutoRecoversEmptySettings(t *testing.T) {
+	for _, body := range []string{"", " \t\r\n", "\ufeff \t\r\n"} {
+		t.Run(body, func(t *testing.T) {
+			groupsHome(t)
+			if err := os.MkdirAll(settings.Dir(), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(settings.Path(), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := updateCmd([]string{"update", "auto", "off"}); err != nil {
+				t.Fatal(err)
+			}
+			if !settings.Load().NoAutoUpdate {
+				t.Fatal("the update preference was not saved")
+			}
+		})
+	}
+}
+
+func TestUpdateAutoWithBOMSettings(t *testing.T) {
+	groupsHome(t)
+	if err := os.MkdirAll(settings.Dir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const token = "SYNTHETIC_PRIVATE_TOKEN"
+	body := "\ufeff" + `{"theme":"dark","proxy":"direct","lang":"zh","githubToken":"` + token + `"}`
+	if err := os.WriteFile(settings.Path(), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := updateCmd([]string{"update", "auto", "off"}); err != nil {
+		t.Fatal(err)
+	}
+	got := settings.Load()
+	if !got.NoAutoUpdate || got.Theme != "dark" || got.Proxy != "direct" || got.Lang != "zh" || got.GitHubToken != token {
+		t.Fatal("the update command lost fields from the BOM file")
 	}
 }
 

@@ -17,7 +17,9 @@ func TestSaveKeepsCorruptSettings(t *testing.T) {
 		{"theme type", `{"theme":7,"githubToken":"` + token + `"}`},
 		{"proxy type", `{"proxy":7,"githubToken":"` + token + `"}`},
 		{"nested type", `{"otel":{"headers":7},"githubToken":"` + token + `"}`},
-		{"empty", ""},
+		{"BOM truncated", "\ufeff" + `{"theme":"dark","githubToken":"` + token + `"`},
+		{"BOM type", "\ufeff" + `{"theme":7,"githubToken":"` + token + `"}`},
+		{"non-JSON whitespace", "\u00a0" + `{"theme":"dark","githubToken":"` + token + `"}`},
 		{"array", `[]`},
 		{"trailing JSON", `{"theme":"dark"} {}`},
 	} {
@@ -65,6 +67,52 @@ func TestSaveKeepsCorruptSettings(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestSaveRecoversEmptySettings(t *testing.T) {
+	for _, body := range []string{"", " \t\r\n", "\ufeff", "\ufeff \t\r\n"} {
+		t.Run(body, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			if err := os.MkdirAll(Dir(), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(Path(), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			s := Load()
+			s.Theme, s.NoAutoUpdate = "light", true
+			if err := Save(s); err != nil {
+				t.Fatal(err)
+			}
+			if got := Load(); got.Theme != "light" || !got.NoAutoUpdate {
+				t.Fatal("the preference change was not saved to the empty file")
+			}
+		})
+	}
+}
+
+func TestSettingsBOM(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := os.MkdirAll(Dir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const token = "SYNTHETIC_PRIVATE_TOKEN"
+	body := "\ufeff" + ` {"theme":"dark","proxy":"direct","lang":"zh","githubToken":"` + token + `"}`
+	if err := os.WriteFile(Path(), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := Load()
+	if s.Theme != "dark" || s.Proxy != "direct" || s.Lang != "zh" || s.GitHubToken != token {
+		t.Error("loading a BOM file lost existing fields")
+	}
+	s.NoAutoUpdate = true
+	if err := Save(s); err != nil {
+		t.Fatal(err)
+	}
+	got := Load()
+	if !got.NoAutoUpdate || got.Theme != "dark" || got.Proxy != "direct" || got.Lang != "zh" || got.GitHubToken != token {
+		t.Fatal("editing a BOM file lost existing fields")
 	}
 }
 
