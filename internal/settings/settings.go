@@ -618,6 +618,16 @@ func Save(s Settings) error {
 	if len(s.TrayUsages) > 0 {
 		s.TrayUsage = s.TrayUsages[0]
 	}
+	// Load may have returned defaults or only part of an unreadable file.
+	// Do not replace it, including its permissions, with those values.
+	if b, err := os.ReadFile(Path()); err == nil {
+		var stored Settings
+		if err := json.Unmarshal(b, &stored); err != nil {
+			return fmt.Errorf("could not read settings at %s; repair or move that file aside before saving: %w", Path(), err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("could not read settings at %s: %w", Path(), err)
+	}
 	if err := os.MkdirAll(Dir(), 0o755); err != nil {
 		return err
 	}

@@ -1,10 +1,37 @@
 package main
 
 import (
+	"bytes"
+	"os"
 	"testing"
 
 	"github.com/yetone/magpie/internal/settings"
 )
+
+func TestUpdateAutoKeepsCorruptSettings(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"truncated", `{"theme":"dark","githubToken":"SYNTHETIC_PRIVATE_TOKEN"`},
+		{"theme type", `{"theme":7,"githubToken":"SYNTHETIC_PRIVATE_TOKEN"}`},
+		{"empty", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			groupsHome(t)
+			if err := os.MkdirAll(settings.Dir(), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			original := []byte(tc.body)
+			if err := os.WriteFile(settings.Path(), original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := updateCmd([]string{"update", "auto", "off"}); err == nil {
+				t.Error("the command reported success with corrupt settings")
+			}
+			if after, err := os.ReadFile(settings.Path()); err != nil || !bytes.Equal(after, original) {
+				t.Errorf("the command overwrote the corrupt settings: %v", err)
+			}
+		})
+	}
+}
 
 // magpie update auto turns the app's own update checks off and on and sets
 // how often they run, from the presets only (#472).
