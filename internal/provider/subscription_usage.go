@@ -56,7 +56,8 @@ type QuotaWindow struct {
 	Model string        `json:"-"`
 	Aside bool          `json:"-"`
 	// Capped is set, for the GUI only (WithCapped), on a window an
-	// account's usage cap counts: neither Aside nor one model's.
+	// account's usage cap counts: neither Aside nor unlimited. One model's
+	// own counts for that model (CapHeld), so it is marked like the rest.
 	Capped bool `json:"capped,omitempty"`
 	// matches further scopes pools whose membership isn't one model word.
 	matches func(string) bool
