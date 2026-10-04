@@ -60,9 +60,9 @@ func TestInstallsOnlyMissing(t *testing.T) {
 // line (#727, Sun1090): nvm and its LTS Node on a Mac or Linux, winget's
 // Node.js LTS on Windows; the vendors' own installers are as they were.
 func TestInstallCommandsWithoutNode(t *testing.T) {
-	nvm := `export NVM_DIR="$HOME/.nvm" && mkdir -p "$NVM_DIR" && curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/` + nvmVersion +
+	nvm := `export NVM_DIR="$HOME/.nvm" && mkdir -p "$NVM_DIR" && curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/` + nvmVersion +
 		`/install.sh | bash && . "$NVM_DIR/nvm.sh" && nvm install --lts && npm install -g `
-	winget := "winget install -e --id OpenJS.NodeJS.LTS; $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User'); npm.cmd install -g "
+	winget := "winget install -e --id OpenJS.NodeJS.LTS --accept-source-agreements --accept-package-agreements; $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User'); npm.cmd install -g "
 	for _, c := range []struct {
 		id, goos string
 		want     []InstallCmd
