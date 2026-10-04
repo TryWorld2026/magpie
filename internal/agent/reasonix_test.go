@@ -156,7 +156,7 @@ func TestReasonixRestoreKeepsLaterUserEdits(t *testing.T) {
 	}
 }
 
-func TestReasonixCLIRequiresMajorVersionTwo(t *testing.T) {
+func TestReasonixCLIRequiresSupportedNativeVersion(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "cmd", "reasonix"), 0o755); err != nil {
 		t.Fatal(err)
@@ -175,6 +175,7 @@ func TestReasonixCLIRequiresMajorVersionTwo(t *testing.T) {
 		if b, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("build fixture: %v %s", err, b)
 		}
+		warmReasonixCLIFixture(t, bin)
 		if got := reasonixCLI(bin); got != tc.want {
 			info, infoErr := buildinfo.ReadFile(bin)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -201,6 +202,7 @@ func TestReasonixCLIRecoversAfterProbeTimeout(t *testing.T) {
 		"cmd/reasonix/main.go": `package main
 import ("fmt"; "os"; "time")
 func main() {
+  if len(os.Args) > 1 && os.Args[1] == "--warmup" { return }
   marker := os.Getenv("REASONIX_TEST_PROBE_MARKER")
   if _, err := os.Stat(marker); os.IsNotExist(err) {
     os.WriteFile(marker, nil, 0600)
@@ -220,14 +222,29 @@ func main() {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build native probe: %v %s", err, out)
 	}
+	warmReasonixCLIFixture(t, bin)
 	if reasonixCLI(bin) {
 		t.Fatal("the initial slow probe should time out")
+	}
+	if _, err := os.Stat(os.Getenv("REASONIX_TEST_PROBE_MARKER")); err != nil {
+		t.Fatalf("the timed-out probe never reached the intentional delay: %v", err)
 	}
 	if !reasonixCLI(bin) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		out, err := proc.CommandContext(ctx, bin, "--version").CombinedOutput()
 		t.Fatalf("a transient timeout permanently hid the installed 2.x CLI; direct probe=%q (%v)", out, err)
+	}
+}
+
+// Separate a temporary executable's first launch from the version and timeout
+// assertions. Windows may delay that first launch beyond the probe budget.
+func warmReasonixCLIFixture(t *testing.T, bin string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if out, err := proc.CommandContext(ctx, bin, "--warmup").CombinedOutput(); err != nil {
+		t.Fatalf("start native CLI fixture: %v %s", err, out)
 	}
 }
 

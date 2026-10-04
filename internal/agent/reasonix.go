@@ -462,8 +462,13 @@ func reasonix(home string) *Agent {
 				state.Planner = cfg.Agent.Planner
 				state.PlannerManaged = true
 			}
-		} else if v != "" && !cfg.hasModel(v) {
-			return fmt.Errorf("Reasonix has no planner model %q", v)
+		} else if v != "" {
+			known := cfg.hasModel(v) || cfg.Agent.Planner != nil && *cfg.Agent.Planner == v ||
+				cfg.DefaultModel != nil && *cfg.DefaultModel == v ||
+				state != nil && (state.Planner != nil && *state.Planner == v || state.Default != nil && *state.Default == v)
+			if !known {
+				return fmt.Errorf("Reasonix has no planner model %q", v)
+			}
 		}
 		if v == "" && !off && state != nil && state.PlannerManaged && state.Planner != nil {
 			v = *state.Planner
@@ -496,7 +501,18 @@ func reasonix(home string) *Agent {
 	}}
 	options := planner.Options
 	planner.Options = func(cur map[string]string) []Option {
-		return append([]Option{{Value: "off", Label: "off", Note: "Disable the separate planner"}}, options(cur)...)
+		choices := options(cur)
+		cfg, state, _ := load()
+		addNative := func(ref *string) {
+			if ref != nil && *ref != "" && !usesMagpie(*ref) && !slices.ContainsFunc(choices, func(o Option) bool { return o.Value == *ref }) {
+				choices = append(choices, Option{Value: *ref, Icon: ModelIcon(*ref), Group: "Reasonix Studio"})
+			}
+		}
+		addNative(cfg.Agent.Planner)
+		if state != nil {
+			addNative(state.Planner)
+		}
+		return append([]Option{{Value: "off", Label: "off", Note: "Disable the separate planner"}}, choices...)
 	}
 	a.Fields[0].Label = "executor"
 	a.Fields = append(a.Fields, planner)

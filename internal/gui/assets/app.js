@@ -266,8 +266,8 @@ function renderAgents() {
       // effort, or the agent's own for its default, as the picker shows it
       else if (effort) b.append(effortIcon(f));
       else if (!f.value && !f.menu && a.icon) b.append(icon(a.icon));
-      else if (!wide(f) || !f.value || f.label === "executor" || f.label === "planner") b.append(el("span", "k", t(f.label)));
-      if ((f.label === "executor" || f.label === "planner") && (opt?.icon || opt?.icons?.length)) b.append(el("span", "k", t(f.label)));
+      else if (!wide(f) || !f.value) b.append(el("span", "k", t(f.label)));
+      if ((f.label === "executor" || f.label === "planner") && !b.querySelector(".k")) b.append(el("span", "k", t(f.label)));
       const shown = f.menu ? f.summary : effort ? effortName(opt || { value: f.value }) : (opt?.label || f.value || t(FOLLOWS_MODEL.includes(f.label) ? "same as model" : "default"));
       if (f.menu) b.title = f.options.map((o) => `${o.label}: ${o.note}`).join("\n");
       b.append(el("span", "v" + (f.value || f.custom ? "" : " empty"), shown));
@@ -1561,7 +1561,7 @@ function openPicker(agent, field, anchor, ev, only) {
     const main = agent.fields.find((f) => f.key === "model");
     options.unshift({ value: "", label: t("Same as model"), note: optionFor(main, main.value)?.label || main.value, icon: optionFor(main, main.value)?.icon, reset: true });
   } else if (!only && !field.menu && !field.onPick && !options.some((o) => o.value === "")) options.unshift({ value: "", label: t("Default"), note: t("what {agent} ships with", { agent: agent.name }), icon: agent.icon, reset: true });
-  const modelPicker = ["model", "small", "large", ...FOLLOWS_MODEL].includes(field.label) && !only;
+  const modelPicker = ["model", "small", "large", "executor", "planner", ...FOLLOWS_MODEL].includes(field.label) && !only;
   pick = { agent, field, options, anchor, cursor: 0, free: !only && !field.menu, modelPicker, effortPicker, groupFilter: "all" };
   anchor.classList.add("open");
   const pop = $("#pop");
@@ -1790,7 +1790,7 @@ function filter() {
   if (q) scored.sort((a, b) => b.s - a.s || a.i - b.i);
   pick.items = scored.map((x) => x.o);
   const typed = $("#q").value.trim();
-  if (typed && pick.free && ["model", "small", "large", ...FOLLOWS_MODEL].includes(pick.field.label) && !pick.items.some((o) => o.value === typed)) {
+  if (typed && pick.free && ["model", "small", "large", "executor", "planner", ...FOLLOWS_MODEL].includes(pick.field.label) && !pick.items.some((o) => o.value === typed)) {
     pick.items.push({ value: typed, note: t("use as typed"), custom: true });
   }
   // a model the filter finds among those kept for routing groups, which
