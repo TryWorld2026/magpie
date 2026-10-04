@@ -595,6 +595,9 @@ func hashes(b backup.Bundle) map[string]string {
 	if len(b.Order) > 0 { // as before it, when never arranged
 		providers = append(providers, map[string][]string{"order": b.Order})
 	}
+	if len(b.GroupOrder) > 0 { // as before it, when never arranged
+		providers = append(providers, map[string][]string{"groupOrder": b.GroupOrder})
+	}
 	return map[string]string{
 		"providers": h(providers),
 		"settings":  settingsHash,
@@ -662,7 +665,7 @@ func take(to *backup.Bundle, from backup.Bundle, part string) {
 			}
 			searches = &ss
 		}
-		to.Providers, to.Icons, to.Groups, to.Searches, to.Order = ps, from.Icons, from.Groups, searches, from.Order
+		to.Providers, to.Icons, to.Groups, to.Searches, to.Order, to.GroupOrder = ps, from.Icons, from.Groups, searches, from.Order, from.GroupOrder
 		to.ProvidersKeys = backup.Flag(keys || (to.ProvidersKeys != nil && *to.ProvidersKeys))
 		to.Keys = to.Keys || keys // the whole-bundle bit follows it, for a magpie that reads no per-part ones: it keeps the server's keys on its own upload then
 	case "settings":
@@ -755,6 +758,9 @@ func bring(b backup.Bundle, part string) error {
 			return err
 		}
 		if err := provider.MirrorOrder(b.Order); err != nil {
+			return err
+		}
+		if err := provider.MirrorGroupOrder(b.GroupOrder); err != nil {
 			return err
 		}
 		if b.Searches == nil { // from a magpie before them: the ones here stay

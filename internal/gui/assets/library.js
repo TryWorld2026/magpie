@@ -591,6 +591,9 @@
     ], tab, (id) => {
       tab = id;
       try { localStorage.setItem("magpie.libTab", id); } catch {}
+      // RTK's count read afresh each time its tab is opened: an agent run
+      // since adds to it (#741); the page keeps the last one until then
+      if (id === "rtk" && rtk) loadRTK();
       if (!lib) return page.querySelector(":scope > .lib-skel")?.replaceWith(skeleton(id));
       render(); syncLists();
     });
@@ -705,6 +708,10 @@
         ttl.append(ub);
       }
       card.append(ttl);
+      // an upgrade under way says what it runs; one that failed says why,
+      // with the tool's exit code and what it said, until the next try (#741)
+      if (rtkUpgrading && rtk.upgrade) card.append(el("p", "lib-rtk-gain", t("Running {cmd} — this can take a few minutes.", { cmd: rtk.upgrade })));
+      else if (rtkUpgradeErr) card.append(el("p", "lib-rtk-note lib-rtk-err", t("The upgrade failed: {why}", { why: rtkUpgradeErr })));
       if (rtk.note) card.append(el("p", "lib-rtk-note", rtk.note));
       // found where magpie looks, but not on the PATH the agents get: their
       // hooks run rtk by name, so it does nothing for them (#601)
@@ -725,10 +732,22 @@
         acts.append(button(t("Check again"), rtk.pathDir ? "" : "action", () => { rtk = null; render(); }));
         card.append(acts);
       }
+      // RTK's own count (rtk gain): every agent and terminal, all time —
+      // said on the page, so an empty one isn't read as magpie counting
+      // only some (#741); one rtk couldn't give says why
       const g = rtk.gain;
-      card.append(el("p", "lib-rtk-gain", g
+      const gain = el("p", "lib-rtk-gain", g
         ? t("{saved} tokens saved over {n} commands — {pct}% on average", { saved: tokens(g.saved), n: g.commands.toLocaleString(), pct: Math.round(g.pct) })
-        : t("Nothing saved yet: the agents' commands go through RTK once it's switched on and the agent is restarted.")));
+        : rtk.gainErr
+          ? t("magpie couldn't read what RTK saved: {why}", { why: rtk.gainErr })
+          : t("Nothing saved yet: the agents' commands go through RTK once it's switched on and the agent is restarted."));
+      gain.append(" ", el("span", "lib-rtk-scope", t("RTK's own count (rtk gain): every command run through RTK on this computer, from any agent or terminal.")));
+      card.append(gain);
+      // Codex's Windows sandbox: rtk runs there as another account, or one
+      // that can't write RTK's history, so what it saves isn't in that count
+      if (rtk.codexSandbox) card.append(el("p", "lib-rtk-note lib-rtk-sandbox", rtk.codexSandbox === "elevated"
+        ? t("Codex runs its commands in its Windows sandbox, as its own sandbox account: RTK keeps what it saves there in that account's history, not yours, so it isn't counted here.")
+        : t("Codex runs its commands in its Windows sandbox, which can't write RTK's history: what RTK saves there isn't recorded, so it isn't counted here.")));
       if (rtk.days?.length) card.append(rtkChart(rtk.days));
     } else {
       card.append(ttl);
@@ -857,18 +876,25 @@
     return false;
   }
   let rtkUpgrading = false;
+  let rtkUpgradeErr = ""; // why the last upgrade failed, shown on the card
   async function upgradeRTK() {
     rtkUpgrading = true;
+    rtkUpgradeErr = "";
     render();
+    let failed = false;
     try {
       rtk = await api("library/rtk/upgrade", {});
       if (rtk.note) status(rtk.note, "", 10000);
       else status(t("RTK is now {v}", { v: rtk.version }), "ok", 6000);
     } catch (e) {
-      status(e.message, "err", 10000);
+      failed = true;
+      rtkUpgradeErr = e.message;
+      status(t("RTK's upgrade failed — the RTK card says why"), "err", 10000);
     }
     rtkUpgrading = false;
     render();
+    // the version it left, whatever the installer said
+    if (failed) loadRTK();
   }
   let rtkPathing = false;
   async function pathRTK() {
@@ -1667,6 +1693,8 @@
     body.append(intro(t("A skill is a folder with a SKILL.md an agent loads when it's needed. The library keeps each one once and links it into the agents you pick.")));
     body.append(installCard());
     const all = skillAgents();
+    for (const n of picked) if (!skillNamed(n)) picked.delete(n);
+    if (lib.skills.length < 2) picking = false;
     if (lib.skills.length) {
       const rh = el("div", "row-head lib-skillshead");
       rh.append(el("span", "label", t("In the library")));
@@ -1675,7 +1703,7 @@
       const fresh = lib.skills.filter((s) => s.kind === "github" || s.origin);
       rh.append(el("span", "grow"));
       if (lib.skills.length > 1) rh.append(sortBy("libSkills", SKILL_SORTS(), () => { if (box.isConnected) drawSkills(box, all); }));
-      if (lib.skills.length > 1 && all.length) rh.append(...everySkillButtons(all));
+      if (lib.skills.length > 1 && all.length) rh.append(pickButton(), ...everySkillButtons(all));
       if (byAgentRows("skills").length) rh.append(byAgentButton("skills"));
       if (lib.skills.length > 1) rh.append(removeEverySkillButton());
       if (lib.skills.some((s) => s.kind === "github")) {
@@ -1710,6 +1738,7 @@
       body.append(rh);
       drawSkills(box, all);
       body.append(box);
+      if (picking) body.append(pickBar(all));
     }
     if (lib.foundSkills.length) {
       const rh = el("div", "row-head");
@@ -1753,6 +1782,8 @@
   // drawn, the rest is room kept for them, so a scroll through a thousand
   // skills draws a few rows now and then instead of laying out and painting
   // each as it comes into view.
+  let picking = false;         // the skills' rows have a box each, to pick some (#791)
+  const picked = new Set();    // the names picked
   let skillQuery = "";         // what the filter over the skills holds
   let skillTimer = 0;          // the filter's redraw, waiting for typing to pause
   const unfiltered = new Set(); // groups folded while filtering, till the filter changes
@@ -1895,7 +1926,7 @@
     }
     if (!cards.length) cards.push(el("div", "list lib-none", t("No skill matches “{q}”.", { q: skillQuery.trim() })));
     box.replaceChildren(...cards);
-    if (box.isConnected) syncLists();
+    if (box.isConnected) { syncLists(); if (picking) syncPicks(); } // the bar's All counts what the filter shows
   }
 
   // A group's list: its skills, or its parts, each a heading over its own.
@@ -1909,17 +1940,18 @@
       if (!ph.length) continue;
       const fk = g.key + "\n" + p.key;
       const folded = filtering ? unfiltered.has(fk) : folds[fk] ?? g.skills.length > MANY;
-      items.push({ key: ["p", p.key, folded, filtering, ph.length].join("\n"), h: SUB_H, make: () => partHead(g, p, ph, folded, filtering, fk, redraw) });
+      items.push({ key: ["p", p.key, folded, filtering, ph.length].join("\n"), h: SUB_H, make: () => partHead(g, p, ph, folded, filtering, fk, redraw, all) });
       if (!folded) for (const s of ph) items.push(row(s));
     }
     return items;
   }
 
-  function partHead(g, p, hits, folded, filtering, fk, redraw) {
+  function partHead(g, p, hits, folded, filtering, fk, redraw, all) {
     const head = el("div", "row lib-row click lib-subhead" + (folded ? "" : " open"));
     const chev = el("span", "chev");
     chev.append(svg(CHEV_R, 10, 1.7));
     const n = p.skills.length;
+    if (picking) head.append(pickAll(hits));
     head.append(chev, el("span", "name" + (p.mono && p.key ? " mono" : ""), p.label),
       el("span", "sub", filtering && hits.length !== n ? t("{n} of {total}", { n: hits.length, total: n }) : String(n)));
     // a dot when GitHub changed some of its skills
@@ -1928,6 +1960,11 @@
       const dot = el("span", "lib-dot");
       dot.title = stale === 1 ? t("1 skill has an update") : t("{n} skills have updates", { n: stale });
       head.append(dot);
+    }
+    // its skills on or off for an agent at once, as a group's are (#791)
+    if (all.length) {
+      const live = p.skills.map((s) => skillNamed(s.name) || s);
+      head.append(el("span", "grow"), groupChips(live, all, null));
     }
     head.title = folded ? t("Show its skills") : t("Hide its skills");
     head.onclick = () => {
@@ -1966,16 +2003,7 @@
       u.title = stale.length === 1 ? t("Fetch {name} from GitHub again", { name: stale[0].name }) : t("Fetch the {n} skills GitHub changed again", { n: stale.length });
       tags.append(u);
     }
-    // which agents have its skills, all of them or some
-    const have = el("div", "lib-have");
-    for (const a of all) {
-      const k = g.skills.filter((s) => s.agents.includes(a.id)).length;
-      if (!k) continue;
-      const i = agentIcon(a.icon);
-      i.title = k === n ? t("{agent} has all of them", { agent: a.name }) : t("{agent} has {n} of them", { agent: a.name, n: k });
-      if (k < n) i.classList.add("some");
-      have.append(i);
-    }
+    const have = groupChips(g.skills, all, g.repo || t("On this computer"));
     const acts = el("div", "lib-rowacts");
     if (g.repo) {
       const o = button("", "lib-icon", () => browse("https://github.com/" + g.repo));
@@ -1986,6 +2014,7 @@
     const chev = el("span", "chev");
     chev.append(svg(CHEV_R, 11, 1.7));
     const pic = g.repo ? mark(g.skills.find((s) => s.icon)?.icon, GLYPH.skill) : glyph(GLYPH.folder);
+    if (picking) head.append(pickAll(hits));
     head.append(pic, who, tags, have, acts, chev);
     head.title = folded ? t("Show its skills") : t("Hide its skills");
     head.onclick = () => {
@@ -1996,6 +2025,121 @@
     card.append(head);
     if (!folded) card.append(w.el);
     return card;
+  }
+
+  // A group's chips: which agents have its skills, all of them or some,
+  // and a click gives an agent every one of them or takes them all (#787,
+  // mintonight: a repository's skills were on or off one row at a time).
+  // A chip is lit when its agent has them all; one with some is half lit,
+  // and a click gives it the rest. All gives them to every agent shown.
+  // A part's chips (#791, mintonight: the lark-* skills of Feishu's pack
+  // on or off together) and a pick's are the same, said of so many skills
+  // rather than of a repository.
+  function groupChips(skills, all, repo) {
+    const n = skills.length, names = skills.map((s) => s.name);
+    const count = (id) => skills.filter((s) => s.agents?.includes(id)).length;
+    const full = all.filter((a) => count(a.id) === n).map((a) => a.id);
+    const box = agentChips(all, full, async (next) => {
+      const on = next.filter((id) => !full.includes(id)), off = full.filter((id) => !next.includes(id));
+      box.classList.add("busy");
+      try {
+        let v = null;
+        if (on.length) v = await api("library/skills/agents-some", { names, agents: on, on: true });
+        if (off.length) v = await api("library/skills/agents-some", { names, agents: off, on: false });
+        if (!v) return;
+        take(v);
+        const who = (ids) => ids.map(nameOf).join(", ");
+        report(v.result, repo != null
+          ? (on.length ? t("{repo}'s skills are on for {agents}", { repo, agents: who(on) }) : t("{repo}'s skills are off for {agents}", { repo, agents: who(off) }))
+          : n === 1 ? (on.length ? t("{name} is on for {agents}", { name: names[0], agents: who(on) }) : t("{name} is off for {agents}", { name: names[0], agents: who(off) }))
+          : on.length ? t("{n} skills are on for {agents}", { n, agents: who(on) }) : t("{n} skills are off for {agents}", { n, agents: who(off) }));
+      } catch (e) {
+        status(e.message, "err", 6000);
+      }
+      render();
+    }, { all: true });
+    box.classList.add("lib-groupchips");
+    for (const c of box.querySelectorAll(".lib-ag[data-agent]")) {
+      const a = all.find((x) => x.id === c.dataset.agent), k = count(a.id);
+      if (k && k < n) c.classList.add("some");
+      c.title = k === n ? t("{agent} has all of them — click to take them away", { agent: a.name })
+        : k ? t("{agent} has {n} of them — click to give it the rest", { agent: a.name, n: k })
+        : t("Give {agent} all of them", { agent: a.name });
+    }
+    const every = box.querySelector(".lib-ag.all");
+    if (every) every.title = every.classList.contains("on") ? t("Every agent has all of them — click to take them from every one") : t("Give all of them to every agent");
+    return box;
+  }
+
+  // ---------- some skills, picked, on or off at once ----------
+
+  // Select puts a box on each skill's row, and on each heading for the
+  // skills under it, and a bar under the list turns the ones picked on or
+  // off for an agent at once (#791, mintonight: 能不能支持多选来开启或关闭):
+  // its chips work as a group's do. Done takes the boxes away.
+  function pickButton() {
+    const b = button(picking ? t("Done") : t("Select"), "action lib-updall lib-select", () => {
+      picking = !picking;
+      picked.clear();
+      render();
+    });
+    b.title = picking ? t("Stop picking skills") : t("Pick some skills and turn them on or off together");
+    return b;
+  }
+
+  // the skills the filter shows, in every group, folded or not
+  function shownSkills() {
+    const q = skillQuery.trim().toLowerCase();
+    return skillGroups().flatMap((g) => (q ? g.skills.filter((s) => g.text.get(s).includes(q)) : g.skills));
+  }
+
+  // A box for some skills: ticked when they're all picked, half when some
+  // are; a click picks them all, or none when they all were.
+  function pickBox(names) {
+    const box = el("input", "lib-pickbox");
+    box.type = "checkbox";
+    box._names = names;
+    paintPick(box);
+    box.onclick = (e) => {
+      e.stopPropagation();
+      const every = names.length && names.every((n) => picked.has(n));
+      for (const n of names) if (every) picked.delete(n); else picked.add(n);
+      syncPicks();
+    };
+    return box;
+  }
+  const pickAll = (skills) => pickBox(skills.map((s) => s.name));
+  function paintPick(box) {
+    const k = box._names.filter((n) => picked.has(n)).length;
+    box.checked = k > 0 && k === box._names.length;
+    box.indeterminate = k > 0 && k < box._names.length;
+    const row = box.parentElement;
+    if (row?.classList.contains("lib-skill")) row.classList.toggle("picked", box.checked);
+  }
+  // every box drawn, and the bar, as the picks are now
+  function syncPicks() {
+    for (const b of page.querySelectorAll(".lib-pickbox")) paintPick(b);
+    const bar = page.querySelector(".lib-pickbar");
+    if (bar) bar.replaceWith(pickBar(skillAgents()));
+  }
+
+  function pickBar(all) {
+    const bar = el("div", "row lib-row lib-pickbar");
+    const shown = shownSkills(), q = skillQuery.trim();
+    const every = el("label", "lib-pickall");
+    every.append(pickAll(shown), el("span", "", q ? t("All {n} that match", { n: shown.length }) : t("All {n}", { n: shown.length })));
+    every.onclick = (e) => e.stopPropagation();
+    const skills = lib.skills.filter((s) => picked.has(s.name));
+    const n = skills.length;
+    bar.append(every, el("span", "lib-pickn" + (n ? "" : " none"), n ? t("{n} selected", { n }) : t("Pick skills to turn them on or off together")), el("span", "grow"));
+    if (n) {
+      bar.append(groupChips(skills, all, null));
+      const c = button(t("Clear"), "lib-updall lib-pickclear", () => { picked.clear(); syncPicks(); });
+      c.title = t("Unpick them all");
+      bar.append(c);
+    }
+    bar.append(button(t("Done"), "action lib-updall lib-pickdone", () => { picking = false; picked.clear(); render(); }));
+    return bar;
   }
 
   // ---------- a long list, drawn near the view first ----------
@@ -2819,6 +2963,14 @@
     rm.title = t("Remove");
     acts.append(rm);
     row.append(mark(s.icon, GLYPH.skill), who, acts, agentChips(all, s.agents, chipsChange("skills/agents", s.name, "skills", (x) => skillRow(x, all)), { problems: s.problems, via: viaFor(s), all: true, always: alwaysFor(s) }));
+    if (picking) {
+      const box = pickBox([s.name]);
+      row.prepend(box);
+      row.classList.toggle("picked", picked.has(s.name));
+      row.onclick = () => box.click();
+      row.title = t("Select {name}", { name: s.name });
+      return row;
+    }
     row.onclick = () => viewSkill(s);
     row.title = t("Read {name}'s SKILL.md", { name: s.name });
     return row;

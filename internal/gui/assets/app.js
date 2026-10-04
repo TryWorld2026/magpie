@@ -57,6 +57,7 @@ let importingApps = null; // the Import from other apps dialog: { sources, picks
 let flavor = params.get("flavor") || localStorage.getItem("magpie.flavor") || "openai"; // which API the snippets speak
 let lang = params.get("lang") || localStorage.getItem("magpie.lang") || "shell";        // which snippet
 let exampleModel = localStorage.getItem("magpie.model") || "";  // the model in the snippets
+let decideModel = localStorage.getItem("magpie.decideModel") || ""; // the System One snippets' decision model
 let connectFolded = false; // Connect folded away under its heading
 try { connectFolded = localStorage.getItem("magpie.gwConnectFolded") === "1"; } catch {}
 const expandedCalls = new Set(); // recent-call ids whose wire bodies are open
@@ -137,6 +138,8 @@ function keepIcons(...roots) {
     keptIcons.get(e.dataset.icon).push(e);
   }
 }
+const pngIcons = new Set(["crush", "zcode", "alma", "hanako", "cindy", "typesafe", "atomcode"]);
+
 function icon(name) {
   const kept = keptIcons?.get(name || "")?.shift();
   if (kept) { kept.removeAttribute("title"); return kept; }
@@ -158,9 +161,9 @@ function icon(name) {
     return e;
   }
   if (name) {
-    if (name.endsWith("-color") || name === "crush" || name === "zcode" || name === "alma" || name === "hanako" || name === "cindy" || name === "typesafe") {
+    if (name.endsWith("-color") || pngIcons.has(name)) {
       const img = el("img");
-      img.src = `icons/${name}.${name === "crush" || name === "zcode" || name === "alma" || name === "hanako" || name === "cindy" || name === "typesafe" ? "png" : "svg"}`;
+      img.src = `icons/${name}.${pngIcons.has(name) ? "png" : "svg"}`;
       img.alt = "";
       img.draggable = false;
       e.append(img);
@@ -1750,6 +1753,8 @@ function setAgentHidden(a, hide) {
 }
 
 const ALT = /^Mac/.test(navigator.platform) ? "⌥" : "Alt+";
+// the arrows of a row menu's Move up and Move down (agents, routing groups)
+const MOVE_UP = "M8 12.5v-9M4 7.25l4-3.75 4 3.75", MOVE_DOWN = "M8 3.5v9M4 8.75l4 3.75 4-3.75";
 const EYE_OFF = "M6.6 3.7A6.9 6.9 0 0 1 8 3.5c3.75 0 6.25 4.5 6.25 4.5a11 11 0 0 1-1.5 2M4.4 4.4C2.7 5.55 1.75 8 1.75 8S4.25 12.5 8 12.5c1.2 0 2.25-.45 3.1-1.05M6.75 6.75a1.75 1.75 0 0 0 2.5 2.5M2 2l12 12";
 const EYE = "M1.75 8S4.25 3.5 8 3.5 14.25 8 14.25 8 11.75 12.5 8 12.5 1.75 8 1.75 8ZM8 9.75a1.75 1.75 0 1 0 0-3.5 1.75 1.75 0 0 0 0 3.5Z";
 
@@ -2099,8 +2104,6 @@ async function openAgentModels(a, anchor, ev) {
   const reset = el("button", "am-reset", t("Show all"));
   hideAll.type = reset.type = "button";
   foot.append(el("span", "", t("New models are shown")), el("span", "sp"), hideAll, el("span", "am-dot", "·"), reset);
-  box.append(head, tools, list, foot);
-
   // groups as the catalog has them, routing groups first; a long one
   // starts folded, unless the agent is set to a model in it
   const groups = [];
@@ -2111,6 +2114,41 @@ async function openAgentModels(a, anchor, ev) {
   }
   groups.sort((x, y) => (y.name === ROUTING_GROUPS) - (x.name === ROUTING_GROUPS));
   const shut = new Set(groups.filter((g) => groups.length > 1 && g.models.length > 8 && !g.models.some((m) => m.inUse)).map((g) => g.name));
+  // with a few providers, a rail of them down the left: one picked shows
+  // its models alone, so a long list is one click away rather than a
+  // scroll down past the others (蓝猫 on Discord); a search looks in all
+  const railed = groups.length > 2 && innerWidth >= 600;
+  let pick = "";
+  const rail = el("div", "am-rail");
+  if (railed) {
+    const body = el("div", "am-body");
+    body.append(rail, list);
+    box.classList.add("railed");
+    box.append(head, tools, body, foot);
+  } else box.append(head, tools, list, foot);
+  const drawRail = () => {
+    if (!railed) return;
+    const top = rail.scrollTop;
+    rail.replaceChildren();
+    const item = (name, label, lead, on, n) => {
+      const b = el("button", "am-ri" + (pick === name ? " on" : ""));
+      b.type = "button";
+      b.setAttribute("aria-pressed", String(pick === name));
+      b.append(lead, el("span", "rn", label), el("span", "c", `${on}/${n}`));
+      b.title = label;
+      b.onclick = () => { pick = name; q.value = ""; list.scrollTop = 0; draw(); };
+      rail.append(b);
+    };
+    const all = el("span", "ic");
+    all.append(svg("M3 4.5h10M3 8h10M3 11.5h10", 14, 1.5));
+    item("", t("All providers"), all, models.filter((m) => !m.hidden).length, models.length);
+    for (const g of groups) {
+      const route = g.name === ROUTING_GROUPS;
+      item(g.name, route ? t(g.name) : g.name, route ? svg(FAN, 14, 1.5) : icon(g.icon || "generic"),
+        g.models.filter((m) => !m.hidden).length, g.models.length);
+    }
+    rail.scrollTop = top;
+  };
   // under "Shown", one just turned off stays until the view changes
   let onlyShown = false, kept = new Set();
 
@@ -2145,12 +2183,14 @@ async function openAgentModels(a, anchor, ev) {
     const top = list.scrollTop;
     list.replaceChildren();
     const words = q.value.trim().toLowerCase();
+    drawRail();
     for (const g of groups) {
+      if (pick && !words && g.name !== pick) continue;
       const rows = g.models.filter((m) => (!onlyShown || !m.hidden || kept.has(m.id)) &&
         (!words || [m.name, m.id, g.name].some((s) => s.toLowerCase().includes(words))));
       if (!rows.length) continue;
       const on = g.models.filter((m) => !m.hidden).length;
-      const folded = !words && shut.has(g.name);
+      const folded = !words && !pick && shut.has(g.name);
       const sec = el("section", "am-g" + (folded ? " shut" : "") + (g.name === ROUTING_GROUPS ? " routes" : ""));
       const gh = el("div", "am-gh");
       const fold = el("button", "am-fold");
@@ -2244,7 +2284,7 @@ async function openAgentModels(a, anchor, ev) {
   document.body.append(box);
   // under the line, or over it where there's no room; the list scrolls
   const r = anchor.getBoundingClientRect(), pad = 8;
-  const w = Math.min(380, innerWidth - pad * 2);
+  const w = Math.min(railed ? 580 : 380, innerWidth - pad * 2);
   box.style.width = w + "px";
   const x = Math.max(pad, Math.min(r.left - 10, innerWidth - w - pad));
   box.style.left = x + "px";
@@ -2300,8 +2340,8 @@ function openAgentMenu(anchor, a, inFold) {
     : inFold
     ? [{ name: "Hide", icon: EYE_OFF, run: () => setAgentHidden(a, true) }]
     : [
-        { name: "Move up", icon: "M8 12.5v-9M4 7.25l4-3.75 4 3.75", key: ALT + "↑", off: i <= 0, run: () => moveAgent(a.id, i - 1) },
-        { name: "Move down", icon: "M8 3.5v9M4 8.75l4 3.75 4-3.75", key: ALT + "↓", off: i < 0 || i >= shown.length - 1, run: () => moveAgent(a.id, i + 1) },
+        { name: "Move up", icon: MOVE_UP, key: ALT + "↑", off: i <= 0, run: () => moveAgent(a.id, i - 1) },
+        { name: "Move down", icon: MOVE_DOWN, key: ALT + "↓", off: i < 0 || i >= shown.length - 1, run: () => moveAgent(a.id, i + 1) },
         // for a config rewritten in a way magpie can't see: set it again anyway
         ...(reapply ? [{ name: "Apply again", icon: REAPPLY, sep: true, run: () => reapplyAgent(a) }] : []),
         ...(a.drift?.kind === "replaced" ? [{ name: "Keep current settings", icon: CHECK, run: () => keepAgent(a) }] : []),
@@ -4224,7 +4264,7 @@ function renderMovable() {
   card.setAttribute("role", "note");
   const body = el("div", "dep-body");
   body.append(el("div", "dep-head", ps.length > 1 ? t("These built-in subscriptions are deprecated: {names}", { names }) : t("{name}'s built-in subscription is deprecated", { name: names })),
-    el("p", "dep-why", [t(DEPRECATED_WHY), t("Moving keeps your accounts, models and agents as they are.")].join(locale === "zh" ? "" : " ")));
+    el("p", "dep-why", [t(DEPRECATED_WHY), t("Moving keeps your accounts, models and agents as they are.")].join(locale === "zh" || locale === "ja" ? "" : " ")));
   const acts = el("div", "dep-acts");
   const hide = el("button", "text", t("Not now"));
   hide.title = t("Hide this until another deprecated subscription is signed in");
@@ -4372,7 +4412,7 @@ function accountPlan(a) {
 
 // ---------- gateway view ----------
 //
-// The gateway is one local endpoint speaking four APIs; this tab is the
+// The gateway is one local endpoint speaking five APIs; this tab is the
 // page that gets anything else connected to it: base URL, key, model ids,
 // and a snippet in whichever language the reader is holding.
 
@@ -4513,7 +4553,7 @@ function renderGateway() {
   if (older) {
     who.append(name, el("div", "sub old", t("Agents' requests go through magpie {v} and are sent as it sends them, without this version's fixes. Quit that magpie (a magpie serve, another copy) and this one takes the gateway over within 15 seconds.", { v: g.version })));
   } else who.append(name, el("div", "sub", g.running
-    ? [t(g.models === 1 ? "{n} model" : "{n} models", { n: g.models }), n ? t(n === 1 ? "{n} agent routed through it" : "{n} agents routed through it", { n }) : t("no agent routed through it yet"), t("four APIs, one URL")].join(" · ")
+    ? [t(g.models === 1 ? "{n} model" : "{n} models", { n: g.models }), n ? t(n === 1 ? "{n} agent routed through it" : "{n} agents routed through it", { n }) : t("no agent routed through it yet"), t("five APIs, one URL")].join(" · ")
     : t("start it with magpie serve, or open magpie at login")));
   const url = el("button", "url");
   url.append(el("code", "", g.url));
@@ -4608,6 +4648,45 @@ const ai = new GoogleGenAI({
 const r = await ai.models.generateContent({ model: "${m}", contents: "hi" });
 console.log(r.text);`,
   },
+  // magpie's own System One API (ARNO on Discord: gateway添加system one
+  // api 有想法吗): a decision model — Jev, Clef, Bailian's — answers typed
+  // questions about a state; no SDK speaks it, so no shell variables
+  systemone: {
+    name: "System One", base: (u) => u + "/v1", decide: true,
+    note: "TypeSafe's decision API: a Jev or Clef model answers typed questions (choice, noul, score) about a state, with how sure it is. Clef also reads images: add \"images\": [\"data:image/png;base64,…\"].",
+    curl: (b, m, k = "magpie") => ({ url: `${b}/systemone`, headers: [`Authorization: Bearer ${k}`],
+      body: `{"model": "${m}",\n "state": {"message": "My order never arrived, refund it"},\n "questions": {"team": {"type": "choice",\n   "instructions": "Which team should answer the message?",\n   "criteria": {"billing": "Payments and refunds", "shipping": "Deliveries", "other": "Anything else"}}}}` }),
+    python: (b, m, k = "magpie") => `import requests
+
+r = requests.post("${b}/systemone",
+    headers={"Authorization": "Bearer ${k}"},
+    json={
+        "model": "${m}",
+        "state": {"message": "My order never arrived, refund it"},
+        "questions": {"team": {
+            "type": "choice",
+            "instructions": "Which team should answer the message?",
+            "criteria": {"billing": "Payments and refunds", "shipping": "Deliveries", "other": "Anything else"},
+        }},
+    })
+a = r.json()["answers"]["team"]
+print(a["choice"], a["confidence"])`,
+    node: (b, m, k = "magpie") => `const r = await fetch("${b}/systemone", {
+  method: "POST",
+  headers: { Authorization: "Bearer ${k}", "Content-Type": "application/json" },
+  body: JSON.stringify({
+    model: "${m}",
+    state: { message: "My order never arrived, refund it" },
+    questions: { team: {
+      type: "choice",
+      instructions: "Which team should answer the message?",
+      criteria: { billing: "Payments and refunds", shipping: "Deliveries", other: "Anything else" },
+    } },
+  }),
+});
+const a = (await r.json()).answers.team;
+console.log(a.choice, a.confidence);`,
+  },
 };
 // Windows gets PowerShell: $env: in place of export, and the curl.exe that
 // ships with it (plain curl there is Invoke-WebRequest). The body goes in
@@ -4624,6 +4703,9 @@ function curlSnippet({ url, headers, body }) {
 function envSnippet(vars) {
   return vars.map(([k, v]) => (WIN ? `$env:${k}="${v}"` : `export ${k}=${v}`)).join("\n");
 }
+
+// a decision model on the list: one only System One asks, never an agent
+const decideEntry = (m) => !m.group && !!m.provider?.id && decidesModel(m.provider, m.id.slice(m.provider.id.length + 1));
 
 // every exposed model, as the ids agents use
 function gatewayModels() {
@@ -4707,10 +4789,20 @@ function renderConnect() {
   const g = providers.gateway;
   const box = $("#connect");
   box.replaceChildren();
-  const models = gatewayModels();
-  if (!models.some((m) => m.id === exampleModel)) exampleModel = models[0]?.id || "";
-  const model = exampleModel || "provider/model";
   const f = FLAVORS[flavor] || FLAVORS.openai;
+  // System One's snippets take a decision model, the others any other
+  const models = gatewayModels().filter((m) => decideEntry(m) === !!f.decide);
+  let model;
+  if (f.decide) {
+    if (!models.some((m) => m.id === decideModel)) decideModel = models[0]?.id || "";
+    model = decideModel || "provider/jev-latest";
+  } else {
+    if (!models.some((m) => m.id === exampleModel)) exampleModel = models[0]?.id || "";
+    model = exampleModel || "provider/model";
+  }
+  // no SDK speaks System One, so it has no shell variables to set
+  const langs = f.baseEnv ? LANGS : LANGS.filter(([id]) => id !== "shell");
+  const snipLang = langs.some(([id]) => id === lang) ? lang : "curl";
   const urls = [g.url, ...(g.lanURLs || [])];
   if (!urls.includes(connectURL)) connectURL = g.url;
   const remote = connectURL !== g.url;
@@ -4744,7 +4836,7 @@ function renderConnect() {
     (u) => { connectURL = u; renderConnect(); }));
   else b.append(el("code", "", base));
   b.append(copyBtn(base, "Base URL"));
-  box.append(...field("Base URL", b, t("What {env} takes.", { env: f.baseEnv })));
+  box.append(...field("Base URL", b, f.baseEnv ? t("What {env} takes.", { env: f.baseEnv }) : t("Requests go to POST {url}.", { url: base + "/systemone" })));
 
   const k = el("div", "val");
   const options = keys.map((k) => ({ v: k.id, name: k.name, literalName: true, note: k.masked }));
@@ -4756,30 +4848,34 @@ function renderConnect() {
   else k.append(el("code", "", t("Create a gateway key above to connect")));
   if (key) k.append(copyCallerKeyBtn(key));
   else if (!remote) k.append(copyBtn("magpie", t("Key")));
-  box.append(...field(t(keyLabel), k, t(g.lan && (remote || gatewayKeys?.length)
+  box.append(...field(t(keyLabel), k, !f.keyEnv ? t(g.lan && (remote || gatewayKeys?.length)
+    ? "Choose a gateway key to send as Authorization: Bearer; usage is tracked by key."
+    : "Sent as Authorization: Bearer. The gateway trusts everything on loopback, so any value works.") : t(g.lan && (remote || gatewayKeys?.length)
     ? "Choose a gateway key to use as {env}; usage is tracked by key."
     : "{env}=magpie. The gateway trusts everything on loopback, so any value works.", { env: f.keyEnv })));
 
   const m = el("div", "val");
   m.append(el("code", "", model), copyBtn(model, t("Model id")));
-  box.append(...field(t("Model"), m, t(models.length ? "provider/model, as listed below. Click a model there to put it in the snippets." : "No models yet. Add a provider, or sign in to Codex or Copilot.")));
+  box.append(...field(t("Model"), m, f.decide
+    ? t(models.length ? "A decision model (Jev, Clef), as listed below. Click one there to put it in the snippets." : "No decision models yet. Add a System One, Jev or Workers AI provider.")
+    : t(models.length ? "provider/model, as listed below. Click a model there to put it in the snippets." : "No models yet. Add a provider, or sign in to Codex or Copilot.")));
 
   const ex = el("div", "stack");
-  ex.append(segs(LANGS, lang, (id) => { lang = id; localStorage.setItem("magpie.lang", id); renderConnect(); }));
+  ex.append(segs(langs, snipLang, (id) => { lang = id; localStorage.setItem("magpie.lang", id); renderConnect(); }));
   const code = !secret ? t(key ? "Loading gateway key…" : "Create a gateway key above to connect")
-    : lang === "shell" ? envSnippet([[f.baseEnv, base], [f.keyEnv, secret]])
-    : lang === "curl" ? curlSnippet(f.curl(base, model, secret))
-    : f[lang](base, model, secret);
+    : snipLang === "shell" ? envSnippet([[f.baseEnv, base], [f.keyEnv, secret]])
+    : snipLang === "curl" ? curlSnippet(f.curl(base, model, secret))
+    : f[snipLang](base, model, secret);
   const pre = el("pre", "snip");
   const c = el("code");
-  c.append(highlight(code, lang));
+  c.append(highlight(code, snipLang));
   pre.append(c);
   // the button sits outside the scrolling box, so a long line doesn't carry it off
   const wrap = el("div", "snip-wrap");
   wrap.append(pre);
   if (secret) wrap.append(copyBtn(code, t("Snippet")));
   ex.append(wrap);
-  box.append(...field(t("Example"), ex, lang === "shell" ? t("Put these in the shell (or the tool's settings) and the tool talks to magpie instead of the vendor.") : ""));
+  box.append(...field(t("Example"), ex, snipLang === "shell" ? t("Put these in the shell (or the tool's settings) and the tool talks to magpie instead of the vendor.") : ""));
 }
 
 // A small highlighter for the four snippet dialects: strings, comments,
@@ -4878,14 +4974,22 @@ function renderGatewayModels() {
     return;
   }
   for (const m of models) {
-    const row = el("div", "row model" + (m.id === exampleModel ? " selected" : ""));
+    const row = el("div", "row model" + (m.id === (FLAVORS[flavor]?.decide ? decideModel : exampleModel) ? " selected" : ""));
     const who = el("div", "who");
     const name = el("div", "name", m.id);
     if (namedFree(m.id, m.name)) name.append(freeBadge(false));
     who.append(name, el("div", "sub", m.name && m.name !== m.id.split("/")[1] ? `${m.name} · ${m.provider.name}` : m.provider.name));
     row.append(m.group ? stackIcon(m.icons) : icon(m.provider.icon || "generic"), who, modelInfo(m), copyBtn(m.id, t("Model id")));
     row.title = t("Use this model in the snippets");
-    row.onclick = () => { exampleModel = m.id; localStorage.setItem("magpie.model", m.id); renderConnect(); renderGatewayModels(); };
+    // a decision model is put in System One's snippets, any other in the
+    // other APIs'; the API follows the model clicked
+    row.onclick = () => {
+      const so = decideEntry(m);
+      if (so) { decideModel = m.id; localStorage.setItem("magpie.decideModel", m.id); }
+      else { exampleModel = m.id; localStorage.setItem("magpie.model", m.id); }
+      if (so !== !!FLAVORS[flavor]?.decide) { flavor = so ? "systemone" : "openai"; localStorage.setItem("magpie.flavor", flavor); }
+      renderConnect(); renderGatewayModels();
+    };
     list.append(row);
   }
 }
@@ -5629,6 +5733,10 @@ function pairTile(pr, cn) {
   return b;
 }
 
+// regionAt is the region of a preset a draft's endpoints are at, by its
+// chat URL (a new one's are the preset's own: its first region)
+const regionAt = (pr, d) => pr?.regions?.find((r) => r.chat && r.chat === (d?.chat || pr.chat));
+
 // the first provider made from a preset, which may not have the preset's id
 const presetProvider = (pr) => providers.providers.find((p) => p.preset === pr.id) || providers.providers.find((p) => p.id === pr.id);
 
@@ -5977,6 +6085,27 @@ const dot = (x, y) => `M${x - 1.4} ${y}a1.4 1.4 0 1 0 2.8 0a1.4 1.4 0 1 0 -2.8 0
 const FAN = [dot(2.9, 8), dot(13.1, 3.4), dot(13.1, 8), dot(13.1, 12.6),
   "M4.3 8h7.4", "M4.3 8c2.6 0 3.2-4.6 5.8-4.6h1.6", "M4.3 8c2.6 0 3.2 4.6 5.8 4.6h1.6"].join(" ");
 
+// Icons no preset uses, there to be picked for a provider of one's own
+// (Tom on X: Built-in icons 太少了): vendors' and platforms' marks from
+// lobehub/icons, as the presets' are.
+const MORE_ICONS = [
+  "ai21", "ai360-color", "alibaba-color", "alibabacloud-color", "anyscale-color", "aws",
+  "azureai-color", "baichuan-color", "baidu-color", "bailian-color", "baseten", "burncloud-color",
+  "bytedance-color", "cerebras", "chatglm-color", "chutes", "codebuddy-color", "cohere-color",
+  "cometapi-color", "copilot-color", "coze", "deepinfra-color", "deepmind-color", "doubao-color",
+  "featherless-color", "friendli", "gemma-color", "giteeai", "github", "glama", "gmicloud",
+  "google-color", "grok", "huawei-color", "huggingface-color", "hunyuan-color", "hyperbolic-color",
+  "iflytekcloud-color", "inference", "infinigence-color", "internlm-color", "jina", "kilocode",
+  "kling-color", "lambda", "leptonai-color", "liquid", "llmapi", "longcat", "metaai-color",
+  "microsoft-color", "monica-color", "morph-color", "nebius", "newapi-color", "nousresearch",
+  "nova-color", "novita-color", "openwebui", "parasail", "perplexity-color", "phala-color", "poe",
+  "ppio-color", "qiniu-color", "reka", "replicate", "roocode", "sambanova-color",
+  "sensenova-color", "snowflake-color", "sophnet-color", "spark-color", "straico-color",
+  "submodel-color", "targon-color", "tencent-color", "tiangong-color", "upstage-color",
+  "venice-color", "vertexai-color", "vllm-color", "voyage-color", "wenxin-color", "windsurf",
+  "workersai-color", "xiaomimimo", "xinference-color", "yi", "yuanbao-color", "zenmux", "zeroone"
+];
+
 function iconPicker(ed) {
   const box = el("div", "icon-pick");
   const draw = () => {
@@ -6036,7 +6165,16 @@ function iconPicker(ed) {
     }
     if (open) {
       const grid = el("div", "icon-grid");
-      const names = [...new Set((providers.presets || []).map((p) => p.icon).filter((n) => n && n !== "generic"))].sort();
+      const names = [...new Set([...(providers.presets || []).map((p) => p.icon), ...MORE_ICONS].filter((n) => n && n !== "generic"))]
+        .sort((a, b) => a.replace(/-color$/, "").localeCompare(b.replace(/-color$/, "")));
+      // well over a hundred of them: a vendor is found by its name
+      const find = input(seek, t("Find an icon…"));
+      find.onkeydown = (e) => e.stopPropagation();
+      find.oninput = () => {
+        seek = find.value;
+        const f = seek.trim().toLowerCase();
+        for (const b of grid.querySelectorAll("button")) b.hidden = !!f && !b.title.includes(f);
+      };
       for (const n of names) {
         const b = el("button", n === draft.icon ? "on" : "");
         b.title = n.replace(/-color$/, "");
@@ -6044,10 +6182,11 @@ function iconPicker(ed) {
         b.onclick = () => { draft.icon = n; open = false; draw(); syncHead(); };
         grid.append(b);
       }
-      box.append(grid);
+      box.append(find, grid);
+      find.oninput();
     }
   };
-  let open = false;
+  let open = false, seek = "";
   // the dialog's title shows the icon too
   const syncHead = () => {
     const old = ed.querySelector(".ehead .ic");
@@ -6295,8 +6434,15 @@ function drawEditor(p, presetID) {
     h.append(el("span", "grow"));
     // a plugin's provider has plugin://<id> for its base, and its id is no
     // address to open: only a host with a dot or a port makes a link
-    const site = pr?.website || p?.website || (/[.:]/.test(p?.host || "") ? "https://" + p.host : "");
-    if (site) { const b = el("button", "link", hostOf(site) + " ↗"); b.onclick = () => api("open", { url: site }); h.append(b); }
+    // a region with docs of its own (Tencent Cloud's plan and TokenHub) has
+    // its page here, following the region picked below
+    const site = regionAt(pr, draft)?.website || pr?.website || p?.website || (/[.:]/.test(p?.host || "") ? "https://" + p.host : "");
+    if (site) {
+      const b = el("button", "link site", hostOf(site) + " ↗");
+      b.dataset.url = site;
+      b.onclick = () => api("open", { url: b.dataset.url });
+      h.append(b);
+    }
     if (p) h.append(providerSwitch(p));
     ed.append(h);
     if (p?.off) ed.append(el("div", "hint off-note", t("Switched off: agents aren't given its models and no request goes to it. Its keys and settings are kept; switch it on to use it again.")));
@@ -6439,7 +6585,9 @@ function drawEditor(p, presetID) {
     // the sign-in belongs to the agent; magpie only borrows it
     const a = p.account;
     if (subOf(a.agent)) {
-      ed.append(...field(t("Accounts"), renderAccounts(a, p), p.routing ? t("Tick every account to use; Routing says how requests spread over them.") : subOf(a.agent).single ? t("{agent} keeps one account; the gateway runs it for every request. Signing in to another replaces it.", { agent: a.agentName }) : subOf(a.agent).own && (a.logins || []).some((l) => l.own) ? t("The gateway uses the first. Tick more and it moves on to the next when the one before it is out of quota. {agent} itself stays signed in as it is.", { agent: a.agentName && a.agentName !== a.agent ? a.agentName : p.name }) : subOf(a.agent).own || subOf(a.agent).plugin ? t("The gateway uses the first. Tick more and it moves on to the next when the one before it is out of quota.") : t("{agent} signs in to the first. Tick more and the gateway moves on to the next when the one before it is out of quota. Sessions already running keep theirs until restarted.", { agent: a.agentName })));
+      // no Claude Code on Windows: the gateway runs the one in WSL
+      const via = a.wsl ? t("Runs through WSL · {distro}: Claude Code there signs in and answers; Windows has none of its own.", { distro: a.wsl }) + " " : "";
+      ed.append(...field(t("Accounts"), renderAccounts(a, p), via + (p.routing ? t("Tick every account to use; Routing says how requests spread over them.") : subOf(a.agent).single ? t("{agent} keeps one account; the gateway runs it for every request. Signing in to another replaces it.", { agent: a.agentName }) : subOf(a.agent).own && (a.logins || []).some((l) => l.own) ? t("The gateway uses the first. Tick more and it moves on to the next when the one before it is out of quota. {agent} itself stays signed in as it is.", { agent: a.agentName && a.agentName !== a.agent ? a.agentName : p.name }) : subOf(a.agent).own || subOf(a.agent).plugin ? t("The gateway uses the first. Tick more and it moves on to the next when the one before it is out of quota.") : t("{agent} signs in to the first. Tick more and the gateway moves on to the next when the one before it is out of quota. Sessions already running keep theirs until restarted.", { agent: a.agentName }))));
       if ((a.logins || []).filter((l) => l.active || l.on).length > 1) ed.append(...renderRouting(p));
       if (p.move) ed.append(...renderMove(p));
     } else {
@@ -6624,12 +6772,17 @@ function drawEditor(p, presetID) {
   if (pr?.regions?.length) {
     // Bedrock's ten regions don't fit the editor's width: they scroll
     const seg = el("div", "segs regions");
-    const cur = pr.regions.find((r) => r.chat && r.chat === (draft.chat || pr.chat)) || pr.regions.find((r) => r.decide && (r.id === draft.region || (!draft.region && workspaceOf(r.decide, draft.decide ?? p?.decide ?? pr.decide) !== null))) || pr.regions[0];
+    const cur = regionAt(pr, draft) || pr.regions.find((r) => r.decide && (r.id === draft.region || (!draft.region && workspaceOf(r.decide, draft.decide ?? p?.decide ?? pr.decide) !== null))) || pr.regions[0];
     for (const r of pr.regions) {
       const b = el("button", "opt" + (r.id === cur.id ? " on" : ""), t(r.name));
       b.onclick = () => {
         draft.chat = r.chat || ""; draft.responses = r.responses || ""; draft.anthropic = r.anthropic || "";
         draft.keysUrl = r.keysUrl || "";
+        const site = ed.querySelector(".ehead .link.site");
+        if (site && pr.regions.some((x) => x.website)) {
+          site.dataset.url = r.website || pr.website;
+          site.textContent = hostOf(site.dataset.url) + " ↗";
+        }
         onRegion(r);
         for (const x of seg.querySelectorAll(".opt")) x.classList.toggle("on", x === b);
         slide(seg, "regions");
@@ -6844,7 +6997,9 @@ function contextsText(cx) {
 function contextPicks(p, cx) {
   const size = (n) => contextsText({ "*": n });
   const picks = [128e3, 200e3, 256e3, 1e6].map((n) => ({ label: size(n).toUpperCase(), value: size(n) }));
-  const big = (p?.models || []).filter((m) => m.max > (m.context || 0));
+  // above the window its vendor says, not the one set here: a model set to
+  // its most still offers it
+  const big = (p?.models || []).filter((m) => m.max > ("listed" in m ? m.listed || 0 : m.context || 0));
   if (big.length) {
     const tops = [...new Set(big.map((m) => m.max))];
     const value = () => {
@@ -7532,7 +7687,9 @@ function renderModels(p) {
     }, "API this model is asked on", "model-api-menu");
   };
   const menu = (c, id) => {
-    const noTest = decidesModel(p, id) ? modelTestWhy({ modelTest: "decide" }) : modelTestWhy(p);
+    // a decision model is asked a System One question where the server
+    // says its API takes one (decideTest)
+    const noTest = decidesModel(p, id) ? (p.decideTest ? "" : modelTestWhy({ modelTest: "decide" })) : modelTestWhy(p);
     if (!noTest) c.title = (c.title ? c.title + "\n" : "") + t("Right-click to test just this model");
     c.oncontextmenu = (e) => {
       e.preventDefault();
@@ -7542,6 +7699,9 @@ function renderModels(p) {
       if (again) return;
       const acts = [noTest ? { name: "Test this model", icon: "M5.5 3.75v8.5L12.25 8z", off: true, why: noTest, run() {} }
         : { name: "Test this model", icon: "M5.5 3.75v8.5L12.25 8z", run: () => testOne(id) }];
+      // its id as agents and the gateway name it, to paste where a model is
+      // typed (ARNO, Discord: 右击菜单除了测试模型外，还能添加拷贝模型id的功能)
+      acts.push({ name: "Copy model ID", icon: COPY_ICON, tip: id, run: () => copy(id, id, null, t("Model ID {model} copied", { model: id })) });
       if (apis.length && !decidesModel(p, id)) {
         const now = apiNow(id);
         acts.push({ name: now ? t("Asked on {api}…", { api: apiLabel(now) }) : t("Asked on: Auto…"), icon: "M2.5 5h11M2.5 11h11M10.5 2.5 13.5 5l-3 2.5M5.5 8.5 2.5 11l3 2.5", tip: t("Pick the API this model is asked on"), run: () => pickAPI(c, id) });
@@ -7820,11 +7980,18 @@ function renderModels(p) {
   }
   box.append(chips, names);
   const foot = el("div", "mfoot");
+  // a model the vendor's list leaves out is added by its id (Tom on X asked
+  // for this, not seeing the box alone was for it): typed, then Enter or Add
   const add = input(draft.typed || "", t("add a model id…"));
-  add.oninput = () => { draft.typed = add.value; };
+  const addOne = el("button", "text action", t("Add model"));
+  addOne.title = t("Add a model the list doesn't have, by its id (several: comma separated)");
+  addOne.disabled = !add.value.trim();
+  const take = () => { if (!add.value.trim()) return; draft.chosen = chosenIds(); draft.typed = add.value = ""; addOne.disabled = true; draw(); };
+  addOne.onclick = take;
+  add.oninput = () => { draft.typed = add.value; addOne.disabled = !add.value.trim(); };
   add.onkeydown = (e) => {
     e.stopPropagation();
-    if (e.key === "Enter" && add.value.trim()) { draft.chosen = chosenIds(); draft.typed = add.value = ""; draw(); }
+    if (e.key === "Enter") take();
     else if (e.key === "Escape") cancelEdit();
   };
   const refresh = el("button", "text action", t("Refresh"));
@@ -7849,7 +8016,7 @@ function renderModels(p) {
   const testAll = el("button", "text action", t("Test models"));
   testAll.title = t("Send a tiny request to each model agents see, to find the ones that don't answer") + "\n" + t("Right-click a model to test just it");
   testAll.onclick = async () => {
-    const ids = (draft.chosen.length ? draft.chosen : p.models.filter((m) => m.on).map((m) => m.id)).filter((id) => !decidesModel(p, id));
+    const ids = (draft.chosen.length ? draft.chosen : p.models.filter((m) => m.on).map((m) => m.id)).filter((id) => p.decideTest || !decidesModel(p, id));
     if (!ids.length) { status(t("Pick a model first."), "err"); return; }
     testAll.classList.add("busy");
     const got = modelTests[p.id] = {};
@@ -7883,7 +8050,7 @@ function renderModels(p) {
   const rename = el("button", "text action" + (naming === p.id ? " on" : ""), t("Names & levels"));
   rename.title = t("Rename the models agents see, or offer fewer of their reasoning levels");
   rename.onclick = () => { naming = naming === p.id ? null : p.id; rename.classList.toggle("on", naming === p.id); drawNames(); };
-  foot.append(add, refresh);
+  foot.append(add, addOne, refresh);
   if (noTest) { testAll.disabled = true; testAll.title = noTest; }
   foot.append(testAll);
   foot.append(rename);
@@ -8897,9 +9064,14 @@ function renderAccounts(a, p) {
     if (amPill) row.append(amPill);
     // its usage cap: the share of each window it is used to at most
     const cap = accountCapOf(p, l.user);
-    if (p) row.append(accountCapPill(p, l.user, cap));
+    // Claude Code or Codex signed in to it asks its vendor itself, not
+    // through magpie: with no other account to sign it in to, the cap
+    // holds back only what goes through magpie (𝕏 on Discord: a 90% cap
+    // and the five hours run to 100%)
+    const direct = l.active && !several && (a.agent === "claude" || a.agent === "codex") ? a.agentName : "";
+    if (p) row.append(accountCapPill(p, l.user, cap, direct));
     const held = capHeldOf(quota?.[l.user], cap);
-    if (held) row.append(capHeldNote(held, cap, several));
+    if (held) row.append(capHeldNote(held, cap, several, direct));
     row.append(el("span", "grow"));
     if (unusable(l)) {
       row.append(el("span", "using", t("Sign-in required")));
@@ -9348,19 +9520,46 @@ function accountCapOf(p, user) { return p?.accountCaps?.[String(user).toLowerCas
 function capHeldOf(q, cap) {
   if (!cap || !q || q.error || !q.windows?.length) return null;
   const now = Date.now();
-  let held = null, unknown = false;
+  // a window of some models only (Opus's week, a pool's) holds the account
+  // for those alone (#760): the account's own windows say when it is back
+  // when one of them holds it, else those windows do and are named
+  const all = { used: 0, back: 0, unknown: false, n: 0 }, some = { used: 0, back: 0, unknown: false, n: 0, names: [] };
   for (const w of q.windows) {
     if (!w.capped || w.used < cap) continue;
     const r = w.resetsAt ? Date.parse(w.resetsAt) : 0;
     if (r && r <= now) continue; // renewed since it was read
-    held = held || { used: 0, back: 0 };
-    held.used = Math.max(held.used, w.used);
-    if (!r) unknown = true; else held.back = Math.max(held.back, r);
+    const h = w.capsSome ? some : all;
+    h.n++;
+    h.used = Math.max(h.used, w.used);
+    if (w.capsSome && !some.names.includes(w.name)) some.names.push(w.name);
+    if (!r) h.unknown = true; else h.back = Math.max(h.back, r);
   }
-  if (held && unknown) held.back = 0;
-  return held;
+  const h = all.n ? all : some.n ? some : null;
+  return h && { used: h.used, back: h.unknown ? 0 : h.back, all: h === all, some: some.names };
 }
-function capHeldNote(held, cap, several) {
+// directNote: why the cap can't stop agent, signed in to the account and
+// asking its vendor itself, with no other account on to move it to
+function directNote(agent) {
+  return t("{agent} is signed in to this account and asks its vendor itself, not through magpie, so with no other account on to move it to, {agent} goes on using it past the cap. Add another account, or pick {agent}'s models via magpie, for the cap to hold it", { agent });
+}
+function capHeldNote(held, cap, several, direct) {
+  if (direct) {
+    // the account is held for what goes through magpie, but the agent
+    // signed in to it isn't: the note doesn't say it is safe at its cap
+    const n = el("span", "using acap-held acap-direct", t("At its cap · {agent} still uses it", { agent: direct }));
+    n.title = t("A usage window is at {n}%, past this account's {cap}% cap: requests through magpie are refused with a usage-cap error until it renews", { n: Math.round(held.used), cap })
+      + (held.back ? " · " + resetText(new Date(held.back), new Date(held.back).toLocaleString()) : "")
+      + "\n" + directNote(direct);
+    return n;
+  }
+  if (!held.all) {
+    const names = held.some.join(", ");
+    const n = el("span", "using acap-held", held.back ? t("{names} at its cap · back {in}", { names, in: untilText(held.back) }) : t("{names} at its cap", { names }));
+    n.title = t("{names} is at {n}%, past this account's {cap}% cap, so magpie sends the requests it counts to the other accounts until it renews; other models still use this account", { names, n: Math.round(held.used), cap })
+      + (held.back ? " · " + resetText(new Date(held.back), new Date(held.back).toLocaleString()) : "")
+      + (several ? "" : "\n" + t("With no other account on, those requests are refused with a usage-cap error until then"));
+    return n;
+  }
   const n = el("span", "using acap-held", held.back ? t("At its cap · back {in}", { in: untilText(held.back) }) : t("At its cap"));
   n.title = t("A usage window is at {n}%, past this account's {cap}% cap, so magpie counts it as used up and sends requests to the other accounts until that window renews", { n: Math.round(held.used), cap })
     + (held.back ? " · " + resetText(new Date(held.back), new Date(held.back).toLocaleString()) : "")
@@ -9375,11 +9574,12 @@ function capMark(track, w, cap) {
   track.classList.add("capped");
   track.append(mk);
 }
-function accountCapPill(p, user, cap) {
+function accountCapPill(p, user, cap, direct) {
   const pill = el("button", "acap" + (cap ? " set" : ""), cap ? t("Cap {n}%", { n: cap }) : t("No cap"));
   pill.type = "button";
-  pill.title = cap ? t("Used to {n}% of each usage window at most; past it, magpie counts this account as used up until the window renews. Click to change", { n: cap })
-    : t("Used to 100% of its usage windows. Click to cap it at a share of each, so magpie goes on to the other accounts past it");
+  pill.title = (cap ? t("Used to {n}% of each usage window at most; past it, magpie counts this account as used up until the window renews. Click to change", { n: cap })
+    : t("Used to 100% of its usage windows. Click to cap it at a share of each, so magpie goes on to the other accounts past it"))
+    + (direct ? "\n\n" + directNote(direct) : "");
   pill.setAttribute("aria-haspopup", "menu");
   pill.setAttribute("aria-expanded", "false");
   const set = (v) => accountAction("provider/accountcap", { id: p.id, account: user, cap: v },
@@ -9540,7 +9740,7 @@ async function setQuotaLeft(on) {
 // "tomorrow 09:00", "Thu 14:30" later this week (Monday to Sunday), else
 // "Oct 12 08:05": a bare weekday in next week read as this week's (#181).
 function resetClock(at, now = new Date()) {
-  const lang = locale === "zh" ? "zh-CN" : undefined;
+  const lang = intlLang();
   const time = at.toLocaleTimeString(lang, { hour: "2-digit", minute: "2-digit", hour12: false });
   const day = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
   const days = Math.round((day(at) - day(now)) / 864e5);
@@ -10571,8 +10771,8 @@ function creditDays(sub) {
     d.setDate(d.getDate() - i);
     list.push({ day: key(d), date: d, used: by.get(key(d)) || 0, known: key(d) >= since });
   }
-  const num = (v) => (Math.round(v * 100) / 100).toLocaleString(locale === "zh" ? "zh-CN" : undefined);
-  const dayName = (d) => d.toLocaleDateString(locale === "zh" ? "zh-CN" : undefined, { month: "short", day: "numeric" });
+  const num = (v) => (Math.round(v * 100) / 100).toLocaleString(intlLang());
+  const dayName = (d) => d.toLocaleDateString(intlLang(), { month: "short", day: "numeric" });
   const sum = list.reduce((a, d) => a + d.used, 0);
   const head = el("div", "cd-head");
   const name = el("span", "", t("Credits used per day"));
@@ -10706,7 +10906,7 @@ function quotaPaths(points, x0, x1, w, h) {
   return d;
 }
 function quotaTimeText(at, now) {
-  const d = new Date(at), lang = locale === "zh" ? "zh-CN" : undefined;
+  const d = new Date(at), lang = intlLang();
   if (Math.abs(at - now) < 60e3) return t("Now");
   const sameDay = d.toDateString() === new Date(now).toDateString();
   const time = d.toLocaleTimeString(lang, { hour: "2-digit", minute: "2-digit", hour12: false });
@@ -10743,6 +10943,8 @@ function quotaCurve(sub) {
   const head = el("div", "qc-head");
   const range = el("span", "qc-range");
   head.append(el("span", "", t("Left over time")), range);
+  // what the dashes are isn't plain from the plot (John on Discord asked)
+  box.title = t("Solid: what was left. Dashed: an even pace, full at the cycle's start to empty at its reset; a line above its dashes lasts the cycle, one below runs out before the reset.");
   const W = 300, H = 60;
   const g = sv("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none", class: "qc-plot", role: "img" });
   const axis = el("div", "qc-axis");
@@ -10802,7 +11004,7 @@ function quotaSpark(q, w) {
 // either (the vendor doesn't say which), as short as a panel row needs.
 function planTerm(q) {
   if (!q.until) return "";
-  const date = new Date(q.until).toLocaleDateString(locale === "zh" ? "zh-CN" : undefined, { month: "short", day: "numeric" });
+  const date = new Date(q.until).toLocaleDateString(intlLang(), { month: "short", day: "numeric" });
   return t(q.renew === "auto" ? "Renews {date}" : q.renew === "off" ? "Expires {date}" : "Until {date}", { date });
 }
 function planSpan(q) {
@@ -11860,9 +12062,11 @@ function renderUsage() {
   tile(fmtN(tokensOf(u)), t("tokens"), t("{a} in · {b} out", { a: fmtN(u.input), b: fmtN(u.output) }));
   // cache reads are billed at a fraction of input, so how much of the prompt
   // came from cache is the number that explains the bill; input here already
-  // excludes the cached tokens (the gateway subtracts them). The written
-  // count is secondary and only fits in the tooltip.
-  const promptTokens = u.input + u.cache_read;
+  // excludes the cached tokens, read and written (the gateway subtracts
+  // them), so what was written counts in the prompt too: left out, a prompt
+  // written to the cache again at every turn showed a rate near 100%. The
+  // written count is secondary and only fits in the tooltip.
+  const promptTokens = u.input + u.cache_read + u.cache_write;
   const hit = u.cache_read && promptTokens ? t("hit rate {p}", { p: Math.round(100 * u.cache_read / promptTokens) + "%" }) : "";
   tile(fmtN(u.cache_read), t("cache read"), hit, u.cache_write ? t("{n} written", { n: fmtN(u.cache_write) }) : "");
   tile(fmtN(u.reasoning), t("reasoning"), t("inside output"));
@@ -11876,17 +12080,19 @@ function renderUsage() {
   const labels = el("div", "labels");
   const n = u.series.length;
   const every = n <= 8 ? 1 : n <= 31 ? Math.ceil(n / 6) : Math.ceil(n / 5);
+  // the day in the reader's language (the label comes as "Sep 5" in every one)
+  const dayOf = (p) => u.bucket === "hour" || !p.time ? p.label : new Date(p.time).toLocaleDateString(intlLang() || "en", { month: "short", day: "numeric" });
   u.series.forEach((p, i) => {
     const b = el("div", "bar");
     const inp = el("i", "in"), out = el("i", "out");
     inp.style.height = (100 * p.input / peak).toFixed(1) + "%";
     out.style.height = (100 * p.output / peak).toFixed(1) + "%";
     b.append(out, inp);
-    const when = u.bucket === "hour" ? `${p.label}:00` : u.bucket === "week" ? t("week of {label}", { label: p.label }) : p.label;
+    const when = u.bucket === "hour" ? `${p.label}:00` : u.bucket === "week" ? t("week of {label}", { label: dayOf(p) }) : dayOf(p);
     b.title = p.calls ? t(p.calls === 1 ? "{when} · {tokens} tokens · {n} call" : "{when} · {tokens} tokens · {n} calls", { when, tokens: fmtN(tokensOf(p)), n: p.calls }) + (fmtCost(p) ? " · ≈" + fmtCost(p) : "") : t("{when} · nothing", { when });
     bars.append(b);
     const last = i === n - 1 && (n - 1) % every >= every / 2;
-    labels.append(el("span", "", i % every === 0 || last ? p.label : ""));
+    labels.append(el("span", "", i % every === 0 || last ? dayOf(p) : ""));
   });
   chart.append(el("div", "peak", fmtN(peak)), bars, labels);
   fitChartLabels();
@@ -11941,7 +12147,7 @@ function renderUsage() {
 // server pages it (/api/usage/requests) and saves it whole as CSV.
 
 let ledger = null; // the page shown: { rows, offset, total, agents, …totals }
-let ledOffset = 0, ledAgent = "", ledProvider = "", ledAccount = "", ledCallerKey = "", ledFailed = false, ledQuery = "", ledModel = "", ledRoute = 0, ledComputer = "", ledDay = "";
+let ledOffset = 0, ledPurpose = "", ledAgent = "", ledProvider = "", ledAccount = "", ledCallerKey = "", ledFailed = false, ledQuery = "", ledModel = "", ledRoute = 0, ledComputer = "", ledDay = "";
 
 // computerOpts are the Computer filter's choices: this computer, the others
 // together, and each other one, as sync shares their usage (#542); none
@@ -11963,10 +12169,10 @@ try {
 
 let ledRouteInfo = null, ledBeforeRoute = null;
 window.openUsageRoute = (route) => {
-  if (!ledBeforeRoute) ledBeforeRoute = { period, ledOffset, ledAgent, ledProvider, ledAccount, ledCallerKey, ledFailed, ledQuery, ledModel, ledComputer, ledDay };
+  if (!ledBeforeRoute) ledBeforeRoute = { period, ledOffset, ledPurpose, ledAgent, ledProvider, ledAccount, ledCallerKey, ledFailed, ledQuery, ledModel, ledComputer, ledDay };
   ledRoute = route.id;
   ledRouteInfo = route;
-  ledOffset = 0; ledAgent = ""; ledProvider = ""; ledAccount = ""; ledCallerKey = ""; ledFailed = false; ledQuery = ""; ledModel = ""; ledComputer = "";
+  ledOffset = 0; ledPurpose = ""; ledAgent = ""; ledProvider = ""; ledAccount = ""; ledCallerKey = ""; ledFailed = false; ledQuery = ""; ledModel = ""; ledComputer = "";
   ledDay = "";
   $("#ledQ").value = "";
   period = "all";
@@ -11979,6 +12185,7 @@ function ledParams(extra) {
   const q = new URLSearchParams({ period });
   if (ledDay) q.set("day", ledDay);
   if (ledAgent) q.set("agent", ledAgent);
+  if (ledPurpose) q.set("purpose", ledPurpose);
   if (ledProvider) q.set("provider", ledProvider);
   if (ledAccount) q.set("account", ledAccount);
   if (ledComputer) q.set("computer", ledComputer);
@@ -12020,13 +12227,13 @@ function renderLedgerLoading() {
   }
 }
 
-const ledNum = (n) => (n || 0).toLocaleString(locale === "zh" ? "zh-CN" : "en");
+const ledNum = (n) => (n || 0).toLocaleString(intlLang() || "en");
 const ledTook = (ms = 0) => ms < 1000 ? t("{n} ms", { n: ms }) : t("{n} s", { n: (ms / 1000).toFixed(ms < 10e3 ? 1 : 0) });
 function ledTime(when) {
   const d = new Date(when), now = new Date();
   const opts = { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false };
   if (d.toDateString() !== now.toDateString()) Object.assign(opts, { month: "short", day: "numeric" });
-  return d.toLocaleString(locale === "zh" ? "zh-CN" : "en", opts);
+  return d.toLocaleString(intlLang() || "en", opts);
 }
 // the model the reply named: amber, as the Routing page's tag, when it is
 // another than the one sent; plain when it is that one under a dated name,
@@ -12072,6 +12279,12 @@ function ledDetail(r, cols) {
   // model the conversation never picked reads as what it is (#714)
   if (r.kind) add("Called for", window.kindName ? window.kindName(r.kind) : r.kind);
   if (r.ttft_ms) add("First token", ledTook(r.ttft_ms));
+  // of it, magpie's own time before the request went to the vendor, and the
+  // vendor's wait from then to its first token
+  if (r.ttft_ms && r.sent_ms) {
+    add("In magpie", ledTook(r.sent_ms));
+    add("Vendor's first token", ledTook(Math.max(0, r.ttft_ms - r.sent_ms)));
+  }
   if (r.reasoning) add("Reasoning tokens", ledNum(r.reasoning));
   if (r.session_provider) add("Recorded provider ID", r.session_provider);
   if (r.session_account) add("Session account", r.session_account);
@@ -12240,7 +12453,7 @@ function ledCategories(l, split, metric) {
 
 // when a point is: the hour, the day or the week it stands for
 function ledWhen(p, bucket) {
-  const d = new Date(p.time), lang = locale === "zh" ? "zh-CN" : "en";
+  const d = new Date(p.time), lang = intlLang() || "en";
   if (bucket === "hour") return d.toLocaleString(lang, { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
   const day = d.toLocaleDateString(lang, { year: "numeric", month: "2-digit", day: "2-digit" });
   return bucket === "week" ? t("week of {label}", { label: day }) : day;
@@ -12248,7 +12461,7 @@ function ledWhen(p, bucket) {
 function ledTick(p, bucket) {
   const d = new Date(p.time);
   if (bucket === "hour") return String(d.getHours()).padStart(2, "0") + ":00";
-  return d.toLocaleDateString(locale === "zh" ? "zh-CN" : "en", { month: "numeric", day: "numeric" });
+  return d.toLocaleDateString(intlLang() || "en", { month: "numeric", day: "numeric" });
 }
 
 const SVGNS = "http://www.w3.org/2000/svg";
@@ -12599,7 +12812,9 @@ function renderLedger() {
     cost.title = l.unpriced ? t(l.unpriced === 1 ? "{n} call had no known price and is not counted" : "{n} calls had no known price and are not counted", { n: l.unpriced }) : t("Estimated using effective model prices, including custom prices");
   }
 
-  // the filters: the agents with calls in the period, and failures alone
+  // the filters: choices seen in the period, and failures alone
+  sessPick($("#ledPurpose"), "All purposes", ledPurpose, purposeOptions(l.purposes || [], ledPurpose), "Purpose", (v) => { ledPurpose = v; ledOffset = 0; loadLedger().catch((e) => status(e.message, "err")); });
+  $("#ledPurpose").title = t("Purpose");
   sessPick($("#ledComputer"), "All computers", ledComputer, computers, "Computer", (v) => { ledComputer = v; ledOffset = 0; loadLedger().catch((e) => status(e.message, "err")); });
   sessPick($("#ledAgent"), "All agents", ledAgent, l.agents.map((a) => ({ v: a.id, name: a.name, note: "" })), "Agent", (v) => { ledAgent = v; ledOffset = 0; loadLedger().catch((e) => status(e.message, "err")); });
   sessPick($("#ledProvider"), "All providers", ledProvider, providers.map((p) => ({ v: p.id, name: t(p.name), note: "" })), "Provider", (v) => { ledProvider = v; ledOffset = 0; loadLedger().catch((e) => status(e.message, "err")); });
@@ -12631,12 +12846,12 @@ function renderLedger() {
   $("#ledSum").textContent = sum.join(" · ");
   const routeFilter = $("#ledRoute");
   routeFilter.hidden = !ledRoute;
-  $("#ledRouteLabel").textContent = ledRouteInfo ? t("Request: {what}", { what: new Date(ledRouteInfo.time).toLocaleString(locale === "zh" ? "zh-CN" : "en") + " · " + ledRouteInfo.model }) : "";
+  $("#ledRouteLabel").textContent = ledRouteInfo ? t("Request: {what}", { what: new Date(ledRouteInfo.time).toLocaleString(intlLang() || "en") + " · " + ledRouteInfo.model }) : "";
   $("#ledRouteClear").title = t("Clear filter");
   $("#ledRouteClear").setAttribute("aria-label", t("Clear filter"));
   $("#ledRouteClear").onclick = () => {
     ledRoute = 0; ledRouteInfo = null;
-    if (ledBeforeRoute) ({ period, ledOffset, ledAgent, ledProvider, ledAccount = "", ledCallerKey, ledFailed, ledQuery, ledModel, ledComputer = "", ledDay = "" } = ledBeforeRoute);
+    if (ledBeforeRoute) ({ period, ledOffset, ledPurpose = "", ledAgent, ledProvider, ledAccount = "", ledCallerKey, ledFailed, ledQuery, ledModel, ledComputer = "", ledDay = "" } = ledBeforeRoute);
     ledBeforeRoute = null;
     $("#ledQ").value = ledQuery;
     loadLedger().catch((e) => status(e.message, "err"));
@@ -12647,7 +12862,7 @@ function renderLedger() {
   const pager = $("#ledPager");
   if (!l.total) {
     wrap.classList.add("none");
-    const filtered = ledDay || ledRoute || ledAgent || ledProvider || ledAccount || ledComputer || ledCallerKey || ledModel || ledFailed || ledQuery.trim();
+    const filtered = ledPurpose || ledDay || ledRoute || ledAgent || ledProvider || ledAccount || ledComputer || ledCallerKey || ledModel || ledFailed || ledQuery.trim();
     const none = { today: "No calls today.", "7d": "No calls in the last 7 days.", "30d": "No calls in the last 30 days.", all: "No calls yet." }[period];
     wrap.replaceChildren(el("div", "led-none", filtered ? t("No requests match these filters.") : t(none)));
     pager.hidden = true;
@@ -12679,7 +12894,7 @@ function renderLedger() {
       // the link opens the route, not the row's details as well
       when.onclick = (e) => { e.stopPropagation(); window.openRoute(r.route_id, r.t).catch((err) => status(err.message, "err")); };
     }
-    td(when, "when", new Date(r.t).toLocaleString(locale === "zh" ? "zh-CN" : "en"));
+    td(when, "when", new Date(r.t).toLocaleString(intlLang() || "en"));
     const who = el("span", "who");
     // an agent on another computer, whose magpie passed the request on
     const name = r.agentName || r.agent;
@@ -12839,7 +13054,6 @@ try {
 let sessStats = null; // { from, to, days: [{ date, usage, active }], agents } for sessRange
 let sessModel = ""; // "" for every model
 let sessFolder = ""; // "" for every folder
-const sessOpen = new Set(); // agent:id of the sessions opened to their details
 // the sessions of the range summed up under the filters, by the server:
 // { count, median, p90, days, top: { tokens, cost, active } }, and the
 // query it answers
@@ -13163,14 +13377,14 @@ function sessCost(s) {
 }
 function ago(when) {
   const sec = (new Date(when) - Date.now()) / 1000;
-  const rtf = new Intl.RelativeTimeFormat(locale === "zh" ? "zh-CN" : "en", { numeric: "auto" });
+  const rtf = new Intl.RelativeTimeFormat(intlLang() || "en", { numeric: "auto" });
   for (const [unit, n] of [["year", 31536000], ["month", 2592000], ["week", 604800], ["day", 86400], ["hour", 3600], ["minute", 60]]) {
     if (Math.abs(sec) >= n) return rtf.format(Math.round(sec / n), unit);
   }
   return t("just now");
 }
 function stamp(when) {
-  return new Date(when).toLocaleString(locale === "zh" ? "zh-CN" : undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  return new Date(when).toLocaleString(intlLang(), { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 const baseName = (p) => (p || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p;
 
@@ -13196,7 +13410,7 @@ function renderSessRange(loading) {
 // a "YYYY-MM-DD" as a local date, and back
 const sessDate = (d) => { const [y, m, day] = d.split("-").map(Number); return new Date(y, m - 1, day); };
 const sessISO = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-const sessDay = (d) => d.toLocaleDateString(locale === "zh" ? "zh-CN" : "en", { month: "short", day: "numeric" });
+const sessDay = (d) => d.toLocaleDateString(intlLang() || "en", { month: "short", day: "numeric" });
 // a length of time, as hours and minutes
 function fmtDur(sec) {
   const m = Math.round(sec / 60);
@@ -13405,7 +13619,8 @@ function renderSessions() {
       t("Tokens in and out per session: the middle session's, and what nine in ten stay under"), stale ? "stale" : "");
     tile(fmtN(tot.input + tot.output), t("tokens"), t("{a} in · {b} out", { a: fmtN(tot.input), b: fmtN(tot.output) }));
     tile(c ? "≈" + c : "—", t("cost"), t("at effective prices"), unpricedNote);
-    const prompt = tot.input + tot.cache_read;
+    // input leaves out what was read from the cache and written to it
+    const prompt = tot.input + tot.cache_read + tot.cache_write;
     tile(fmtN(tot.cache_read), t("cache read"), tot.cache_read && prompt ? t("hit rate {p}", { p: Math.round(100 * tot.cache_read / prompt) + "%" }) : "", tot.cache_write ? t("{n} written", { n: fmtN(tot.cache_write) }) : "");
     tile(active == null ? "—" : fmtDur(active), t("active"), active == null ? t("not kept by model") : t(days === 1 ? "on {n} day" : "on {n} days", { n: days }),
       t("The time the sessions were at work: the pauses between one message and the next, each under five minutes"));
@@ -13466,7 +13681,7 @@ function sessLegend() {
 }
 // the short names of the days of the week, Monday first
 function sessWeekdays() {
-  const loc = locale === "zh" ? "zh-CN" : "en";
+  const loc = intlLang() || "en";
   return Array.from({ length: 7 }, (_, i) => new Date(2024, 0, 1 + i).toLocaleDateString(loc, { weekday: "short" }));
 }
 function sessCardHead(title) {
@@ -13650,7 +13865,7 @@ function sessCalendar(days, value, tip, pad = 0) {
     l.style.gridArea = `${i + 2} / 1`;
     cal.append(l);
   }
-  const loc = locale === "zh" ? "zh-CN" : "en";
+  const loc = intlLang() || "en";
   let month = -1, labelAt = -9;
   // the days before the range, from the Monday it is laid out from: their
   // months named as the range's are, the days themselves left blank
@@ -14017,59 +14232,55 @@ function wslBadge(s) {
   return b;
 }
 
-function sessionItem(s) {
-  const key = sessKey(s);
-  const item = el("div", "sess-item" + (sessOpen.has(key) ? " open" : ""));
-  const r = el("div", "row sess");
-  r.append(icon(s.icon || "generic"));
-  const who = el("div", "who");
-  who.append(el("div", "name", s.title || t("(no prompt)")));
-  // where magpie's gateway sent its calls, the most first: a routing
-  // group's member and the reasoning it was asked for
-  const via = s.via?.length ? "→ " + [s.via[0].model, s.via[0].effort].filter(Boolean).join(" · ") + (s.via.length > 1 ? " +" + (s.via.length - 1) : "") : "";
-  const sub = el("div", "sub", [s.cwd ? baseName(s.cwd) : "", s.models.slice(0, 2).map((m) => m.model).join(", ") + (s.models.length > 2 ? " +" + (s.models.length - 2) : "") + (via ? " " + via : ""), ago(s.last)].filter(Boolean).join(" · "));
-  sub.title = [s.cwd, ...(s.via || []).map(viaText)].filter(Boolean).join("\n");
-  if (s.wsl) sub.prepend(wslBadge(s), " ");
-  who.append(sub);
-  r.append(who);
-  const num = el("div", "num");
-  num.append(el("b", "", fmtN(sessTokens(s))), el("small", "", t("{a} in · {b} out", { a: fmtN(s.input), b: fmtN(s.output) }) + (s.cache_read ? " · " + t("{n} cached", { n: fmtN(s.cache_read) }) : "")));
-  r.append(num);
+// sessSpent is a session's tokens and cost, as the two right-hand columns
+// of its row: the Usage page's list and the Sessions page's (#752)
+function sessSpent(s) {
+  const tokens = sessTokens(s);
+  const num = el("div", "num" + (tokens ? "" : " none"));
+  num.append(el("b", "", tokens ? fmtN(tokens) : "—"));
+  if (tokens) num.append(el("small", "", t("{a} in · {b} out", { a: fmtN(s.input), b: fmtN(s.output) }) + (s.cache_read ? " · " + t("{n} cached", { n: fmtN(s.cache_read) }) : "")));
   const sc = sessCost(s);
   const cost = el("div", "cost" + (sc === "—" ? " none" : ""), sc);
   if (sc === "—") cost.title = t("No known price for {models}", { models: s.models.map((m) => m.model).join(", ") || "—" });
   else if (s.unpriced) cost.title = t("Not counted: {models}, with no known price", { models: s.models.filter((m) => !m.priced).map((m) => m.model).join(", ") });
-  r.append(cost);
-  if (s.resume) {
-    const res = el("button", "sess-resume", t("Resume"));
-    res.title = t("Copy the command that resumes it: {cmd}", { cmd: s.resume });
-    res.onclick = async (ev) => {
-      ev.stopPropagation();
-      await copy(s.resume, t("Resume command"));
-      res.textContent = t("Copied");
-      res.classList.add("done");
-      clearTimeout(res.copiedT);
-      res.copiedT = setTimeout(() => { res.textContent = t("Resume"); res.classList.remove("done"); }, 1400);
-    };
-    r.append(res);
-    if (sessions?.terminal) {
-      const term = el("button", "copy sess-term");
-      term.title = t("Open in session terminal");
-      term.append(svg("M3 4.5 6 7.5 3 10.5M7.5 11.5h5.5", 13, 1.6));
-      term.onclick = (ev) => {
-        ev.stopPropagation();
-        api("sessions/terminal", { agent: s.agent, id: s.id }).then(() => status(t("Opening in session terminal"), "ok"), (e) => status(e.message, "err"));
-      };
-      r.append(term);
-    }
-  }
-  r.onclick = () => {
+  return [num, cost];
+}
+
+// sessModelsText: a session's models, the first two and how many more, and
+// where magpie's gateway sent its calls, the most first: a routing group's
+// member and the reasoning it was asked for
+function sessModelsText(s) {
+  const via = s.via?.length ? "→ " + [s.via[0].model, s.via[0].effort].filter(Boolean).join(" · ") + (s.via.length > 1 ? " +" + (s.via.length - 1) : "") : "";
+  return s.models.slice(0, 2).map((m) => m.model).join(", ") + (s.models.length > 2 ? " +" + (s.models.length - 2) : "") + (via ? " " + via : "");
+}
+
+// A row of the Usage page's list: what the session spent. It opens on the
+// Sessions page, where it is resumed, read in full and deleted (#752: the
+// two lists were one done twice, each lacking half).
+function sessionItem(s) {
+  const item = el("div", "sess-item");
+  const r = el("div", "row sess sess-link");
+  r.tabIndex = 0;
+  r.setAttribute("role", "link");
+  r.title = t("Open in Sessions");
+  r.append(icon(s.icon || "generic"));
+  const who = el("div", "who");
+  who.append(el("div", "name", s.title || t("(no prompt)")));
+  const sub = el("div", "sub", [s.cwd ? baseName(s.cwd) : "", sessModelsText(s), ago(s.last)].filter(Boolean).join(" · "));
+  sub.title = [s.cwd, ...(s.via || []).map(viaText)].filter(Boolean).join("\n");
+  if (s.wsl) sub.prepend(wslBadge(s), " ");
+  who.append(sub);
+  r.append(who, ...sessSpent(s));
+  const go = el("span", "sess-go");
+  go.append(svg(CHEV_R, 12, 1.6));
+  r.append(go);
+  const open = (e) => {
     if (window.getSelection()?.toString()) return;
-    if (sessOpen.has(key)) sessOpen.delete(key); else sessOpen.add(key);
-    item.replaceWith(sessionItem(s));
+    window.openSessionOnPage?.(s, e);
   };
+  r.onclick = open;
+  r.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(e); } };
   item.append(r);
-  if (sessOpen.has(key)) item.append(sessionDetail(s));
   return item;
 }
 
@@ -14093,7 +14304,16 @@ function sessionDetail(s) {
     l.append(el("span", "k", t("Resume")), code, copyBtn(s.resume, t("Resume command")));
     d.append(l);
   }
-  if (s.models.length) {
+  sessUsageDetail(d, s, line);
+  if (s.path) line(t("File"), s.path);
+  return d;
+}
+
+// sessUsageDetail adds to a session's details what it spent by model, and
+// what the gateway sent its calls to, at what reasoning; line(label, value)
+// adds a line of the details
+function sessUsageDetail(d, s, line) {
+  if (s.models?.length) {
     const m = el("div", "sess-models");
     for (const x of s.models) {
       m.append(el("span", "model", x.model),
@@ -14102,10 +14322,7 @@ function sessionDetail(s) {
     }
     d.append(m);
   }
-  // what the gateway sent the session's calls to, at what reasoning
   (s.via || []).forEach((v, i) => line(i ? "" : t("Routed"), viaText(v) + " · " + t("{n} tokens", { n: fmtN(v.tokens) })));
-  if (s.path) line(t("File"), s.path);
-  return d;
 }
 
 // one place a session's calls went through magpie, in words
@@ -14113,6 +14330,8 @@ function viaText(v) {
   return `${v.provider}/${v.model}` + (v.effort ? " · " + v.effort : "") + " · " + t("{n} calls", { n: v.calls });
 }
 
+// All sessions: the Sessions page, on the agent picked here if one is
+$("#sessAll").onclick = (e) => window.openSessionOnPage?.(sessAgent === "all" ? {} : { agent: sessAgent }, e);
 $("#sessQ").oninput = (e) => { sessQuery = e.target.value; if (sessions) renderSessions(); };
 $("#sessQ").onkeydown = (e) => { if (e.key === "Escape" && e.target.value) { e.stopPropagation(); e.target.value = ""; sessQuery = ""; if (sessions) renderSessions(); } };
 
@@ -14123,7 +14342,7 @@ $("#sessQ").onkeydown = (e) => { if (e.key === "Escape" && e.target.value) { e.s
 // the version, where magpie keeps its files, the gateway's address.
 
 const THEMES = [["system", "System"], ["light", "Light"], ["dark", "Dark"]];
-const LOCALES = [["system", "System"], ["en", "English"], ["zh", "中文"]];
+const LOCALES = [["system", "System"], ["en", "English"], ["zh", "中文"], ["ja", "日本語"]];
 const TRAYS = [["panel", "Quick panel"], ["window", "Main window"]];
 const CURRENCIES = [["usd", "$ USD"], ["cny", "¥ CNY"]];
 // The text size is the windows' own zoom, as a browser's Ctrl/Cmd +: the
@@ -14645,8 +14864,8 @@ function refreshAfterSync() {
 
 function syncWhen(iso) {
   const d = new Date(iso);
-  const time = d.toLocaleTimeString(locale === "zh" ? "zh-CN" : undefined, { hour: "2-digit", minute: "2-digit" });
-  return new Date().toDateString() === d.toDateString() ? t("at {time}", { time }) : d.toLocaleDateString(locale === "zh" ? "zh-CN" : undefined) + " " + time;
+  const time = d.toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit" });
+  return new Date().toDateString() === d.toDateString() ? t("at {time}", { time }) : d.toLocaleDateString(intlLang()) + " " + time;
 }
 
 function tick(label, on) {
@@ -14862,6 +15081,10 @@ function renderTrayUsage(s, keep) {
   // magpie's other models (#141)
   $("#codexAgentsV1Segs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]], s.codexAgentsV1 ? "on" : "off", (v) =>
     writingPrefs(api("settings/codex-agents-v1", { on: v === "on" })).then((ns) => { prefs = ns; renderSettings(); }).catch((e) => { status(t(e.message), "err"); renderSettings(); })));
+  // a 1M model's whole window, or compacting at the working one (X: Chen,
+  // 70–90s to a first token at 550K)
+  $("#fullContextSegs").replaceChildren(segs([["off", t("Compact at 272K")], ["on", t("Full window")]], s.fullContext ? "on" : "off", (v) =>
+    writingPrefs(api("settings/full-context", { on: v === "on" })).then((ns) => { prefs = ns; renderSettings(); }).catch((e) => { status(t(e.message), "err"); renderSettings(); })));
   renderCodexTitles(s);
   const rate = s.fx?.rate;
   const currencySub = $("#currencySub");
@@ -14911,6 +15134,10 @@ function renderTrayUsage(s, keep) {
   $("#trayLogosRow").hidden = !ids.length || !mac;
   $("#trayLogosSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]], s.trayNoLogos ? "off" : "on",
     (v) => savePrefs({ ...keep, trayNoLogos: v === "off" })));
+  // and beside magpie's icon or alone
+  $("#trayBirdRow").hidden = !ids.length || !mac;
+  $("#trayBirdSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]], s.trayNoBird ? "off" : "on",
+    (v) => savePrefs({ ...keep, trayNoBird: v === "off" })));
 }
 const TRAY_EVERY = [1, 3, 5, 10, 30];
 // how often magpie checks for updates by itself, in minutes (settings.UpdateEveries)
@@ -15246,7 +15473,31 @@ function renderSearch(s, keep) {
     const x = el("button", "text", t("Remove"));
     x.onclick = () => set({ vendor: a.vendor, remove: true });
     const what = [a.key || (a.ready ? "" : t("needs its key")), a.url].filter(Boolean).join(" · ");
-    row(`${n + 1}. ${a.name}`, what, x).classList.add("search-api");
+    const tools = [x];
+    if (a.key) {
+      // its saved key shown in its row and hidden again, as a provider's
+      // editor does (OnurBen on Discord)
+      const eye = el("button", "text search-eye", t("Show"));
+      eye.onclick = async () => {
+        const sub = r.querySelector(".sub");
+        if (eye.textContent === t("Show")) {
+          try { sub.textContent = [(await api("settings/search-key", { vendor: a.vendor })).key, a.url].filter(Boolean).join(" · "); } catch (e) { status(e.message, "err"); return; }
+          sub.classList.add("revealed");
+          eye.textContent = t("Hide");
+        } else {
+          sub.textContent = what;
+          sub.classList.remove("revealed");
+          eye.textContent = t("Show");
+        }
+      };
+      const cp = el("button", "text search-copy", t("Copy"));
+      cp.onclick = async () => {
+        try { copy((await api("settings/search-key", { vendor: a.vendor })).key, t("API key"), cp); } catch (e) { status(e.message, "err"); }
+      };
+      tools.unshift(eye, cp);
+    }
+    const r = row(`${n + 1}. ${a.name}`, what, ...tools);
+    r.classList.add("search-api");
   });
 }
 
@@ -15278,6 +15529,9 @@ function renderSearcher(s, keep, box) {
   const plans = choices.filter((c) => c.service).map((c) => c.name);
   if (plans.length) sub.append(" · ", el("span", "searcher-own",
     t("A Kimi Code plan ({names}) searches for its own models first, with its web search; for other models only when named here", { names: plans.join(", ") })));
+  const googles = choices.filter((c) => c.own).map((c) => c.name);
+  if (googles.length) sub.append(" · ", el("span", "searcher-own",
+    t("{names} search for their own models first, with Gemini's Google Search", { names: googles.join(", ") })));
   if (s.searchRelays?.length) sub.append(" · ", el("span", "searcher-relays",
     t("Relays said to search ({names}) are never picked automatically: they would spend the relay's quota on other models' searches; if one refuses magpie's own request, magpie falls back", { names: s.searchRelays.join(", ") })));
   who.append(el("div", "name", t("Searches for other models")), sub);
@@ -15687,7 +15941,7 @@ function prefsKeep(s) {
     redact: !!s.redact, redactPersonal: !!s.redactPersonal, redactWords: s.redactWords || [], codexWarmup: s.codexWarmup || "",
     claudeWarmup: s.claudeWarmup || "", codexWarmAt: s.codexWarmAt || "", claudeWarmAt: s.claudeWarmAt || "", workbuddyCheckin: !!s.workbuddyCheckin, traeCheckin: !!s.traeCheckin, noStats: !!s.noStats,
     noUpdatePill: !!s.noUpdatePill, noAutoUpdate: !!s.noAutoUpdate, updateEvery: s.updateEvery || 360,
-    trayUsage: s.trayUsage || "", trayUsageEvery: s.trayUsageEvery || 3, trayNoLogos: !!s.trayNoLogos, vision: s.vision || "", imageGen: s.imageGen || "", searcher: s.searcher || "", currency: s.currency || "usd",
+    trayUsage: s.trayUsage || "", trayUsageEvery: s.trayUsageEvery || 3, trayNoLogos: !!s.trayNoLogos, trayNoBird: !!s.trayNoBird, vision: s.vision || "", imageGen: s.imageGen || "", searcher: s.searcher || "", currency: s.currency || "usd",
     chineseUnits: !!s.chineseUnits, usageAlert: s.usageAlert || 0, balanceAlert: s.balanceAlert || 0 };
 }
 
@@ -16148,7 +16402,7 @@ function renderUsageEvery() {
   // on the Overview it reads the allowances again too (#486: they had a
   // Refresh of their own beside it)
   const what = usageTab === "usage" ? t("Refresh now, the allowances too; a Claude account's is read by running Claude Code's own /usage") : t("Refresh now");
-  r.title = usageReadAt ? what + " · " + t("Updated {time}", { time: new Date(usageReadAt).toLocaleTimeString(locale === "zh" ? "zh-CN" : undefined, { hour12: false }) }) : what;
+  r.title = usageReadAt ? what + " · " + t("Updated {time}", { time: new Date(usageReadAt).toLocaleTimeString(intlLang(), { hour12: false }) }) : what;
   r.setAttribute("aria-label", t("Refresh now"));
   r.onclick = async () => {
     r.classList.add("busy");
@@ -16438,9 +16692,10 @@ if (mode === "window" && params.get("view") === "usage") {
   quotaFocusUntil = performance.now() + 5000;
   ledProvider = params.get("provider") || "";
   ledAgent = params.get("agent") || "";
+  ledPurpose = params.get("purpose") || "";
   ledComputer = params.get("computer") || "";
   const u = new URL(location.href);
-  for (const k of ["tab", "provider", "agent", "computer", "card"]) u.searchParams.delete(k);
+  for (const k of ["tab", "provider", "agent", "computer", "card", "purpose"]) u.searchParams.delete(k);
   history.replaceState(null, "", u);
 }
 if (mode === "window" && ["providers", "gateway", "routing", "usage", "sessions", "library", "plugins", "settings"].includes(params.get("view"))) show(params.get("view"));

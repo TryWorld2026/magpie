@@ -32,6 +32,7 @@ type RequestPage struct {
 	Sum               Totals
 	Total             int
 	Agents, Providers []string
+	Purposes          []string // all purposes in the period, independent of the selected filter
 	CallerKeys        []Group
 	// Accounts are the subscription accounts that answered calls in the
 	// period, by provider and account, for the Account filter (#557)
@@ -53,6 +54,7 @@ type packedRow struct {
 	Text                           [27]uint32
 	Tokens                         [5]int64
 	Millis, TTFT, FirstText, Order int64
+	Sent                           int64
 	RouteID                        int64
 	Cost                           float64
 	Status                         int32
@@ -94,7 +96,7 @@ func (c *rowChunk) add(r Row, msg string, order int64, failed bool) {
 		c.Bytes += int64(len(s) + 48)
 		return id
 	}
-	p := packedRow{Time: r.Time, Tokens: [5]int64{int64(r.Input), int64(r.Output), int64(r.CacheRead), int64(r.CacheWrite), int64(r.Reasoning)}, Millis: r.Millis, TTFT: r.TTFT, FirstText: r.FirstText, Order: order, RouteID: r.RouteID, Cost: r.Cost, Status: int32(r.Status)}
+	p := packedRow{Time: r.Time, Tokens: [5]int64{int64(r.Input), int64(r.Output), int64(r.CacheRead), int64(r.CacheWrite), int64(r.Reasoning)}, Millis: r.Millis, TTFT: r.TTFT, FirstText: r.FirstText, Sent: r.Sent, Order: order, RouteID: r.RouteID, Cost: r.Cost, Status: int32(r.Status)}
 	for i, s := range rowText(&r) {
 		p.Text[i] = intern(*s)
 	}
@@ -126,7 +128,7 @@ func (c *rowChunk) add(r Row, msg string, order int64, failed bool) {
 }
 func (c *rowChunk) row(i int) Row {
 	p := &c.Rows[i]
-	r := Row{Record: Record{RouteID: p.RouteID, Time: p.Time, Input: int(p.Tokens[0]), Output: int(p.Tokens[1]), CacheRead: int(p.Tokens[2]), CacheWrite: int(p.Tokens[3]), Reasoning: int(p.Tokens[4]), Millis: p.Millis, TTFT: p.TTFT, FirstText: p.FirstText, Status: int(p.Status), Rejected: p.Flags&4 != 0, SessionOfficialLogin: p.Flags&8 != 0}, Cost: p.Cost, Priced: p.Flags&1 != 0, Swapped: p.Flags&2 != 0, Routed: p.Flags&32 != 0}
+	r := Row{Record: Record{RouteID: p.RouteID, Time: p.Time, Input: int(p.Tokens[0]), Output: int(p.Tokens[1]), CacheRead: int(p.Tokens[2]), CacheWrite: int(p.Tokens[3]), Reasoning: int(p.Tokens[4]), Millis: p.Millis, TTFT: p.TTFT, FirstText: p.FirstText, Sent: p.Sent, Status: int(p.Status), Rejected: p.Flags&4 != 0, SessionOfficialLogin: p.Flags&8 != 0}, Cost: p.Cost, Priced: p.Flags&1 != 0, Swapped: p.Flags&2 != 0, Routed: p.Flags&32 != 0}
 	for i, s := range rowText(&r) {
 		*s = c.Strings[p.Text[i]]
 	}
@@ -533,10 +535,14 @@ func visibleLocal(chunks []*rowChunk) map[rowRef]bool {
 
 // matchKey narrows candidates before comparing their end times. Request IDs
 // are consumed first; fallback matching still requires uniqueness both ways.
+// The agent isn't in it: a session's id names the one conversation, and a
+// client built on Codex (miyi-helper, say) is logged under its own name by
+// the gateway while its Codex session file names Codex, so its calls were
+// counted twice, once through magpie and once as not.
 type matchKey struct {
-	session, agent string
-	tokens         [3]int64
-	failed, hasID  bool
+	session       string
+	tokens        [3]int64
+	failed, hasID bool
 }
 
 // matchTokens is what a call's tokens are matched by: its input with what it
@@ -621,7 +627,7 @@ func matchedBlocks(gateways []*rowChunk, chunks []*rowChunk, skip map[rowRef]boo
 			if session == "" {
 				continue
 			}
-			key := matchKey{session, gateway.Strings[p.Text[0]], matchTokens(p.Tokens), p.Status >= 400 || p.Text[9] != 0, p.Text[11] != 0}
+			key := matchKey{session, matchTokens(p.Tokens), p.Status >= 400 || p.Text[9] != 0, p.Text[11] != 0}
 			g := groups[key]
 			if g == nil {
 				g = &matchGroup{}
@@ -645,7 +651,7 @@ func matchedBlocks(gateways []*rowChunk, chunks []*rowChunk, skip map[rowRef]boo
 			if p.Tokens[0]+p.Tokens[1]+p.Tokens[2]+p.Tokens[3] == 0 && !failed {
 				continue
 			}
-			key := matchKey{session: c.Strings[p.Text[13]], agent: c.Strings[p.Text[0]], tokens: matchTokens(p.Tokens), failed: failed}
+			key := matchKey{session: c.Strings[p.Text[13]], tokens: matchTokens(p.Tokens), failed: failed}
 			count, candidate := 0, (rowRef{})
 			// Without a local ID either gateway partition can match. With an ID,
 			// only an unnamed gateway call can match (different IDs stay distinct).
@@ -728,8 +734,9 @@ func buildRequestBlocks(p Period, f Filter, offset, limit int, gateways, chunks,
 			}
 		}
 	}
-	out := RequestPage{Rows: []Row{}, Agents: []string{}, Providers: []string{}, By: map[string][]Share{}}
+	out := RequestPage{Rows: []Row{}, Agents: []string{}, Providers: []string{}, Purposes: []string{}, By: map[string][]Share{}}
 	agents, providers := map[string]bool{}, map[string]bool{}
+	purposes := map[string]bool{}
 	callers := map[string]*Group{}
 	accounts := map[string]*Group{}
 	computers := map[string]*Share{}
@@ -757,6 +764,7 @@ func buildRequestBlocks(p Period, f Filter, offset, limit int, gateways, chunks,
 	var first time.Time
 	visit(func(ref rowRef, r Row) {
 		agents[r.Agent] = true
+		purposes[PurposeOf(r.Kind)] = true
 		if r.Provider != "" {
 			providers[r.Provider] = true
 		}
@@ -857,6 +865,10 @@ func buildRequestBlocks(p Period, f Filter, offset, limit int, gateways, chunks,
 		out.Providers = append(out.Providers, a)
 	}
 	slices.Sort(out.Providers)
+	for purpose := range purposes {
+		out.Purposes = append(out.Purposes, purpose)
+	}
+	slices.Sort(out.Purposes)
 	out.CallerKeys = callerGroups(callers)
 	out.Accounts = callerGroups(accounts)
 	for _, d := range Dimensions {
@@ -924,12 +936,18 @@ func buildRequestBlocks(p Period, f Filter, offset, limit int, gateways, chunks,
 }
 func pageFromLedger(p Period, f Filter, offset, limit int, all Ledgered) RequestPage {
 	l := all.Filtered(f)
-	out := RequestPage{Sum: l.Sum, Total: len(l.Rows), Agents: l.Agents, Providers: l.Providers, By: map[string][]Share{}}
+	out := RequestPage{Sum: l.Sum, Total: len(l.Rows), Agents: l.Agents, Providers: l.Providers, Purposes: []string{}, By: map[string][]Share{}}
 	callers, accounts := map[string]*Group{}, map[string]*Group{}
+	purposes := map[string]bool{}
 	for i := len(all.Rows) - 1; i >= 0; i-- {
+		purposes[PurposeOf(all.Rows[i].Kind)] = true
 		addCallerRow(callers, all.Rows[i])
 		addAccountRow(accounts, all.Rows[i])
 	}
+	for purpose := range purposes {
+		out.Purposes = append(out.Purposes, purpose)
+	}
+	slices.Sort(out.Purposes)
 	out.CallerKeys = callerGroups(callers)
 	out.Accounts = callerGroups(accounts)
 	offset = min(offset, len(l.Rows))
