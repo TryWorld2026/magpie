@@ -33,7 +33,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           const json = (data) => route.fulfill({ json: data });
           if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = {lang:"${lang}",theme:"light",web:true};` });
           if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
-          if (url.pathname === "/api/state") return json({ agents: [{ id: "reasonix", name: "Reasonix Studio", icon: "reasonix-color", path: "/fixture/config.toml", fields }], profiles: [], settings: { lang, theme: "light" } });
+          if (url.pathname === "/api/state") return json({ agents: [{ id: "reasonix", name: "Reasonix Studio", icon: "reasonix-color", path: "/fixture/config.toml", wired: fields.some((f) => f.value.startsWith("magpie/")), fields }], profiles: [], settings: { lang, theme: "light" } });
           if (url.pathname === "/api/providers") return json({ providers: [], gateway: { running: true, window: true } });
           if (url.pathname === "/api/groups") return json({ groups: [] });
           if (url.pathname === "/api/usage/quotas") return json([]);
@@ -57,11 +57,22 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         };
         await page.goto("http://magpie.test/" + (mode === "panel" ? "?mode=panel" : ""));
         await open();
-        for (const f of fields) {
+        if (mode === "window") {
+          assert.equal((await row.locator(".ag-start").textContent()).trim(), lang === "zh" ? "选模型" : "Pick a model");
+        } else for (const f of fields) {
           assert.equal(await row.locator(`.field[data-key="${f.key}"] > .k`).count(), 1, "a default role must be labelled once");
         }
         fields[0].value = "magpie/b/executor";
         fields[1].value = "magpie/b/planner";
+        // Either role keeps the connection while the other is on its default.
+        for (const f of fields) {
+          const selected = f.value;
+          f.value = "";
+          await page.reload();
+          await open();
+          assert.equal(await row.locator(`.field[data-key="${f.key}"] > .k`).count(), 1, "a connected default role must be labelled once");
+          f.value = selected;
+        }
         await page.reload();
         await open();
         for (const f of fields) {
