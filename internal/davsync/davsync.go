@@ -615,8 +615,9 @@ func orEmpty[V any](m map[string]V) map[string]V {
 func take(to *backup.Bundle, from backup.Bundle, part string) {
 	switch part {
 	case "providers":
+		keys := from.Keys || from.ProvidersKeys
 		ps := from.Providers
-		if !from.Keys && to.Keys { // sent without keys: keep the ones the server has
+		if !keys && (to.Keys || to.ProvidersKeys) { // sent without keys: keep the ones the server has
 			keys := map[string]provider.Provider{}
 			for _, p := range to.Providers {
 				keys[p.ID] = p
@@ -632,7 +633,7 @@ func take(to *backup.Bundle, from backup.Bundle, part string) {
 			}
 		}
 		searches := from.Searches
-		if searches != nil && !from.Keys && to.Keys && to.Searches != nil { // the same for the search APIs
+		if searches != nil && !keys && (to.Keys || to.ProvidersKeys) && to.Searches != nil { // the same for the search APIs
 			keys := map[string]string{}
 			for _, a := range *to.Searches {
 				keys[a.Vendor] = a.Key
@@ -646,7 +647,7 @@ func take(to *backup.Bundle, from backup.Bundle, part string) {
 			searches = &ss
 		}
 		to.Providers, to.Icons, to.Groups, to.Searches, to.Order = ps, from.Icons, from.Groups, searches, from.Order
-		to.Keys = to.Keys || from.Keys
+		to.ProvidersKeys = to.ProvidersKeys || keys
 	case "settings":
 		keys := from.Keys || from.SettingsKeys
 		s := from.Settings
@@ -673,11 +674,13 @@ func take(to *backup.Bundle, from backup.Bundle, part string) {
 	case "agents":
 		to.Agents = from.Agents
 	case "library":
+		keys := from.Keys || from.LibraryKeys
 		lib := from.Library
-		if lib != nil && !from.Keys && to.Keys { // sent without keys: keep the ones the server has
+		if lib != nil && !keys && (to.Keys || to.LibraryKeys) { // sent without keys: keep the ones the server has
 			lib = lib.WithSecrets(to.Library, backup.Secret)
 		}
 		to.Library = lib
+		to.LibraryKeys = to.LibraryKeys || keys
 	}
 }
 

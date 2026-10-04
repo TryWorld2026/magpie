@@ -65,7 +65,7 @@ type Bundle struct {
 	Version     int                        `json:"version"`
 	Created     time.Time                  `json:"created"`
 	App         string                     `json:"app,omitempty"` // the magpie that made it
-	Keys        bool                       `json:"keys"`          // whether credentials are included
+	Keys        bool                       `json:"keys"`          // whole-backup credential policy
 	Providers   []provider.Provider        `json:"providers"`
 	Icons       map[string][]byte          `json:"icons,omitempty"`  // pictures picked for providers, by file name
 	Groups      []provider.Group           `json:"groups,omitempty"` // the user's model groups
@@ -80,9 +80,11 @@ type Bundle struct {
 	// Order is the order the user put the providers in (#499), by id;
 	// none from a magpie before it went, or when they were never arranged.
 	Order []string `json:"order,omitempty"`
-	// SettingsKeys lets sync carry settings credentials without changing the
-	// other parts' Keys policy; absent from older backups and whole collects.
-	SettingsKeys bool `json:"settingsKeys,omitempty"`
+	// Sync can carry one part's credentials without changing the others'
+	// Keys policy; these are absent from older backups and whole collects.
+	ProvidersKeys bool `json:"providersKeys,omitempty"`
+	SettingsKeys  bool `json:"settingsKeys,omitempty"`
+	LibraryKeys   bool `json:"libraryKeys,omitempty"`
 }
 
 type envelope struct {
@@ -434,7 +436,7 @@ func Restore(b Bundle, parts Parts) (Result, error) {
 	}
 	if parts.Library && b.Library != nil {
 		lib := b.Library
-		if !b.Keys { // the servers' keys kept here stay
+		if !b.Keys && !b.LibraryKeys { // the servers' keys kept here stay
 			have, err := library.Collect()
 			if err != nil {
 				return r, err
