@@ -59,6 +59,10 @@ type QuotaWindow struct {
 	// account's usage cap counts: neither Aside nor unlimited. One model's
 	// own counts for that model (CapHeld), so it is marked like the rest.
 	Capped bool `json:"capped,omitempty"`
+	// CapsSome is set beside Capped on a window that counts some models
+	// only — one model's own, or a pool's — so the cap holds the account
+	// for those alone, and the GUI says which.
+	CapsSome bool `json:"capsSome,omitempty"`
 	// matches further scopes pools whose membership isn't one model word.
 	matches func(string) bool
 	// partial is set on the windows of a reading that may leave some out:

@@ -181,6 +181,7 @@ func WithCapped(m map[string]SubscriptionQuota) map[string]SubscriptionQuota {
 		ws := make([]QuotaWindow, len(q.Windows))
 		for i, w := range q.Windows {
 			w.Capped = !w.Aside && !w.Unlimited
+			w.CapsSome = w.Capped && (w.Model != "" || w.matches != nil)
 			ws[i] = w
 		}
 		if q.Windows != nil {

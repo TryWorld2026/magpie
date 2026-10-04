@@ -90,6 +90,9 @@ func TestWithCappedMarksPerModelWindows(t *testing.T) {
 	if !w[1].Capped {
 		t.Error("the window one model's own is not marked")
 	}
+	if w[0].CapsSome || !w[1].CapsSome {
+		t.Error("the window one model's own is not told from the account's")
+	}
 	if w[2].Capped {
 		t.Error("on-demand spending is marked")
 	}
