@@ -34,9 +34,12 @@ var reasonixKeyLine = regexp.MustCompile(`(?m)^\s*(?:export\s+)?` + reasonixKey 
 var reasonixEdits sync.RWMutex
 
 type reasonixConfig struct {
-	DefaultModel *string            `toml:"default_model"`
-	Providers    []reasonixProvider `toml:"providers"`
-	Desktop      struct {
+	DefaultModel *string `toml:"default_model"`
+	Agent        struct {
+		Planner *string `toml:"planner_model"`
+	} `toml:"agent"`
+	Providers []reasonixProvider `toml:"providers"`
+	Desktop   struct {
 		Access []string `toml:"provider_access"`
 	} `toml:"desktop"`
 }
@@ -66,11 +69,13 @@ type reasonixModel struct {
 // The journal contains settings, never an upstream credential. A separate file
 // per home makes portable Studio instances independent and participates in rollback.
 type reasonixState struct {
-	Version     int     `json:"version"`
-	Default     *string `json:"default_model"`
-	NewConfig   bool    `json:"new_config"`
-	NewEnv      bool    `json:"new_env"`
-	AddedAccess bool    `json:"added_access"`
+	Version        int     `json:"version"`
+	Planner        *string `json:"planner_model,omitempty"`
+	PlannerManaged bool    `json:"planner_managed,omitempty"`
+	Default        *string `json:"default_model"`
+	NewConfig      bool    `json:"new_config"`
+	NewEnv         bool    `json:"new_env"`
+	AddedAccess    bool    `json:"added_access"`
 }
 
 func reasonix(home string) *Agent {
@@ -163,6 +168,19 @@ func reasonix(home string) *Agent {
 		if err := checkOwner(cfg, state); err != nil {
 			return err
 		}
+		if cfg.Agent.Planner != nil && usesMagpie(*cfg.Agent.Planner) {
+			// Keep the connection while the independently selected Plan uses it.
+			if native != "" {
+				return edit.SetTOMLTopPreserving(path, edit.KV{Path: "default_model", Value: native})
+			}
+			if cfg.DefaultModel != nil && usesMagpie(*cfg.DefaultModel) {
+				if state.Default != nil {
+					return edit.SetTOMLTopPreserving(path, edit.KV{Path: "default_model", Value: *state.Default})
+				}
+				return edit.DelTOMLTop(path, "default_model")
+			}
+			return nil
+		}
 		if err := edit.DelTOMLArrayTable(path, "providers", "name", magpieID); err != nil {
 			return err
 		}
@@ -204,6 +222,47 @@ func reasonix(home string) *Agent {
 		}
 		return edit.Remove(statePath)
 	}
+	ensureGateway := func(cfg reasonixConfig, state **reasonixState, ref, selected string) error {
+		currentState := *state
+		models := magpieModels("reasonix")
+		if !slices.ContainsFunc(models, func(m catalog.Model) bool { return m.ID == ref }) {
+			return fmt.Errorf("magpie has no visible model %q", ref)
+		}
+		if err := checkOwner(cfg, currentState); err != nil {
+			return err
+		}
+		if currentState == nil {
+			_, cErr := os.Stat(path)
+			_, eErr := os.Stat(env)
+			currentState = &reasonixState{Version: 1, Default: cfg.DefaultModel, NewConfig: os.IsNotExist(cErr), NewEnv: os.IsNotExist(eErr)}
+			currentState.AddedAccess = cfg.Desktop.Access != nil && !slices.Contains(cfg.Desktop.Access, magpieID)
+		}
+		p := reasonixCatalog(models, selected, cfg.magpie().Effort)
+		if err := writeProvider(p); err != nil {
+			return err
+		}
+		if cfg.Desktop.Access != nil && !slices.Contains(cfg.Desktop.Access, magpieID) {
+			access := append(cfg.Desktop.Access, magpieID)
+			if err := edit.SetTOMLKey(path, "desktop", "provider_access", reasonixArray(access)); err != nil {
+				return err
+			}
+			currentState.AddedAccess = true
+		}
+		if token, _ := edit.GetEnvFile(env, reasonixKey); token != gateway.TokenFor("reasonix") {
+			if err := edit.SetEnvFile(env, edit.KV{Path: reasonixKey, Value: gateway.TokenFor("reasonix")}); err != nil {
+				return err
+			}
+		}
+		b, err := json.Marshal(currentState)
+		if err != nil {
+			return err
+		}
+		if err := edit.WriteAtomic(statePath, b); err != nil {
+			return err
+		}
+		*state = currentState
+		return nil
+	}
 	set := func(v string) error {
 		cfg, state, err := load()
 		if err != nil {
@@ -218,57 +277,32 @@ func reasonix(home string) *Agent {
 			}
 			return restore(cfg, state, v)
 		}
-		models := magpieModels("reasonix")
-		if !slices.ContainsFunc(models, func(m catalog.Model) bool { return m.ID == ref }) {
-			return fmt.Errorf("magpie has no visible model %q", ref)
-		}
-		if err := checkOwner(cfg, state); err != nil {
+		if err := ensureGateway(cfg, &state, ref, ref); err != nil {
 			return err
 		}
-		if state == nil {
-			_, cErr := os.Stat(path)
-			_, eErr := os.Stat(env)
-			state = &reasonixState{Version: 1, Default: cfg.DefaultModel, NewConfig: os.IsNotExist(cErr), NewEnv: os.IsNotExist(eErr)}
-			state.AddedAccess = cfg.Desktop.Access != nil && !slices.Contains(cfg.Desktop.Access, magpieID)
-		}
-		p := reasonixCatalog(models, ref, cfg.magpie().Effort)
-		if err := writeProvider(p); err != nil {
-			return err
-		}
-		if cfg.DefaultModel == nil || *cfg.DefaultModel != v {
-			if err := edit.SetTOMLTopPreserving(path, edit.KV{Path: "default_model", Value: v}); err != nil {
-				return err
-			}
-		}
-		if cfg.Desktop.Access != nil && !slices.Contains(cfg.Desktop.Access, magpieID) {
-			access := append(cfg.Desktop.Access, magpieID)
-			if err := edit.SetTOMLKey(path, "desktop", "provider_access", reasonixArray(access)); err != nil {
-				return err
-			}
-			state.AddedAccess = true
-		}
-		if token, _ := edit.GetEnvFile(env, reasonixKey); token != gateway.TokenFor("reasonix") {
-			if err := edit.SetEnvFile(env, edit.KV{Path: reasonixKey, Value: gateway.TokenFor("reasonix")}); err != nil {
-				return err
-			}
-		}
-		b, err := json.Marshal(state)
-		if err != nil {
-			return err
-		}
-		return edit.WriteAtomic(statePath, b)
+		return edit.SetTOMLTopPreserving(path, edit.KV{Path: "default_model", Value: v})
 	}
+
 	a := &Agent{
 		ID: "reasonix", Name: "Reasonix Studio", Icon: "reasonix-color", Aliases: []string{"reasonix-studio"},
 		Bin: "reasonix", Dir: dir, Path: path, UA: []string{"reasonix"},
 		detect: func() bool { return reasonixDetected(home) },
 		Notice: func() string {
-			return "Reasonix Studio 2.x reads global settings at startup: restart it for new sessions. Project/session models can override them. Studio and the native 2.x CLI share this config."
+			return "Reasonix Studio 2.x and the native 1.39.x/2.x CLI read global settings at startup. Start a new process to load changes. Project/session models can override Executor and Plan."
 		},
 		Check: func() string {
 			ref, on := strings.CutPrefix(model(), magpieID+"/")
 			if !on {
-				return ""
+				cfg, _, err := load()
+				if err != nil {
+					return "Reasonix configuration cannot be read"
+				}
+				if cfg.Agent.Planner != nil {
+					ref, on = strings.CutPrefix(*cfg.Agent.Planner, magpieID+"/")
+				}
+				if !on {
+					return ""
+				}
 			}
 			cfg, state, err := load()
 			if err != nil {
@@ -287,7 +321,7 @@ func reasonix(home string) *Agent {
 			if token, _ := edit.GetEnvFile(env, reasonixKey); token != gateway.TokenFor("reasonix") {
 				return "Reasonix's gateway credential changed"
 			}
-			if !slices.Contains(p.Models, ref) {
+			if !slices.Contains(p.Models, ref) || cfg.Agent.Planner != nil && usesMagpie(*cfg.Agent.Planner) && !slices.Contains(p.Models, strings.TrimPrefix(*cfg.Agent.Planner, magpieID+"/")) {
 				return "Reasonix's selected model is missing from the magpie catalog"
 			}
 			if cfg.Desktop.Access != nil && !slices.Contains(cfg.Desktop.Access, magpieID) {
@@ -363,6 +397,9 @@ func reasonix(home string) *Agent {
 						return err
 					}
 					if state == nil || cfg.DefaultModel == nil || !usesMagpie(*cfg.DefaultModel) {
+						if v == "" {
+							return nil
+						}
 						return fmt.Errorf("select a magpie model in Reasonix before setting effort")
 					}
 					if err := checkOwner(cfg, state); err != nil {
@@ -394,6 +431,72 @@ func reasonix(home string) *Agent {
 			},
 		},
 	}
+	planner := Field{Key: "planner", Label: "planner", Get: func() string {
+		cfg, _ := readReasonix(path)
+		if cfg.Agent.Planner != nil {
+			return *cfg.Agent.Planner
+		}
+		return ""
+	}, Options: a.Fields[0].Options, Set: func(v string) error {
+		cfg, state, err := load()
+		if err != nil {
+			return err
+		}
+		off := v == "off"
+		if off {
+			v = ""
+		}
+		ref, via := strings.CutPrefix(v, magpieID+"/")
+		if via {
+			selected := ref
+			if cfg.DefaultModel != nil && usesMagpie(*cfg.DefaultModel) {
+				selected = strings.TrimPrefix(*cfg.DefaultModel, magpieID+"/")
+			}
+			if err := ensureGateway(cfg, &state, ref, selected); err != nil {
+				return err
+			}
+			if !state.PlannerManaged {
+				state.Planner = cfg.Agent.Planner
+				state.PlannerManaged = true
+			}
+		} else if v != "" && !cfg.hasModel(v) {
+			return fmt.Errorf("Reasonix has no planner model %q", v)
+		}
+		if v == "" && !off && state != nil && state.PlannerManaged && state.Planner != nil {
+			v = *state.Planner
+		}
+		if v == "" {
+			err = edit.DelTOMLKey(path, "agent", "planner_model")
+		} else {
+			err = edit.SetTOMLKey(path, "agent", "planner_model", v)
+		}
+		if err != nil {
+			return err
+		}
+		if state != nil {
+			raw, err := json.Marshal(state)
+			if err != nil {
+				return err
+			}
+			if err = edit.WriteAtomic(statePath, raw); err != nil {
+				return err
+			}
+		}
+		if !via && !usesMagpie(model()) {
+			next, _, err := load()
+			if err != nil {
+				return err
+			}
+			return restore(next, state, "")
+		}
+		return nil
+	}}
+	options := planner.Options
+	planner.Options = func(cur map[string]string) []Option {
+		return append([]Option{{Value: "off", Label: "off", Note: "Disable the separate planner"}}, options(cur)...)
+	}
+	a.Fields[0].Label = "executor"
+	a.Fields = append(a.Fields, planner)
 	return serializedReasonix(atomic(a, path, env, statePath))
 }
 

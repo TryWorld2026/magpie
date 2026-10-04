@@ -166,7 +166,7 @@ func TestReasonixCLIRequiresMajorVersionTwo(t *testing.T) {
 	for _, tc := range []struct {
 		version string
 		want    bool
-	}{{"1.18.0", false}, {"2.24.0", true}} {
+	}{{"1.18.0", false}, {"1.39.4", true}, {"2.24.0", true}} {
 		source := "package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"reasonix v" + tc.version + "\") }\n"
 		os.WriteFile(filepath.Join(dir, "cmd", "reasonix", "main.go"), []byte(source), 0o600)
 		cmd := proc.Command("go", "build", "-o", bin, "./cmd/reasonix")
@@ -231,7 +231,7 @@ func main() {
 	}
 }
 
-func reasonixFixture(t *testing.T, config string) (*Agent, string) {
+func reasonixFixture(t testing.TB, config string) (*Agent, string) {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)

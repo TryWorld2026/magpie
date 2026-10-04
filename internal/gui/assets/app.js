@@ -242,7 +242,7 @@ function renderAgents() {
     // the model picker takes the wide column, everything else the narrow one,
     // so the controls line up down the list
     const fields = el("div", "fields");
-    const wide = (f) => f.label === "model" || f.label === "large";
+    const wide = (f) => f.label === "model" || f.label === "large" || f.label === "executor" || f.label === "planner";
     // an effort or ultracode the model has none of (Claude Code on Haiku
     // 4.5, ultracode short of xhigh) isn't drawn at all
     const none = (f) => (f.key === "effort" || f.key === "ultracode") && !f.options.length && !f.value;
@@ -266,7 +266,8 @@ function renderAgents() {
       // effort, or the agent's own for its default, as the picker shows it
       else if (effort) b.append(effortIcon(f));
       else if (!f.value && !f.menu && a.icon) b.append(icon(a.icon));
-      else if (!wide(f) || !f.value) b.append(el("span", "k", t(f.label)));
+      else if (!wide(f) || !f.value || f.label === "executor" || f.label === "planner") b.append(el("span", "k", t(f.label)));
+      if ((f.label === "executor" || f.label === "planner") && (opt?.icon || opt?.icons?.length)) b.append(el("span", "k", t(f.label)));
       const shown = f.menu ? f.summary : effort ? effortName(opt || { value: f.value }) : (opt?.label || f.value || t(FOLLOWS_MODEL.includes(f.label) ? "same as model" : "default"));
       if (f.menu) b.title = f.options.map((o) => `${o.label}: ${o.note}`).join("\n");
       b.append(el("span", "v" + (f.value || f.custom ? "" : " empty"), shown));

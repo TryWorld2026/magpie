@@ -50,8 +50,8 @@ var reasonixVersions = struct {
 	m map[goProgramKey]bool
 }{m: map[goProgramKey]bool{}}
 
-// A shared config is also evidence of 1.x, and npm's reasonix still installs
-// that line. Probe only a native Reasonix CLI, once per binary revision, without
+// Config alone cannot distinguish the native CLI from the historical npm 1.x
+// client. Probe only a native Reasonix CLI, once per binary revision, without
 // starting either its agent loop or the desktop host.
 func reasonixCLI(path string) bool {
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
@@ -80,7 +80,7 @@ func reasonixCLI(path string) bool {
 			return false // retry a failed probe; only a confirmed version is cached
 		}
 		version, ok := strings.CutPrefix(strings.TrimSpace(string(b)), "reasonix v")
-		detected = ok && strings.HasPrefix(version, "2.")
+		detected = ok && (strings.HasPrefix(version, "2.") || strings.HasPrefix(version, "1.39."))
 	}
 	reasonixVersions.m[key] = detected
 	return detected
