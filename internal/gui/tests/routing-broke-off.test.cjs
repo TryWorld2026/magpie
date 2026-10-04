@@ -30,11 +30,11 @@ const answered = (id, i) => ({
   done: true, status: 200, ms: 3000, ttft: 300, tokens: 3000, out: 100,
 });
 const noted = {
-  id: 99, seq: 99, time: at(1), agent: "codex", model: "openai/gpt-6-luna", provider: "openai", error: "Codex titles are off in magpie's Settings, so magpie answered it itself",
-  order: [key], tries: [{ id: key.id, model: key.model, start: at(1), done: true, status: 200, ms: 5, ttft: 5 }],
+  id: 101, seq: 101, time: at(0), agent: "codex", model: "openai/gpt-6-luna", provider: "openai", error: "Codex titles are off in magpie's Settings, so magpie answered it itself",
+  order: [key], tries: [{ id: key.id, model: key.model, start: at(0), done: true, status: 200, ms: 5, ttft: 5 }],
   done: true, status: 200, ms: 5, ttft: 5, tokens: 30, out: 20,
 };
-const routes = [broke, noted, answered(98, 2), answered(97, 3), answered(96, 4)];
+const routes = [noted, broke, answered(98, 2), answered(97, 3), answered(96, 4)];
 
 function serve(lang) {
   const state = { agents: [{ id: "codex", name: "Codex", path: "/test/config.toml", fields: [] }], profiles: [], settings: { lang, theme: "light" } };
@@ -72,22 +72,25 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
       const context = await browser.newContext({ viewport: { width: 1100, height: 760 }, reducedMotion: "reduce" });
       const page = await context.newPage();
-      page.setDefaultTimeout(9000); // webkit's first launch in a run is slow here
+      page.setDefaultTimeout(15000); // webkit launches are slow here, and slower again later in a run
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang));
-      t.after(() => browser.close());
+      t.after(async () => { await browser.close(); });
       await page.goto("http://magpie.test/?view=routing");
+      await page.locator(".rt-day").first().waitFor(); // the view is drawn
       await page.locator(".rt-day:visible").nth(1).click(); // Live, then the day with the requests
-      const first = page.locator(".rt-req").first();
+      const first = page.locator(".rt-req").nth(1); // the broken-off one, under the newer noted 200
       await first.waitFor();
       // the row is bad, not a green dot that answered (the old rule said "ok": status 200)
       const cls = await first.getAttribute("class");
       assert(cls.includes("bad"), `row class ${cls}`);
       assert(!cls.includes("ok") && !cls.includes("moved"), `row class ${cls}`);
-      // the stat counts it, so clicking the stat picks it (the old click only knew status >= 400)
+      // the stat's click picks it, over the noted 200 that answers and is newer
       await page.locator(".rt-errs").click();
-      assert.equal(await first.getAttribute("aria-pressed"), "true", "the errors stat doesn't pick the broken request");
+      await page.waitForTimeout(300);
+      assert.equal(await first.getAttribute("aria-pressed"), "true", "the errors stat picks a 200 with a note of its own, not the broken-off request");
+      assert.equal(await page.locator(".rt-req").first().getAttribute("aria-pressed"), "false", "the newer noted 200 was picked");
       // its story says it began answering and broke off
       const story = await page.locator(".rt-steps").textContent();
       assert.match(story, want[lang].broke, story);
@@ -107,14 +110,15 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
       const context = await browser.newContext({ viewport: { width: 1100, height: 760 }, reducedMotion: "reduce" });
       const page = await context.newPage();
-      page.setDefaultTimeout(9000); // webkit's first launch in a run is slow here
+      page.setDefaultTimeout(15000); // webkit launches are slow here, and slower again later in a run
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang));
-      t.after(() => browser.close());
+      t.after(async () => { await browser.close(); });
       await page.goto("http://magpie.test/?view=routing");
+      await page.locator(".rt-day").first().waitFor(); // the view is drawn
       await page.locator(".rt-day:visible").nth(1).click();
-      const first = page.locator(".rt-req").nth(1); // the noted 200, under the broken-off one
+      const first = page.locator(".rt-req").first(); // the noted 200, newer than the broken-off one
       await first.waitFor();
       const cls = await first.getAttribute("class");
       assert(cls.includes("ok"), `row class ${cls}`);

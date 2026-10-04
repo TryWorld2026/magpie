@@ -59,7 +59,9 @@
       s.classList.add("rt-errs");
       s.title = t("Show the latest request that failed");
       s.addEventListener("click", () => {
-        const r = listed().find((x) => x.done && (x.status >= 400 || x.error)); // a reply that broke off told the agent one, as the stat counts it
+        // the same "bad" the rows and the story tell: a reply that broke
+        // off, not a 200 with a note of magpie's own (Codex's titles off)
+        const r = listed().find((x) => x.done && outcome(x)[1] === "bad");
         if (r) pick(r);
       });
     }
