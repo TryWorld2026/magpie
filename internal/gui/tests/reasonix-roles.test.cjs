@@ -54,6 +54,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const open = async () => {
           await row.waitFor();
           if (mode === "panel") await row.locator(".ag-sum").click();
+          else if (await row.locator(':scope > .ag-link[aria-expanded="false"]').count()) {
+            await row.locator(":scope > .ag-link").click();
+            await row.locator(".ag-exp").waitFor();
+          }
         };
         await page.goto("http://magpie.test/" + (mode === "panel" ? "?mode=panel" : ""));
         await open();
