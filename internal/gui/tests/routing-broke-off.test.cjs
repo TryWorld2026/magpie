@@ -29,7 +29,12 @@ const answered = (id, i) => ({
   order: [key], tries: [{ id: key.id, model: key.model, start: at(i), done: true, status: 200, ms: 3000, ttft: 300 }],
   done: true, status: 200, ms: 3000, ttft: 300, tokens: 3000, out: 100,
 });
-const routes = [broke, answered(99, 1), answered(98, 2), answered(97, 3), answered(96, 4)];
+const noted = {
+  id: 99, seq: 99, time: at(1), agent: "codex", model: "openai/gpt-6-luna", provider: "openai", error: "Codex titles are off in magpie's Settings, so magpie answered it itself",
+  order: [key], tries: [{ id: key.id, model: key.model, start: at(1), done: true, status: 200, ms: 5, ttft: 5 }],
+  done: true, status: 200, ms: 5, ttft: 5, tokens: 30, out: 20,
+};
+const routes = [broke, noted, answered(98, 2), answered(97, 3), answered(96, 4)];
 
 function serve(lang) {
   const state = { agents: [{ id: "codex", name: "Codex", path: "/test/config.toml", fields: [] }], profiles: [], settings: { lang, theme: "light" } };
@@ -86,6 +91,34 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // its story says it began answering and broke off
       const story = await page.locator(".rt-steps").textContent();
       assert.match(story, want[lang].broke, story);
+      assert.deepEqual(errors, []);
+    });
+  }
+}
+
+// A 200 whose error is magpie's own note — Codex's titles turned off in
+// Settings, a title reply with no title in it — answered: its try has no
+// fail. The rule reads the tries, not the route's error, so the row stays
+// a green dot rather than turning every titled thread's first request red
+// (yetone, reviewing #772).
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  for (const lang of ["en", "zh"]) {
+    test(`${engine} ${lang}: a 200 with a note of its own is still an answer`, async (t) => {
+      const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+      const context = await browser.newContext({ viewport: { width: 1100, height: 760 }, reducedMotion: "reduce" });
+      const page = await context.newPage();
+      page.setDefaultTimeout(9000); // webkit's first launch in a run is slow here
+      const errors = [];
+      page.on("pageerror", (e) => errors.push(e.message));
+      await page.route("**/*", serve(lang));
+      t.after(() => browser.close());
+      await page.goto("http://magpie.test/?view=routing");
+      await page.locator(".rt-day:visible").nth(1).click();
+      const first = page.locator(".rt-req").nth(1); // the noted 200, under the broken-off one
+      await first.waitFor();
+      const cls = await first.getAttribute("class");
+      assert(cls.includes("ok"), `row class ${cls}`);
+      assert(!cls.includes("bad"), `row class ${cls}`);
       assert.deepEqual(errors, []);
     });
   }
