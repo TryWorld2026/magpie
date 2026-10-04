@@ -128,8 +128,8 @@ func npmInstall(pkg, goos string, node bool) InstallCmd {
 		how = "nvm-mac"
 	}
 	return InstallCmd{Via: "npm", Node: how, Command: `export NVM_DIR="$HOME/.nvm" && mkdir -p "$NVM_DIR" && ` +
-		"curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/" + nvmVersion + "/install.sh | bash && " +
-		`. "$NVM_DIR/nvm.sh" && nvm install --lts && ` + plain}
+		"t=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/" + nvmVersion + `/install.sh -o "$t" && ` +
+		`bash "$t" && . "$NVM_DIR/nvm.sh" && nvm install --lts && ` + plain}
 }
 
 // nodeHere says whether this machine has Node.js's npm: on PATH, in one
