@@ -304,7 +304,7 @@ func TestGatewayKeysTakeScopedSettings(t *testing.T) {
 			case "key-only":
 				from.Settings = nil
 			}
-			from.SettingsKeys = tc.scoped
+			from.SettingsKeys = backup.Flag(tc.scoped)
 			beforeTo, _ := json.Marshal(to)
 			beforeFrom, _ := json.Marshal(from)
 			merged := to
@@ -352,7 +352,7 @@ func TestGatewayKeysTakeKeylessOntoScopedSettings(t *testing.T) {
 		t.Run(map[bool]string{false: "different-endpoint", true: "same-endpoint"}[sameEndpoint], func(t *testing.T) {
 			old := settings.Settings{Theme: "dark", LANKey: "fixture-server-lan", LANKeyID: "server-lan", GitHubToken: "fixture-server-github",
 				OTel: settings.OTel{Endpoint: "https://collector.example.com", Headers: map[string]string{"Authorization": "fixture-server-otel"}}}
-			to := backup.Bundle{SettingsKeys: true, Settings: &old,
+			to := backup.Bundle{Version: backup.BundleVersion, SettingsKeys: backup.Flag(true), Settings: &old,
 				GatewayKeys: &[]access.Key{{ID: "server", Name: "Server", Secret: "fixture-server-gateway"}}}
 			next := settings.Settings{Theme: "light", OTel: settings.OTel{Endpoint: "https://other.example.com"}}
 			if sameEndpoint {

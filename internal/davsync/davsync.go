@@ -611,13 +611,16 @@ func orEmpty[V any](m map[string]V) map[string]V {
 	return m
 }
 
-// take puts from's part in to.
+// take puts from's part in to. The merged bundle is a sync one (BundleVersion):
+// its per-part markers, not the whole-bundle Keys bit, say which part
+// carries credentials, so a keyed providers upload no longer tells a reader
+// the settings and the library came with keys too.
 func take(to *backup.Bundle, from backup.Bundle, part string) {
 	switch part {
 	case "providers":
-		keys := from.Keys || from.ProvidersKeys
+		keys := from.Keys || (from.ProvidersKeys != nil && *from.ProvidersKeys)
 		ps := from.Providers
-		if !keys && (to.Keys || to.ProvidersKeys) { // sent without keys: keep the ones the server has
+		if !keys && (to.Keys || (to.ProvidersKeys != nil && *to.ProvidersKeys)) { // sent without keys: keep the ones the server has
 			keys := map[string]provider.Provider{}
 			for _, p := range to.Providers {
 				keys[p.ID] = p
@@ -633,7 +636,7 @@ func take(to *backup.Bundle, from backup.Bundle, part string) {
 			}
 		}
 		searches := from.Searches
-		if searches != nil && !keys && (to.Keys || to.ProvidersKeys) && to.Searches != nil { // the same for the search APIs
+		if searches != nil && !keys && (to.Keys || (to.ProvidersKeys != nil && *to.ProvidersKeys)) && to.Searches != nil { // the same for the search APIs
 			keys := map[string]string{}
 			for _, a := range *to.Searches {
 				keys[a.Vendor] = a.Key
@@ -647,11 +650,12 @@ func take(to *backup.Bundle, from backup.Bundle, part string) {
 			searches = &ss
 		}
 		to.Providers, to.Icons, to.Groups, to.Searches, to.Order = ps, from.Icons, from.Groups, searches, from.Order
-		to.ProvidersKeys = to.ProvidersKeys || keys
+		to.ProvidersKeys = backup.Flag(keys || (to.ProvidersKeys != nil && *to.ProvidersKeys))
+		to.Keys = to.Keys || keys // the whole-bundle bit follows it, for a magpie that reads no per-part ones: it keeps the server's keys on its own upload then
 	case "settings":
-		keys := from.Keys || from.SettingsKeys
+		keys := from.Keys || (from.SettingsKeys != nil && *from.SettingsKeys)
 		s := from.Settings
-		if s != nil && !keys && (to.Keys || to.SettingsKeys) && to.Settings != nil {
+		if s != nil && !keys && (to.Keys || (to.SettingsKeys != nil && *to.SettingsKeys)) && to.Settings != nil {
 			// Sent without keys: keep the ones the server has, as for providers.
 			copy := *s
 			copy.LANKey, copy.LANKeyID = to.Settings.LANKey, to.Settings.LANKeyID
@@ -668,20 +672,26 @@ func take(to *backup.Bundle, from backup.Bundle, part string) {
 		if keys && from.GatewayKeys != nil {
 			to.GatewayKeys = from.GatewayKeys // an explicit empty store clears it
 		}
-		to.SettingsKeys = to.SettingsKeys || keys
+		to.SettingsKeys = backup.Flag(keys || (to.SettingsKeys != nil && *to.SettingsKeys))
 	case "profiles":
 		to.Profiles = from.Profiles
 	case "agents":
 		to.Agents = from.Agents
 	case "library":
-		keys := from.Keys || from.LibraryKeys
+		keys := from.Keys || (from.LibraryKeys != nil && *from.LibraryKeys)
 		lib := from.Library
-		if lib != nil && !keys && (to.Keys || to.LibraryKeys) { // sent without keys: keep the ones the server has
+		// An empty secret is not a clear: a keyed computer's library holds
+		// "" for a server it synced and never held a token for, and writes
+		// that over the token the keyless computer that set it up has. The
+		// server's value is kept for such an entry whatever the policy; a
+		// server taken out here is gone, as a part's own clearing works.
+		if lib != nil && (to.Keys || (to.LibraryKeys != nil && *to.LibraryKeys)) {
 			lib = lib.WithSecrets(to.Library, backup.Secret)
 		}
 		to.Library = lib
-		to.LibraryKeys = to.LibraryKeys || keys
+		to.LibraryKeys = backup.Flag(keys || (to.LibraryKeys != nil && *to.LibraryKeys))
 	}
+	to.Version = backup.BundleVersion // the merged bundle is a sync one, whatever the server's file was
 }
 
 // changed is when a part was last changed here, as its files say.

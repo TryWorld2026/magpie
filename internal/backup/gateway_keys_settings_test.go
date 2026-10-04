@@ -83,7 +83,11 @@ func TestRestoreSettingsKeysScope(t *testing.T) {
 				OTel: settings.OTel{Endpoint: "https://remote.example.com", Headers: map[string]string{"Authorization": "fixture-remote-otel"}}}
 			keys := []access.Key{{ID: incoming.LANKeyID, Name: "Remote", LAN: true, Secret: incoming.LANKey},
 				{ID: "client", Name: "Client", Secret: "fixture-remote-client"}}
-			b := Bundle{Version: 1, SettingsKeys: tc.keys, Settings: &incoming, GatewayKeys: &keys,
+			version := 1
+			if tc.keys {
+				version = BundleVersion // a sync bundle from a keyed uploader carries the markers
+			}
+			b := Bundle{Version: version, SettingsKeys: Flag(tc.keys), Settings: &incoming, GatewayKeys: &keys,
 				Providers: []provider.Provider{{ID: "acme", Name: "Remote", Chat: "https://remote.example.com/v1"}},
 				Library: &library.Bundle{MCP: []*library.Server{{Name: "github", Transport: "stdio", Command: "remote-mcp",
 					Env: map[string]string{"GITHUB_TOKEN": "", "MODE": "remote"}, Agents: []string{}}}}}
@@ -145,7 +149,7 @@ func TestRestoreSettingsKeysStore(t *testing.T) {
 			case "legacy":
 				b.Settings = &settings.Settings{Theme: "light", LAN: true, LANKey: "fixture-older-lan", LANKeyID: "old-marker", GitHubToken: "fixture-older-github"}
 			}
-			b.SettingsKeys = true
+			b.SettingsKeys = Flag(true)
 			if _, err := Restore(b, Parts{Settings: true}); err != nil {
 				t.Fatal(err)
 			}
@@ -178,7 +182,7 @@ func TestRestoreSettingsKeysStore(t *testing.T) {
 func TestRestoreSettingsKeysLegacyLAN(t *testing.T) {
 	home(t)
 	appdir.UseExecutable("")
-	b := Bundle{Version: 1, SettingsKeys: true, Settings: &settings.Settings{LAN: true, LANKey: "fixture-legacy-lan", LANKeyID: "incomplete-marker"}}
+	b := Bundle{Version: BundleVersion, SettingsKeys: Flag(true), Settings: &settings.Settings{LAN: true, LANKey: "fixture-legacy-lan", LANKeyID: "incomplete-marker"}}
 	if _, err := Restore(b, Parts{Settings: true}); err != nil {
 		t.Fatal(err)
 	}

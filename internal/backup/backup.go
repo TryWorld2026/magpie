@@ -82,9 +82,9 @@ type Bundle struct {
 	Order []string `json:"order,omitempty"`
 	// Sync can carry one part's credentials without changing the others'
 	// Keys policy; these are absent from older backups and whole collects.
-	ProvidersKeys bool `json:"providersKeys,omitempty"`
-	SettingsKeys  bool `json:"settingsKeys,omitempty"`
-	LibraryKeys   bool `json:"libraryKeys,omitempty"`
+	ProvidersKeys *bool `json:"providersKeys,omitempty"`
+	SettingsKeys  *bool `json:"settingsKeys,omitempty"`
+	LibraryKeys   *bool `json:"libraryKeys,omitempty"`
 }
 
 type envelope struct {
@@ -105,6 +105,34 @@ var ErrPassphrase = errors.New("wrong passphrase, or the file was changed")
 // wrong passphrase and from a newer magpie's file, so a sync can rebuild
 // the damaged one from this computer rather than fail on it forever.
 var ErrCorrupt = errors.New("not a magpie backup")
+
+// BundleVersion is the bundle's structure: 2 carries the per-part
+// credential markers (ProvidersKeys, SettingsKeys, LibraryKeys) as their
+// own three-state flags; 1 and before had the whole-bundle Keys alone.
+const BundleVersion = 2
+
+// Flag is a per-part credential marker as a bundle field takes one: the
+// part's own, written when a sync merged it. Absent (nil) is a whole
+// collect's or an older magpie's.
+func Flag(keys bool) *bool { return &keys }
+
+// scopedKeys is whether a part's credentials are in the bundle: the part's
+// own marker when the bundle carries one — a sync writes it for every part
+// it merges — and the whole-bundle bit for a whole collect or an older
+// file, which have no per-part ones.
+func (b Bundle) scopedKeys(part string) bool {
+	var own *bool
+	switch part {
+	case "settings":
+		own = b.SettingsKeys
+	case "library":
+		own = b.LibraryKeys
+	}
+	if own != nil {
+		return *own
+	}
+	return b.Keys
+}
 
 // Collect gathers the bundle; without keys, providers carry none, nor any
 // header that looks like one, and the library's servers no environment
@@ -360,7 +388,7 @@ func Restore(b Bundle, parts Parts) (Result, error) {
 		}
 	}
 	if parts.Settings && (b.Settings != nil || b.GatewayKeys != nil) {
-		keys := b.Keys || b.SettingsKeys
+		keys := b.scopedKeys("settings")
 		// the window's size, the proxy, the menu bar's usage are this machine's own
 		cur := settings.Load()
 		s := cur
@@ -436,7 +464,7 @@ func Restore(b Bundle, parts Parts) (Result, error) {
 	}
 	if parts.Library && b.Library != nil {
 		lib := b.Library
-		if !b.Keys && !b.LibraryKeys { // the servers' keys kept here stay
+		if !b.scopedKeys("library") { // the servers' keys kept here stay
 			have, err := library.Collect()
 			if err != nil {
 				return r, err

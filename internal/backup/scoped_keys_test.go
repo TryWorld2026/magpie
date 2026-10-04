@@ -32,7 +32,7 @@ func TestRestoreLibraryKeysScope(t *testing.T) {
 					Headers: map[string]string{"Authorization": "fixture-local-header"}, Agents: []string{}}); err != nil {
 					t.Fatal(err)
 				}
-				b := Bundle{Version: 1, Keys: policy == "full", Library: &library.Bundle{MCP: []*library.Server{{Name: "github", Transport: "stdio", Command: "changed-mcp",
+				b := Bundle{Version: BundleVersion, Keys: policy == "full", Library: &library.Bundle{MCP: []*library.Server{{Name: "github", Transport: "stdio", Command: "changed-mcp",
 					Env: map[string]string{"GITHUB_TOKEN": ""}, Agents: []string{}}, {Name: "headers", Transport: "http", URL: "https://mcp.example.com",
 					Headers: map[string]string{"Authorization": ""}, Agents: []string{}}}}}
 				if policy != "keyless" && policy != "full" {

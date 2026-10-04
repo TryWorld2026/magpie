@@ -130,8 +130,8 @@ func TestProviderKeysPreserveOtherSecretsSync(t *testing.T) {
 			}
 			t.Logf("after providers-only upload: Keys=%v, remote MCP token present=%v, remote GitHub token present=%v", got.Keys,
 				got.Library.MCP[0].Env["GITHUB_TOKEN"] != "", got.Settings.GitHubToken != "")
-			if got.Keys || !reflect.DeepEqual(got.Library, initial.Library) || !reflect.DeepEqual(got.Settings, initial.Settings) {
-				t.Error("taking providers changed the credential policy or contents of unselected parts")
+			if !got.Keys || !reflect.DeepEqual(got.Library, initial.Library) || !reflect.DeepEqual(got.Settings, initial.Settings) {
+				t.Error("a keyed providers upload left the whole-bundle bit an older reader needs, or changed unselected parts")
 			}
 
 			use(a)
@@ -190,7 +190,7 @@ func TestTakeScopedPartCredentials(t *testing.T) {
 			for _, source := range []string{"keyless", "full", "scoped", "clear"} {
 				t.Run(part+"/"+server+"/"+source, func(t *testing.T) {
 					makeBundle := func(policy, value string) backup.Bundle {
-						b := backup.Bundle{Keys: policy == "full", SettingsKeys: true,
+						b := backup.Bundle{Version: backup.BundleVersion, Keys: policy == "full", SettingsKeys: backup.Flag(true),
 							Settings:  &settings.Settings{GitHubToken: value},
 							Providers: []provider.Provider{{ID: "relay", Name: value, Key: value, BalanceToken: value}},
 							Searches:  &[]provider.SearchAPI{{Vendor: "tavily", Key: value}},
@@ -216,11 +216,27 @@ func TestTakeScopedPartCredentials(t *testing.T) {
 					beforeFrom, _ := json.Marshal(from)
 					merged := to
 					take(&merged, from, part)
-					if merged.Keys != to.Keys || merged.SettingsKeys != to.SettingsKeys || merged.Settings != to.Settings {
+					if merged.SettingsKeys != to.SettingsKeys || merged.Settings != to.Settings {
 						t.Error("taking one part changed another part's credential policy or settings")
+					}
+					if part == "providers" {
+						// the whole-bundle bit follows the providers' own when
+						// this upload carried them, so a magpie that reads no
+						// per-part ones still keeps the server's keys when it
+						// uploads after a keyed one
+						if (from.Keys || (from.ProvidersKeys != nil && *from.ProvidersKeys)) && (merged.ProvidersKeys != nil && *merged.ProvidersKeys) && !merged.Keys {
+							t.Error("the providers carry their scope without the whole-bundle bit, which an older reader would lose the keys to")
+						}
+					} else if merged.Keys != to.Keys {
+						t.Error("taking the library changed the providers' or the whole bundle's credential policy")
 					}
 					want := next
 					if source == "keyless" && server != "keyless" {
+						want = old
+					}
+					if part == "library" && source == "clear" {
+						// an empty secret is not a clear: it is mostly a
+						// redaction the uploader downloaded and never held
 						want = old
 					}
 					if part == "providers" {
