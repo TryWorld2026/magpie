@@ -224,6 +224,8 @@ const I18N = {
     "off magpie": "不经 magpie",
     "{agent} as installed: magpie's endpoint and models come out": "{agent} 安装时的样子：移除 magpie 的地址和模型",
     "Take {agent} off magpie?": "让 {agent} 不再经过 magpie？",
+    "restore the previous {field} selection": "还原原来的 {field} 选择",
+    "Restores {agent}'s previous {field} selection. Magpie's provider and private credential are removed when neither Executor nor Plan uses them.": "还原 {agent} 原来的 {field} 选择。Executor 和 Plan 都不再使用 magpie 时，移除它的服务商配置和专用密钥。",
     "Default is {agent} as installed: magpie's endpoint and models come out, and {agent} starts on its own default model. What it had before magpie isn't put back; Disconnect and restore does that.": "「默认」是 {agent} 刚安装时的样子：移除 magpie 的地址和模型，{agent} 用它自己的默认模型启动。不会还原接入 magpie 之前的设置；要还原请用「断开并还原」。",
     "{model} is {agent}'s own model: {agent} asks {vendor} for it itself, with its own sign-in, not through magpie. Picking it takes {agent} off magpie, and it starts on {model}.": "{model} 是 {agent} 自己的模型：{agent} 用自己的登录直接向 {vendor} 请求，不经过 magpie。选它会让 {agent} 断开 magpie，并以 {model} 启动。",
     "「接入」 goes off, and {agent} is listed under Not set up with the agents not connected. Switch it on again to go back through magpie.": "「接入」会关闭，{agent} 会和其他未接入的 agent 一起列在「未设置」里。再打开「接入」即可重新经过 magpie。",

@@ -27,13 +27,21 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           { key: "model", label: "executor", value: "", options },
           { key: "planner", label: "planner", value: "", options: [{ value: "off", label: "off" }, ...options] },
         ];
+        const posts = [];
+        const state = () => ({ agents: [{ id: "reasonix", name: "Reasonix Studio", icon: "reasonix-color", path: "/fixture/config.toml", wired: fields.some((f) => f.value.startsWith("magpie/")), fields }], profiles: [], settings: { lang, theme: "light" } });
         await page.addInitScript(() => localStorage.setItem("magpie.modelFavorites", '["a/pro"]'));
         await page.route("**/*", async (route) => {
           const url = new URL(route.request().url());
           const json = (data) => route.fulfill({ json: data });
           if (url.pathname === "/boot.js") return route.fulfill({ contentType: "text/javascript", body: `window.bootPrefs = {lang:"${lang}",theme:"light",web:true};` });
           if (url.pathname === "/wails/runtime.js") return route.fulfill({ contentType: "text/javascript", body: "export const Window = {};" });
-          if (url.pathname === "/api/state") return json({ agents: [{ id: "reasonix", name: "Reasonix Studio", icon: "reasonix-color", path: "/fixture/config.toml", wired: fields.some((f) => f.value.startsWith("magpie/")), fields }], profiles: [], settings: { lang, theme: "light" } });
+          if (url.pathname === "/api/state") return json(state());
+          if (url.pathname === "/api/set") {
+            const body = route.request().postDataJSON();
+            posts.push(body);
+            fields.find((f) => f.key === body.field).value = body.value || "native/old";
+            return json(state());
+          }
           if (url.pathname === "/api/providers") return json({ providers: [], gateway: { running: true, window: true } });
           if (url.pathname === "/api/groups") return json({ groups: [] });
           if (url.pathname === "/api/usage/quotas") return json([]);
@@ -104,6 +112,33 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           assert.equal(await page.locator("#list li.custom").count(), 1, "typed model choice is missing");
           await page.keyboard.press("Escape");
         }
+        // Restoring one role does not disconnect the other. The last role
+        // asks before leaving, and describes restoration rather than a
+        // factory reset. Exercise the actual picker and resulting API calls.
+        const defaults = async (key) => {
+          await row.locator(`.field[data-key="${key}"]`).click();
+          const label = fields.find((f) => f.key === key).label;
+          assert((await page.locator("#pop").innerText()).includes(lang === "zh" ? `还原原来的 ${label} 选择` : `restore the previous ${label} selection`));
+          await page.locator("#pop").getByText(lang === "zh" ? "默认" : "Default", { exact: true }).first().click();
+        };
+        const first = mode === "panel" ? fields[1] : fields[0];
+        const last = fields.find((f) => f !== first);
+        const remaining = last.value;
+        await defaults(first.key);
+        await page.waitForFunction((key) => document.querySelector(`.agent[data-id="reasonix"] .field[data-key="${key}"]`)?.textContent.includes("Native Old"), first.key);
+        assert.deepEqual(posts, [{ agent: "reasonix", field: first.key, value: "" }]);
+        assert.equal(await page.locator(".leave-ask").count(), 0, "the other role still uses magpie");
+        assert.equal(last.value, remaining);
+        await defaults(last.key);
+        const ask = page.locator(".leave-ask");
+        await ask.waitFor();
+        assert((await ask.innerText()).includes(lang === "zh" ? `还原 Reasonix Studio 原来的 ${last.label} 选择` : `Restores Reasonix Studio's previous ${last.label} selection`));
+        assert.equal(posts.length, 1, "the last role waits for confirmation");
+        await Promise.all([
+          page.waitForResponse((r) => new URL(r.url()).pathname === "/api/set"),
+          ask.locator(".bar button.primary").click(),
+        ]);
+        assert.deepEqual(posts[1], { agent: "reasonix", field: last.key, value: "" });
         assert.deepEqual(errors, []);
       });
     }
