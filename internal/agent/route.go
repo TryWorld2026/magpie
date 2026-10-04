@@ -26,6 +26,25 @@ const RoutingGroups = "Routing groups"
 func viaMagpie(agent, prefix string) []Option {
 	var out, groups []Option
 	shown, _ := provider.CatalogFor(agent)
+	// own: whether a provider is the account the agent is signed in to,
+	// asked once a provider (OwnPaused reads the saved logins); a plugin's
+	// for the agent's own vendor (Grok moved onto its plugin) is when it
+	// is the account the agent itself is signed in to
+	own := map[string]bool{}
+	for _, e := range shown {
+		a := e.Provider.Account
+		if a == nil || a.StandIn() {
+			continue
+		}
+		if _, ok := own[e.Provider.ID]; ok {
+			continue
+		}
+		if a.Agent == agent {
+			own[e.Provider.ID] = !e.Provider.OwnPaused()
+		} else if e.Provider.PluginProvider() == agent && a.User != "" {
+			own[e.Provider.ID] = a.User == provider.AgentUser(agent)
+		}
+	}
 	for _, e := range shown {
 		if e.Group != "" {
 			groups = append(groups, Option{Value: prefix + e.ID, Label: e.Name, Note: "routing group · via magpie",
@@ -37,7 +56,8 @@ func viaMagpie(agent, prefix string) []Option {
 			note = a.User + " · via magpie"
 		}
 		out = append(out, Option{Value: prefix + e.ID, Label: e.Name, Note: note,
-			Icon: e.Provider.Icon, Group: e.Provider.Name, Ref: e.ID, Free: e.Free, Context: e.Context})
+			Icon: e.Provider.Icon, Group: e.Provider.Name, Ref: e.ID, Free: e.Free, Rate: e.Rate, RateWas: e.RateWas, Context: e.Context, own: own[e.Provider.ID],
+			sub: e.Provider.Account != nil && (e.Provider.Account.Agent != "claude" || agent == "claude")})
 	}
 	return append(groups, out...)
 }
@@ -56,6 +76,9 @@ func viaMagpieFor(agentID, prefix string) []Option {
 
 // isMagpie reports whether a model value is a catalog reference.
 func isMagpie(v string) bool {
+	if pid, _, ok := strings.Cut(v, "/"); ok && dryProviders[pid] {
+		return true
+	}
 	_, _, ok := provider.Resolve(v)
 	return ok && strings.Contains(v, "/")
 }
@@ -73,8 +96,14 @@ func magpieModels(agent string) []catalog.Model {
 	var out []catalog.Model
 	shown, _ := provider.CatalogFor(agent)
 	labels := provider.Labels(shown)
+	// a model magpie describes images to takes them (provider.Described)
+	seen := provider.Described != nil && provider.Described()
 	for i, e := range shown {
-		m := catalog.Model{ID: e.ID, Name: labels[i], Provider: firstOf(e.Provider.Catalogs()), Efforts: e.Efforts, Images: e.Images, ImageInput: e.ImageInput, Context: e.Context, Output: e.Output}
+		m := catalog.Model{ID: e.ID, Name: labels[i], Provider: firstOf(e.Provider.Catalogs()), Efforts: e.Efforts, Images: e.Images || seen, ImageInput: e.ImageInput, Context: e.Context, Output: e.Output, AgentsV2: e.AgentsV2, Reasoning: e.Reasoning}
+		if seen && !e.Images {
+			yes := true
+			m.ImageInput = &yes
+		}
 		// APIs is the one to ask it on for the gateway to relay the request
 		// as it is; none for a group, whose members may each want another
 		if e.Group == "" {

@@ -22,6 +22,7 @@ func codexSignedIn(t *testing.T, spares ...string) {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // Windows finds the home there
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	restingUntil.Lock()
@@ -46,6 +47,10 @@ func codexSignedIn(t *testing.T, spares ...string) {
 	}
 	os.MkdirAll(filepath.Dir(provider.Path()), 0o755)
 	os.WriteFile(filepath.Join(filepath.Dir(provider.Path()), "logins.json"), mustJSON(saved), 0o600)
+	// signed in behind magpie's back: an earlier test's look at its own
+	// home within 30s would otherwise keep Codex's sign-in off the list
+	provider.ForgetAccounts()
+	t.Cleanup(provider.ForgetAccounts)
 }
 
 // usedUp stands in for the ChatGPT backend with acct-1 out of its

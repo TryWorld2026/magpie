@@ -27,6 +27,17 @@ const WHO = [
 const shareOf = (id, name, icon, calls, tokens, cost, errors = 0) => ({ id, name, icon, calls, errors, input: tokens * 0.01, output: tokens * 0.005, cache_write: tokens * 0.05, cache_read: tokens * 0.935, cost });
 
 function page(q) {
+  if (q.has("day")) {
+    const whole = new URLSearchParams(q);
+    whole.delete("day");
+    const l = page(whole), point = l.series.find((p) => p.time.slice(0, 10) === q.get("day"));
+    const by = Object.fromEntries(Object.entries(l.by).map(([dim, shares]) => [dim, shares.flatMap((s) => {
+      const part = point?.by[dim][s.id];
+      return part ? [shareOf(s.id, s.name, s.icon, part.calls, part.tokens, part.cost)] : [];
+    })]));
+    return { ...l, calls: 0, errors: 0, input: 0, output: 0, cache_read: 0, cache_write: 0, cost: 0,
+      ...point, series: l.series, day: q.get("day"), chartBy: l.by, by, total: point?.calls ? 1 : 0 };
+  }
   const only = q.get("provider");
   const who = WHO.filter((w) => !only || w.id === only);
   const days = q.get("period") === "today" ? 1 : q.get("period") === "7d" ? 7 : 30;
@@ -138,6 +149,22 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await p.locator("#panelUsage .pu-tot").waitFor();
       assert(await p.locator("#panelUsage").isVisible());
       assert.equal(await p.locator("#panelUsage > .usage-note").textContent(), lang === "zh" ? "统计网关调用与会话日志调用；本地拒绝的请求不计入汇总。" : "Gateway and session-log calls; local rejections excluded from totals.");
+      // read again on asking (#546), and as the panel is opened again
+      const refresh = p.locator("#panelUsage .pu-again");
+      assert.equal(await refresh.getAttribute("aria-label"), lang === "zh" ? "立即刷新" : "Refresh now");
+      let n = asked.length;
+      await refresh.click();
+      for (let i = 0; i < 60 && asked.length === n; i++) await new Promise((r) => setTimeout(r, 40));
+      assert.equal(asked.length, n + 1, "Refresh reads the usage again");
+      await new Promise((r) => setTimeout(r, 2100));
+      n = asked.length;
+      await p.evaluate(() => window.dispatchEvent(new Event("focus")));
+      for (let i = 0; i < 60 && asked.length === n; i++) await new Promise((r) => setTimeout(r, 40));
+      assert.equal(asked.length, n + 1, "the panel focused reads the usage again");
+      n = asked.length;
+      await p.evaluate(() => window.dispatchEvent(new Event("focus")));
+      await new Promise((r) => setTimeout(r, 300));
+      assert.equal(asked.length, n, "not again at once");
       assert(!(await p.locator("#agents").isVisible()) && !(await p.locator("#panelRouting").isVisible()), "the others are other tabs");
       assert.equal(asked[0].get("period"), "today");
       assert.equal(asked[0].get("limit"), "1", "a page of one row is all it asks for");
@@ -154,6 +181,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // Labels in the 440px panel must be readable, not clipped by ellipsis.
       assert(await p.locator("#panelUsage .pu-tot .blk").first().locator(".sub").evaluate(e =>
         e.scrollWidth <= e.clientWidth + 1 && e.scrollHeight <= e.clientHeight + 1 && getComputedStyle(e).textOverflow !== "ellipsis"), "token input/output is fully visible");
+      // the total counts the cache, so the line under it names the cache too, or in + out doesn't add up to it
+      assert((await p.locator("#panelUsage .pu-tot .blk").first().locator(".sub").textContent()).includes(lang === "zh" ? "缓存" : "cached"), "the cache under the token total");
       // nothing runs out of the panel
       const over = await p.evaluate(() => [...document.querySelectorAll("#panelUsage *")].filter((e) => e.scrollWidth > e.clientWidth + 1 && getComputedStyle(e).overflow === "visible" && e.children.length === 0 && e.tagName !== "text").length);
       assert.equal(over, 0, "an element wider than itself");
@@ -192,10 +221,124 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await p.locator("#panelUsage:not(.pu-loading)").waitFor(); // the answer is in, not only asked for
       assert((await p.locator("#panelUsage svg .axis").allTextContents()).some((s) => /\d\/\d|\d月/.test(s)), "days along the bottom");
 
+      // Pick a day without losing the rest of the period, then an empty day.
+      const days = p.locator("#panelUsage .led-day");
+      const label = await days.nth(4).getAttribute("aria-label");
+      const original = await p.locator("#panelUsage rect.col").evaluateAll((rs) => rs.map((r) => [r.dataset.day, r.dataset.k, r.getAttribute("height"), r.dataset.color]));
+      await days.nth(4).click();
+      await settled(asked, (q) => q.has("day"));
+      await p.locator("#panelUsage:not(.pu-loading)").waitFor();
+      const selectedDay = asked.at(-1).get("day");
+      assert.equal(await p.locator('#panelUsage .led-day[aria-pressed="true"]').getAttribute("aria-label"), label);
+      assert.equal(await p.locator("#panelUsage .led-rank .rk").first().locator(".rk-val").textContent(), "900,000");
+      assert.deepEqual(await p.locator("#panelUsage rect.col").evaluateAll((rs) => rs.map((r) => [r.dataset.day, r.dataset.k, r.getAttribute("height"), r.dataset.color])), original, "the chart keeps its heights and colors");
+      const dimmed = () => p.locator("#panelUsage rect.col").evaluateAll((rs, day) => rs.every((r) => r.dataset.day === day ? r.style.opacity === "" && r.style.fill === r.dataset.color : r.style.opacity === "0.22" && r.style.fill === "var(--faint)"), selectedDay);
+      assert(await dimmed(), "the other days are gray");
+      await p.mouse.move(2, 2);
+      assert(await dimmed(), "selection survives leaving the chart");
+      await refresh.click();
+      await p.locator("#panelUsage:not(.pu-loading)").waitFor();
+      assert.equal(asked.at(-1).get("day"), selectedDay, "refresh keeps the selected day");
+      await p.locator("#panelUsage .pu-card .segs .opt").nth(1).click();
+      assert.equal(parseFloat((await p.locator("#panelUsage .led-rank .rk").first().locator(".rk-val").textContent()).slice(1)), 0.9);
+      await p.locator("#panelUsage .pu-card .segs .opt").nth(0).click();
+      if (process.env.ARTIFACT_DIR) {
+        await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
+        const context = await browser.newContext({ viewport: { width: 440, height: 760 }, reducedMotion: "reduce" });
+        const shot = await context.newPage();
+        shot.setDefaultTimeout(5000);
+        await shot.addInitScript(() => { localStorage.setItem("magpie.panelTab", "stats"); localStorage.setItem("magpie.panelUsePeriod", "7d"); });
+        await shot.route("**/*", serve(lang, [], []));
+        await shot.goto("http://magpie.test/?mode=panel");
+        await shot.locator("#panelUsage .led-day").nth(4).click();
+        await shot.locator('#panelUsage .led-day[aria-pressed="true"]').waitFor();
+        await shot.mouse.move(2, 2);
+        await shot.locator("#panelUsage .pu-card").screenshot({ path: path.join(process.env.ARTIFACT_DIR, `${engine}-${lang}-panel-day.png`) });
+        await context.close();
+      }
+      await days.nth(1).click();
+      await settled(asked, (q) => q.has("day") && q.get("day") !== selectedDay);
+      await p.locator("#panelUsage:not(.pu-loading)").waitFor();
+      assert.equal(await p.locator("#panelUsage .led-rank .rk").count(), 0, "an empty day clears the ranking");
+      assert.equal(await days.count(), 7, "an empty day keeps every day available");
+      const emptyDay = asked.at(-1).get("day");
+      await days.nth(1).click();
+      await settled(asked, (q) => !q.has("day"));
+      await p.locator("#panelUsage:not(.pu-loading)").waitFor();
+      assert.equal(await p.locator('#panelUsage .led-day[aria-pressed="true"]').count(), 0);
+      // Hold the first response so the second click happens before it arrives.
+      let release, held, blocked;
+      const delay = () => {
+        held = new Promise((resolve) => { release = resolve; });
+        blocked = false;
+      };
+      const hold = async (route) => {
+        const q = new URL(route.request().url()).searchParams;
+        if (!blocked && q.has("day")) {
+          blocked = true;
+          asked.push(q);
+          await held;
+          await route.fulfill({ json: page(q) });
+          return;
+        }
+        await route.fallback();
+      };
+      const reply = (day) => p.waitForResponse((r) => {
+        const url = new URL(r.url());
+        return url.pathname === "/api/usage/requests" && (url.searchParams.get("day") || "") === day;
+      }).then((r) => r.finished());
+      await p.route("**/api/usage/requests?*", hold);
+      delay();
+      const beforeClicks = asked.length, clickedDay = await days.nth(4).getAttribute("data-day");
+      const requested = p.waitForRequest((r) => new URL(r.url()).searchParams.get("day") === clickedDay);
+      const selectedReply = reply(clickedDay), clearedReply = reply("");
+      await days.nth(4).dispatchEvent("click");
+      await requested;
+      await days.nth(4).dispatchEvent("click");
+      release();
+      await Promise.all([selectedReply, clearedReply]);
+      await p.evaluate(() => new Promise(requestAnimationFrame));
+      await settled(asked, (q) => asked.length > beforeClicks && !q.has("day"));
+      await p.locator("#panelUsage:not(.pu-loading)").waitFor();
+      assert.equal(await p.locator('#panelUsage .led-day[aria-pressed="true"]').count(), 0, "two quick clicks clear selection");
+
+      // A delayed redraw must not take focus back after the user moves it.
+      delay();
+      const movedRequest = p.waitForRequest((r) => new URL(r.url()).searchParams.get("day") === clickedDay);
+      const movedReply = reply(clickedDay);
+      await days.nth(4).focus();
+      await p.keyboard.press("Enter");
+      await movedRequest;
+      const away = p.locator('#ptabs [data-ptab="stats"]');
+      await away.focus();
+      release();
+      await movedReply;
+      await p.locator('#panelUsage .led-day[aria-pressed="true"]').waitFor();
+      assert(await away.evaluate((e) => e === document.activeElement), "the redraw does not steal focus");
+      const resetReply = reply("");
+      await days.nth(4).dispatchEvent("click");
+      await resetReply;
+      await p.waitForFunction(() => !document.querySelector('#panelUsage .led-day[aria-pressed="true"]'));
+      await p.unroute("**/api/usage/requests?*", hold);
+      const keyboardDay = await days.nth(1).getAttribute("data-day");
+      await days.nth(1).focus();
+      await p.keyboard.press("Enter");
+      await settled(asked, (q) => q.get("day") === emptyDay);
+      await p.locator("#panelUsage:not(.pu-loading)").waitFor();
+
+      await p.waitForFunction((day) => document.activeElement?.matches('#panelUsage .led-day[aria-pressed="true"]') && document.activeElement.dataset.day === day, keyboardDay);
+      await p.keyboard.press("Space");
+      await settled(asked, (q) => !q.has("day"));
+      await p.waitForFunction((day) => document.activeElement?.matches('#panelUsage .led-day[aria-pressed="false"]') && document.activeElement.dataset.day === day, keyboardDay);
       // a click on a provider switches to it: its requests, its models in the chart
       await p.locator("#panelUsage .pu-bar .segs .opt").nth(0).click();
       await settled(asked, (q) => q.get("period") === "today");
       await p.locator("#panelUsage:not(.pu-loading)").waitFor();
+      assert(!asked.at(-1).has("day"), "changing the period clears day selection");
+      // half under the footer's edge, WebKit takes it as in view and clicks the footer: scroll it in whole, as a reader would
+      await p.locator("#panelUsage .pu-tot").hover();
+      await p.mouse.wheel(0, 400);
+      await p.waitForFunction(() => document.querySelector("#panelUsage .led-rank .rk").getBoundingClientRect().bottom <= document.querySelector("footer.foot").getBoundingClientRect().top);
       await p.locator("#panelUsage .led-rank .rk").first().click();
       await settled(asked, (q) => q.get("provider") === "anthropic");
       await p.locator("#panelUsage .sess-pick", { hasText: "Claude" }).waitFor();
@@ -204,6 +347,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await p.locator("#panelUsage rect.col").evaluateAll((r) => [...new Set(r.map((x) => x.dataset.k))].sort().join()), "claude-opus-5,claude-sonnet-5");
 
       // Open Usage takes the window to that provider's requests
+      await p.mouse.wheel(0, -400);
       await p.locator("#panelUsage .pu-bar .text").click();
       for (let i = 0; i < 50 && !opened.length; i++) await p.waitForTimeout(40);
       assert.equal(opened.at(-1), "?view=usage&tab=requests&provider=anthropic");

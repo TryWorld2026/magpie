@@ -1,14 +1,19 @@
 package provider
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -29,6 +34,7 @@ type zcodeStartUpstream struct {
 	balance map[string]any
 	jwt     string
 	model   *http.Request // the last request to the Start Plan's endpoint
+	body    []byte        // and its body
 }
 
 func newZCodeStartUpstream(t *testing.T, jwt string) *zcodeStartUpstream {
@@ -66,6 +72,7 @@ func newZCodeStartUpstream(t *testing.T, jwt string) *zcodeStartUpstream {
 			ok(u.balance)
 		case strings.HasPrefix(r.URL.Path, "/api/v1/zcode-plan/anthropic/"):
 			u.model = r
+			u.body, _ = io.ReadAll(r.Body)
 			w.Write([]byte(`{}`))
 		default:
 			w.WriteHeader(404)
@@ -123,7 +130,7 @@ func TestZCodeStartPlanOwnAccount(t *testing.T) {
 	req, _ := http.NewRequest("POST", p.Anthropic+"/v1/messages", nil)
 	req.Header.Set("Authorization", "Bearer magpie")
 	if err := p.Sign(context.Background(), req, Anthropic, []byte(`{}`)); err != nil ||
-		req.Header.Get("x-api-key") != jwt || req.Header.Get("Authorization") != "Bearer "+jwt ||
+		req.Header.Get("x-api-key") != "" || req.Header.Get("Authorization") != "Bearer "+jwt ||
 		req.Header.Get("X-ZCode-App-Version") == "" || req.URL.Path != "/api/v1/zcode-plan/anthropic/v1/messages" {
 		t.Fatalf("signs with ZCode's token: %v %s %v", err, req.URL, req.Header)
 	}
@@ -181,7 +188,7 @@ func TestZCodeStartPlanRouting(t *testing.T) {
 	}
 	// no Coding Plan: the Start Plan, with ZCode's token
 	req := sign()
-	if req.URL.String() != u.srv.URL+"/api/v1/zcode-plan/anthropic/v1/messages?beta=true" || req.Header.Get("x-api-key") != jwt {
+	if req.URL.String() != u.srv.URL+"/api/v1/zcode-plan/anthropic/v1/messages?beta=true" || req.Header.Get("Authorization") != "Bearer "+jwt {
 		t.Fatalf("no coding plan: %s %v", req.URL, req.Header)
 	}
 	if q := zcodeQuota(context.Background(), Login{User: "a@example.com"}, k); q.Plan != "Start Plan" || len(q.Windows) != 1 {
@@ -242,5 +249,57 @@ func TestZCodeSignInStartPlan(t *testing.T) {
 	}
 	if _, _, err := zcodeSignedIn(ctx, "zai", "zai-tok", ""); err == nil {
 		t.Fatal("no token, no plan: signed in")
+	}
+}
+
+// ARNO on Discord (v0.1.639): the Start Plan turned magpie's request away
+// with 405 / code 3012, while an OpenCode plugin run in magpie's plugin host
+// got through on the same machine and account, its headers and body the
+// same. What differed was the wire: Bun's fetch, ZCode's own Node fetch and
+// zcode2api-plus all speak HTTP/1.1 to zcode.z.ai, and the gateway's client
+// HTTP/2 wherever it is offered. A Start Plan request goes over HTTP/1.1
+// whatever client it is given; a Coding Plan account's still goes through
+// that client.
+func TestZCodeStartHTTP1(t *testing.T) {
+	var mu sync.Mutex
+	var got []string
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got = append(got, r.URL.Path+" "+r.Proto)
+		mu.Unlock()
+		w.Write([]byte(`{}`))
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+	pool := x509.NewCertPool()
+	pool.AddCert(srv.Certificate())
+	oldAPI, oldBase, oldTLS := zcodeAPI, ZCodeZaiBase, zcodeStartTransport.TLSClientConfig
+	zcodeAPI, ZCodeZaiBase = srv.URL, srv.URL+"/api/anthropic"
+	zcodeStartTransport.TLSClientConfig = &tls.Config{RootCAs: pool}
+	t.Cleanup(func() {
+		zcodeStartTransport.CloseIdleConnections()
+		zcodeAPI, ZCodeZaiBase, zcodeStartTransport.TLSClientConfig = oldAPI, oldBase, oldTLS
+	})
+	gateway := srv.Client() // speaks HTTP/2, as the gateway's client does
+	send := func(p Provider) {
+		t.Helper()
+		body := []byte(`{"model":"GLM-5.3-Flash","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`)
+		req, _ := http.NewRequest(http.MethodPost, p.Base(Anthropic)+"/v1/messages", bytes.NewReader(body))
+		if err := p.Sign(context.Background(), req, Anthropic, body); err != nil {
+			t.Fatal(err)
+		}
+		res, err := p.Do(gateway, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+	}
+	send(zcodeProvider("trial@example.com", "Start Plan", zcodeKey{Base: ZCodeZaiBase, JWT: zcodeTestJWT(time.Now().Add(time.Hour))}))
+	send(zcodeProvider("pro@example.com", "GLM Coding Pro", zcodeKey{Key: "id.secret", Base: ZCodeZaiBase}))
+	want := []string{"/api/v1/zcode-plan/anthropic/v1/messages HTTP/1.1", "/api/anthropic/v1/messages HTTP/2.0"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("sent:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 }

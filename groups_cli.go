@@ -23,7 +23,7 @@ const groupUsage = `usage:
   magpie group set <id> k=v…              change one: name, models (the whole list, in order),
                                           models+=<m> (append), models-=<m> (drop), routing, stays,
                                           context (how long a request agents are told it takes: 272k; empty is
-                                          its shortest model's), levels (the reasoning levels agents are offered:
+                                          its largest model's), levels (the reasoning levels agents are offered:
                                           levels=none,low,medium,high,xhigh,max; empty is those every model has —
                                           a model without the one asked is sent its nearest),
                                           family (a tag: magpie visible shows agents families, not each group),
@@ -37,10 +37,15 @@ const groupUsage = `usage:
                                           (as clicking it on the group's card in the Routing view does)
   magpie group rm <id>                    remove a group (one magpie found is hidden instead)
   magpie group restore <id>               bring back a group magpie found that you removed
+  magpie group auto [on|off]              whether magpie finds groups on its own (on by default); off, none is
+                                          listed or served — yours, and found ones you changed, stay — and an
+                                          agent set to one is moved to its model from one provider; on brings
+                                          them back
   magpie group rule add|rm|mv <id> …      rules: which model a turn goes to first, by its length, an image,
                                           the reasoning asked for or the agent (magpie group rule help)
 
-  magpie finds a group for each model two or more providers serve (auto-<model>, never stored);
+  magpie finds a group for each model two or more providers serve (auto-<model>, never stored;
+  magpie group auto off stops it);
   removing one stores {"id":…,"hidden":true} in providers.json, which is what keeps it removed:
   take that record out of the file and the group is back
 
@@ -58,6 +63,8 @@ const groupUsage = `usage:
            order   the first model until it can't answer, then the next
            rotate  each conversation's next turn goes to the next member's account or key
            usage   the account or key with the most of its allowance left first
+           pace    the account with the most of its week left per hour until it renews first, so less
+                   of a week is lost at its reset
            manual  only the model you pick (pick=, or click it on the group's card): the others and
                    the rules wait until you pick another or route it otherwise; no failover to them
   stays    auto    (default) with the account or key that answered, while its cache is worth keeping
@@ -90,6 +97,7 @@ var routingNames = []struct {
 	{provider.Ordered, "order", []string{"ordered", "in-order"}},
 	{provider.Rotate, "rotate", []string{"in-turn", "round-robin"}},
 	{provider.LeastUsed, "usage", []string{"least-used"}},
+	{provider.Pace, "pace", []string{"weekly-pace"}},
 	{provider.Manual, "manual", []string{"pick", "picked", "pinned"}},
 }
 
@@ -341,7 +349,7 @@ func applyGroupPairs(g *provider.Group, pairs []string, resolve func(string) (st
 			g.Affinity, err = parseStays(v)
 		case "context":
 			// what agents are told the group takes; empty or 0 is its
-			// shortest model's again
+			// largest model's again
 			g.Context = 0
 			if strings.TrimSpace(v) != "" {
 				g.Context, err = parseTokens(v)
@@ -529,6 +537,8 @@ func groupCmd(args []string) error {
 			return err
 		}
 		return showGroup(g)
+	case "auto", "found":
+		return autoGroupsCmd(rest)
 	case "restore", "unhide":
 		if len(rest) != 1 {
 			return fmt.Errorf("magpie group restore <id>")
@@ -723,6 +733,42 @@ func catalogByID() map[string]provider.Entry {
 }
 
 // groups: `magpie groups`
+// autoGroupsCmd says whether magpie finds groups on its own, or turns
+// that on or off: off, the agents set to one are moved to its model from
+// one provider (agent.Reseat), as the Routing view's switch does.
+func autoGroupsCmd(args []string) error {
+	if len(args) == 0 {
+		if provider.AutoGroupsOn() {
+			fmt.Println("found groups are", green.Render("on"), muted.Render("· a model two or more providers serve is a group of them (auto-<model>); magpie group auto off turns them off"))
+		} else {
+			fmt.Println("found groups are", amber.Render("off"), muted.Render("· only the groups you made or changed; magpie group auto on brings the others back"))
+		}
+		return nil
+	}
+	var on bool
+	switch strings.ToLower(args[0]) {
+	case "on", "true", "yes", "1":
+		on = true
+	case "off", "false", "no", "0":
+	default:
+		return fmt.Errorf("magpie group auto [on|off]")
+	}
+	if len(args) > 1 {
+		return fmt.Errorf("magpie group auto [on|off]")
+	}
+	moved, err := agent.Reseat(func() error { return provider.SetAutoGroups(on) })
+	if err != nil {
+		return err
+	}
+	defer printMoved(moved)
+	if on {
+		fmt.Println(green.Render("✓"), "found groups are on", muted.Render("· a model two or more providers serve is a group of them again"))
+	} else {
+		fmt.Println(green.Render("✓"), "found groups are off", muted.Render("· the groups you made or changed stay; a request for an auto- group goes to its model from one provider"))
+	}
+	return nil
+}
+
 func groups() error {
 	all := provider.Groups()
 	var shown, hidden []provider.Group
@@ -735,6 +781,9 @@ func groups() error {
 	}
 	if len(shown) == 0 {
 		fmt.Println(muted.Render("no routing groups yet ·"), "magpie group add <name> models=<m1>,<m2>", muted.Render("· magpie group help"))
+	}
+	if !provider.AutoGroupsOn() {
+		defer fmt.Println(" ", muted.Render("found groups are off · magpie group auto on brings them back"))
 	}
 	names, uses := catalogByID(), groupUses()
 	for _, e := range provider.Served() {

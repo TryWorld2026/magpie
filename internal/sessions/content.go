@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -67,7 +68,7 @@ func (c *Content) add(input bool, p Part) {
 // ContentOf reads what was said in a call from its file.
 func ContentOf(c Call) (Content, error) {
 	out := Content{Input: []Part{}, Output: []Part{}}
-	if c.File == "" {
+	if c.File == "" || c.Agent == "opencode" { // OpenCode's are rows, not lines of a file
 		return out, errNoPlace
 	}
 	var err error
@@ -229,9 +230,17 @@ var cxItem = []byte(`"type":"response_item"`)
 
 // codexContent reads the items between the call before and this one: what the
 // model was given (the prompt, a tool's output) and what it said (words,
-// reasoning, a call of a tool).
+// reasoning, a call of a tool). A rollout the Codex app has compressed (or
+// unpacked) since the call was read is read in its new form: its lines and
+// their places are the same.
 func codexContent(c Call, out *Content) error {
-	_, err := scanAt(c.File, c.From, nil, func(b []byte, start, end int64) bool {
+	path := c.File
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Stat(rolloutTwin(path)); err == nil {
+			path = rolloutTwin(path)
+		}
+	}
+	_, err := scanAt(path, c.From, nil, func(b []byte, start, end int64) bool {
 		if start >= c.To {
 			return false
 		}

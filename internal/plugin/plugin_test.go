@@ -32,6 +32,7 @@ func sandbox(t *testing.T) {
 	}
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(dir, "cache"))
 	t.Setenv("MAGPIE_BUN", bun)
@@ -82,6 +83,10 @@ func TestFakePlugin(t *testing.T) {
 	for _, m := range ps[0].Models {
 		if want := map[string][2]bool{"fake-1": {false, false}, "fake-claude": {true, true}, "fake-gemini": {false, true}}[m.ID]; m.Image != want[0] || m.ImageSaid != want[1] {
 			t.Errorf("%s: image %v, said %v; want %v", m.ID, m.Image, m.ImageSaid, want)
+		}
+		// a model's credit rate, as the plugin gave it, number or "x0.03"
+		if want := map[string][2]float64{"fake-claude": {0.5, 1}, "fake-gemini": {0.03, 0}}[m.ID]; m.Rate != want[0] || m.RateWas != want[1] {
+			t.Errorf("%s: rate %v, was %v; want %v", m.ID, m.Rate, m.RateWas, want)
 		}
 	}
 

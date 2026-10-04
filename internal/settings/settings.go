@@ -8,6 +8,7 @@
 package settings
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -18,10 +19,14 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/redact"
+	"github.com/yetone/magpie/internal/steady"
 )
 
 // Settings is what the user chose. "" and "system" both mean "follow the OS".
@@ -38,6 +43,13 @@ type Settings struct {
 	// rate (see internal/fx). A vendor's own balance, already in its own
 	// currency (a Chinese relay's ¥), is never touched by this.
 	Currency string `json:"currency,omitempty"`
+	// ChineseUnits shortens a large count in 万 and 亿 when magpie speaks
+	// Chinese (8000 万 rather than 80M); otherwise it is in K, M and B, as
+	// prices per million tokens and context windows (200K, 1M) are, in
+	// Chinese too (#740). It means nothing in English. It replaces
+	// westernUnits, which asked for K/M/B: what that chose is now the
+	// default, so an old file's is left unread.
+	ChineseUnits bool `json:"chineseUnits,omitempty"`
 	// Dock keeps magpie in the Mac's Dock as well as the menu bar, for a
 	// menu bar too full to show its icon.
 	Dock bool `json:"dock,omitempty"`
@@ -49,6 +61,12 @@ type Settings struct {
 	// environment and then the system, "direct" uses none, anything else
 	// is the proxy (http://, https:// or socks5://; host:port means http).
 	Proxy string `json:"proxy,omitempty"`
+	OTel  OTel   `json:"otel,omitempty"`
+	// GitHubToken is a GitHub token the library's requests to GitHub's
+	// API carry, raising its rate limit from 60 requests an hour to 5,000.
+	// It is a secret: the Settings page is told only a masked one, and a
+	// backup or sync without keys leaves it out, as it does LANKey.
+	GitHubToken string `json:"githubToken,omitempty"`
 	// Redact keeps secrets in what agents send (API keys, private keys,
 	// tokens, passwords) from the vendors behind magpie: they go as
 	// placeholders, and come back as they were. RedactPersonal does the same
@@ -60,15 +78,19 @@ type Settings struct {
 	RedactPersonal bool          `json:"redactPersonal,omitempty"`
 	RedactWords    []string      `json:"redactWords,omitempty"`
 	RedactRules    []redact.Rule `json:"redactRules,omitempty"`
-	// LAN shares the gateway on the local network, for agents on other
-	// machines; a request from one must carry LANKey as its API key, a
-	// key magpie makes when LAN is first turned on.
+	// LAN shares the gateway on the local network; remote callers must use
+	// named caller keys. LANKey is retained for older Magpie versions.
 	LAN    bool   `json:"lan,omitempty"`
 	LANKey string `json:"lanKey,omitempty"`
+	// LANKeyID remembers the default named key created when sharing is enabled.
+	LANKeyID string `json:"lanKeyId,omitempty"`
 	// RequestArchive keeps each call the gateway serves — its headers and
 	// bodies both ways, secrets taken out — in the S3 bucket sync keeps
 	// its backup in (gateway/archive.go), for looking into a request later.
 	RequestArchive bool `json:"requestArchive,omitempty"`
+	// RequestArchiveMaxMB is how much of each body the archive keeps, in
+	// MiB: 0 for 32, at most 1024 (#447)
+	RequestArchiveMaxMB int `json:"requestArchiveMaxMB,omitempty"`
 	// CodexWarmup starts a ChatGPT account's next window as soon as the
 	// last one resets, with one tiny request, so it counts from then (a
 	// Codex window starts at its first use): "" off, "week" the weekly
@@ -88,12 +110,18 @@ type Settings struct {
 	// CodexAutoReset are the ChatGPT accounts (lower-case) that spend one
 	// of their rate-limit resets by themselves once their weekly window is
 	// used up and no other account can take the request: at most one a
-	// week each (see provider.AutoUseCodexReset).
+	// week each (see provider.AutoUseCodexReset); and one about to run out
+	// unused half an hour before it does, or at once when the account is
+	// held up past then (provider.SpendExpiringCodexResets).
 	CodexAutoReset []string `json:"codexAutoReset,omitempty"`
 	// WorkBuddyCheckin presses WorkBuddy's daily check-in (签到) for each
 	// signed-in WorkBuddy (China) account once a Beijing day, claiming the
 	// credits it gives while its event runs.
 	WorkBuddyCheckin bool `json:"workbuddyCheckin,omitempty"`
+	// TraeCheckin presses Trae CN's daily check-in (每日签到) for each
+	// signed-in Trae CN account (its plugin's) once a Beijing day, claiming
+	// the credits it gives.
+	TraeCheckin bool `json:"traeCheckin,omitempty"`
 	// NoStats stops the one event a day that counts magpie's users (see
 	// internal/stats).
 	NoStats bool `json:"noStats,omitempty"`
@@ -103,6 +131,19 @@ type Settings struct {
 	// puts it in as it quits, and Settings' version row still offers it.
 	NoUpdatePill bool   `json:"noUpdatePill,omitempty"`
 	UpdateSkip   string `json:"updateSkip,omitempty"`
+	// NoAutoUpdate stops magpie asking for a newer version by itself, and
+	// so downloading one (#472): only Settings' Check, or magpie update,
+	// asks then. UpdateEvery is how often it asks otherwise, in minutes:
+	// one of UpdateEveries, 0 for every six hours.
+	NoAutoUpdate bool `json:"noAutoUpdate,omitempty"`
+	UpdateEvery  int  `json:"updateEvery,omitempty"`
+	// UpdateMirror is a GitHub download mirror an update's file is fetched
+	// through, its prefix put before the release's github.com URL
+	// (https://mirror.example/https://github.com/…): "" for none, which is
+	// the default — magpie names no mirror of its own. The file is still
+	// checked against the SHA-256 the update feed at usemagpie.ai gives,
+	// never one from the mirror. magpie update mirror sets it.
+	UpdateMirror string `json:"updateMirror,omitempty"`
 	// Vision is the model that describes an image to a model that can't see
 	// it: a model's id (provider/model, group/<id>), "off" to turn such an
 	// image away, or empty for one magpie picks (see gateway.seer).
@@ -113,6 +154,12 @@ type Settings struct {
 	// "off" turns the video a request that names no model gets off too
 	// (gateway.videomaker).
 	ImageGen string `json:"imageGen,omitempty"`
+	// Searcher is the provider that searches the web for a model that
+	// can't: "<provider>" with the small model magpie picks of it,
+	// "<provider>/<model>", or empty for the one magpie picks
+	// (gateway.searcher). One that is gone, off or can't search gives way
+	// to magpie's pick.
+	Searcher string `json:"searcher,omitempty"`
 	// TrayUsages are the subscriptions and plans whose windows are shown
 	// beside the tray icon, in the order shown, each by its provider and
 	// account ("claude|a@b.c"); none when empty.
@@ -128,6 +175,11 @@ type Settings struct {
 	// is its windows stacked alone, a thin line between one card and the
 	// next.
 	TrayNoLogos bool `json:"trayNoLogos,omitempty"`
+	// Lightweight lets the webview of a window closed — the tray panel or
+	// the main window — go once it has stayed closed a while, and makes it
+	// again when it is opened (#580): less memory, a moment's wait. This
+	// computer's own (KeepOwn).
+	Lightweight bool `json:"lightweight,omitempty"`
 	// QuotaLeft shows a subscription's windows by how much of each is left,
 	// not used: the Usage page, the tray panel and the menu bar alike.
 	QuotaLeft bool `json:"quotaLeft,omitempty"`
@@ -145,6 +197,29 @@ type Settings struct {
 	// (#335) — but for two in one list that would read the same, which keep
 	// it (see provider.Labels).
 	PlainNames bool `json:"plainNames,omitempty"`
+	// PlainOwnNames, with PlainNames off, has those lists name a model the
+	// user gave a name of their own by that name alone, just as they wrote
+	// it (#92: "Opus 5.5", not "Opus 5.5 · Claude Code"), the vendor's names
+	// keeping their provider's after them (see provider.Labels).
+	PlainOwnNames bool `json:"plainOwnNames,omitempty"`
+	// CodexAgentsV1 has the OpenAI models magpie hands Codex — the ChatGPT
+	// account's own, their codex/ ids and the groups one is in — say
+	// multi_agent_version "v1" (#141): their subagents are then handed
+	// their tasks as text, which a magpie-served subagent can read, where
+	// V2's are sealed by OpenAI's server. Codex's features.multi_agent_v2
+	// still wins, and a thread keeps the version it started with.
+	CodexAgentsV1 bool `json:"codexAgentsV1,omitempty"`
+	// CodexTitles is where the requests Codex makes for a thread's title
+	// (thread_title, thread_title_reconsideration: a hidden turn of their
+	// own, on Codex's own model through its ChatGPT sign-in) go (#705): ""
+	// as Codex sends them, "off" answered by magpie with no title and sent
+	// nowhere, or a model's id (provider/model, group/<id>) that writes it.
+	CodexTitles string `json:"codexTitles,omitempty"`
+	// ChinaMirror is the Plugins page's 「国内镜像」 switch: the plugin list,
+	// npm (the plugins' packages and what npm says of them) and Bun's
+	// downloads are asked of mirrors in China first, and of their official
+	// addresses after (see source.China).
+	ChinaMirror bool `json:"chinaMirror,omitempty"`
 	// TextSize is how large the window's and the tray panel's pages are
 	// drawn, in percent (one of TextSizes): the webviews' own zoom, as a
 	// browser's, so the text and everything around it grow together.
@@ -157,6 +232,11 @@ type Settings struct {
 	AgentOrder   []string `json:"agentOrder,omitempty"`
 	AgentsHidden []string `json:"agentsHidden,omitempty"`
 	AgentsShown  []string `json:"agentsShown,omitempty"`
+	// UsageOrder is how the Usage page's cards are listed, by provider id,
+	// as they were dragged there; one it doesn't name follows in magpie's
+	// own order. Only the page's: the order providers are tried in is the
+	// Providers page's.
+	UsageOrder []string `json:"usageOrder,omitempty"`
 	// Visible narrows the models an agent is shown, by agent id: the
 	// families (the tag a provider or group is given), provider ids and
 	// group ids its lists hold. An agent it doesn't name is shown them all.
@@ -213,6 +293,18 @@ type Settings struct {
 	// the routing groups, the usage records and what a call is priced at —
 	// keeps the name magpie knows the model by.
 	ModelWires map[string]string `json:"modelWires,omitempty"`
+	// ModelAPIs is the one API a model is asked on at its provider, by
+	// "<provider id>/<model id>": chat, responses or anthropic, for a relay
+	// whose one key serves some models on one and others on another
+	// (01huadalang on Discord). Absent leaves it to the vendor's list and
+	// to each URL the provider has (see provider.SetModelAPI).
+	ModelAPIs map[string]string `json:"modelAPIs,omitempty"`
+	// ModelSameAs is the model another vendor sells under another name
+	// that a model is, by "<provider id>/<model id>": the routing groups
+	// magpie finds (provider's autoGroups) merge it with that one rather
+	// than by its own id, for an id no rule of magpie's matches up
+	// (kyzhouxu, #583). Absent leaves it to its id.
+	ModelSameAs map[string]string `json:"modelSameAs,omitempty"`
 	// The main window's size when it was last resized, width and height,
 	// so it opens at it again after a restart.
 	Window []int `json:"window,omitempty"`
@@ -331,6 +423,8 @@ var (
 	Warmups = []string{"", "week", "all"}
 	// TrayEvery are TrayUsageEvery's values, in minutes.
 	TrayEvery = []int{1, 3, 5, 10, 30}
+	// UpdateEveries are UpdateEvery's values, in minutes.
+	UpdateEveries = []int{30, 60, 360, 1440}
 	// TextSizes are TextSize's values, in percent. None is under 100: the
 	// webviews' zoom on Windows and Linux (Wails' SetZoom) goes no lower.
 	TextSizes = []int{100, 110, 125, 150}
@@ -404,6 +498,16 @@ func CarryPerModel(in, cur *Settings) {
 	}
 }
 
+// KeepOwn puts back cur's settings that are this computer's own, which a
+// sync or a restored backup never brings from another: the window's size,
+// the proxy, the Dock, and what the menu bar or tray shows beside magpie's
+// icon (yoooo on Discord: usage turned off on a Mac came back from a
+// Windows box that shows it).
+func (s *Settings) KeepOwn(cur Settings) {
+	s.Window, s.Proxy, s.Dock, s.DockWindow, s.Lightweight = cur.Window, cur.Proxy, cur.Dock, cur.DockWindow, cur.Lightweight
+	s.TrayUsages, s.TrayUsage, s.TrayUsageEvery, s.TrayNoLogos = cur.TrayUsages, cur.TrayUsage, cur.TrayUsageEvery, cur.TrayNoLogos
+}
+
 // RenamePerModel moves what the user said of a provider's models to the id
 // it has now: in every per-model map (see ModelNames) each key beginning
 // with from+"/" is rewritten to to+"/", and it says whether any key moved at
@@ -443,22 +547,26 @@ func renameInMap(m reflect.Value, from, to string) bool {
 }
 
 // Path is the settings file.
-func Path() string {
-	if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
-		return filepath.Join(x, "magpie", "settings.json")
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "magpie", "settings.json")
-}
+func Path() string { return filepath.Join(Dir(), "settings.json") }
 
-// Dir is the folder every magpie file lives in.
-func Dir() string { return filepath.Dir(Path()) }
+// Dir is the folder every magpie file lives in: the data folder beside a
+// portable magpie (appdir.Portable), else ~/.config/magpie.
+func Dir() string { return appdir.Config() }
+
+// Portable is the data folder of a portable magpie, or "" when installed.
+func Portable() string { return appdir.Portable() }
+
+// Serialize reads with saves too: the editor preserves hard links by
+// writing them in place rather than replacing their inode.
+var fileMu sync.RWMutex
 
 // Load reads the settings; anything missing or unreadable is the default.
 func Load() Settings {
+	fileMu.RLock()
+	defer fileMu.RUnlock()
 	var s Settings
-	if b, err := os.ReadFile(Path()); err == nil {
-		_ = json.Unmarshal(b, &s)
+	if b, err := steady.ReadFile(Path()); err == nil {
+		_ = json.Unmarshal(bytes.TrimPrefix(b, []byte("\xef\xbb\xbf")), &s)
 	}
 	return s.normal()
 }
@@ -485,6 +593,8 @@ func CheckProxy(p string) error {
 
 // Save validates and writes the settings.
 func Save(s Settings) error {
+	fileMu.Lock()
+	defer fileMu.Unlock()
 	s = s.normal()
 	if !slices.Contains(Themes, s.Theme) {
 		return fmt.Errorf("theme must be one of %v, not %q", Themes, s.Theme)
@@ -515,6 +625,14 @@ func Save(s Settings) error {
 	if !slices.Contains(TrayEvery, s.TrayUsageEvery) {
 		return fmt.Errorf("the menu bar's usage is refreshed every %v minutes, not %d", TrayEvery, s.TrayUsageEvery)
 	}
+	if !slices.Contains(UpdateEveries, s.UpdateEvery) {
+		return fmt.Errorf("magpie checks for updates every %v minutes, not %d", UpdateEveries, s.UpdateEvery)
+	}
+	if m := s.UpdateMirror; m != "" {
+		if u, err := url.Parse(m); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			return fmt.Errorf("an update mirror is an http(s) address put before the github.com URL, like https://mirror.example/, not %q", m)
+		}
+	}
 	if s.UsageAlert < 0 || s.UsageAlert > 100 {
 		return fmt.Errorf("a usage alert is at a percentage from 1 to 100, or 0 for off, not %d", s.UsageAlert)
 	}
@@ -524,6 +642,10 @@ func Save(s Settings) error {
 	if !slices.Contains(TextSizes, s.TextSize) {
 		return fmt.Errorf("text size must be one of %v percent, not %d", TextSizes, s.TextSize)
 	}
+	s.OTel.Endpoint = strings.TrimRight(strings.TrimSpace(s.OTel.Endpoint), "/")
+	if err := s.OTel.Check(); err != nil {
+		return err
+	}
 	s.Proxy = strings.TrimSpace(s.Proxy)
 	if err := CheckProxy(s.Proxy); err != nil {
 		return err
@@ -532,6 +654,11 @@ func Save(s Settings) error {
 	if s.Vision != "" && s.Vision != "off" && !strings.Contains(s.Vision, "/") {
 		return fmt.Errorf("the vision model must be a model's id such as openai/gpt-5-mini, or off, not %q", s.Vision)
 	}
+	s.CodexTitles = strings.TrimSpace(s.CodexTitles)
+	if s.CodexTitles != "" && s.CodexTitles != "off" && !strings.Contains(s.CodexTitles, "/") {
+		return fmt.Errorf("the model for Codex's titles must be a model's id such as openai/gpt-5-mini, or off, not %q", s.CodexTitles)
+	}
+	s.Searcher = strings.TrimSpace(s.Searcher)
 	s.ImageGen = strings.TrimSpace(s.ImageGen)
 	if s.ImageGen != "" && s.ImageGen != "off" && !strings.Contains(s.ImageGen, "/") {
 		return fmt.Errorf("the image generation model must be a model's id such as openai/gpt-image-1, or off, not %q", s.ImageGen)
@@ -542,6 +669,7 @@ func Save(s Settings) error {
 	}
 	s.RedactRules = rules
 	s.AgentOrder, s.AgentsHidden, s.AgentsShown = ids(s.AgentOrder), ids(s.AgentsHidden), ids(s.AgentsShown)
+	s.UsageOrder = ids(s.UsageOrder)
 	s.TrayUsages = ids(s.TrayUsages)
 	for i, u := range s.CodexAutoReset {
 		s.CodexAutoReset[i] = strings.ToLower(u)
@@ -551,6 +679,19 @@ func Save(s Settings) error {
 	if len(s.TrayUsages) > 0 {
 		s.TrayUsage = s.TrayUsages[0]
 	}
+	// Load may have returned defaults or only part of an unreadable file.
+	// Do not replace it, including its permissions, with those values.
+	if b, err := steady.ReadFile(Path()); err == nil {
+		b = bytes.TrimPrefix(b, []byte("\xef\xbb\xbf"))
+		if len(bytes.TrimSpace(b)) != 0 {
+			var stored Settings
+			if err := json.Unmarshal(b, &stored); err != nil {
+				return fmt.Errorf("could not read settings at %s; repair or move that file aside before saving: %w", Path(), err)
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("could not read settings at %s: %w", Path(), err)
+	}
 	if err := os.MkdirAll(Dir(), 0o755); err != nil {
 		return err
 	}
@@ -558,7 +699,22 @@ func Save(s Settings) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(Path(), append(b, '\n'), 0o644)
+	// Restrict existing settings without changing the owner's permissions.
+	if fi, err := os.Stat(Path()); err == nil && fi.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(Path(), fi.Mode().Perm()&0o700); err != nil {
+			return err
+		}
+	}
+	// Open without truncating: read-only settings must still reject saves,
+	// and a new file must have the private mode WriteAtomic will preserve.
+	f, err := os.OpenFile(Path(), os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return edit.WriteAtomic(Path(), append(b, '\n'))
 }
 
 func (s Settings) normal() Settings {
@@ -582,6 +738,9 @@ func (s Settings) normal() Settings {
 	}
 	if s.TrayUsageEvery == 0 {
 		s.TrayUsageEvery = 3
+	}
+	if s.UpdateEvery == 0 {
+		s.UpdateEvery = 360
 	}
 	if s.TextSize == 0 {
 		s.TextSize = 100

@@ -1,5 +1,15 @@
 package gateway
 
+// PLUGIN-SERVED (see AGENTS.md): Command Code's plan ("commandcode-plan") is
+// a deprecated built-in subscription served by its plugin,
+// @magpie-community/opencode-commandcode-auth, once moved onto it
+// (provider.Moved; the default for a new sign-in). A moved one's sign-ins,
+// models, requests and usage are all the plugin's, never this code's (only
+// the move, in migrate*.go, still reads its accounts). A fix here alone
+// doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/commandcode) and raise the
+// mover's min in internal/provider/migrate_side.go.
+
 // A Command Code account on the Go plan has no Provider API: its key is
 // only taken where the CLI itself asks, POST /alpha/generate. The request
 // is written as the CLI (command-code 1.72.2) writes it — its
@@ -224,7 +234,9 @@ func cmdRequest(req *Request, model string) []byte {
 		"max_tokens": cmdMaxTokens, "stream": true,
 	}
 	if req.MaxTokens > 0 {
-		params["max_tokens"] = req.MaxTokens
+		// within what the model gives and Command Code takes: more is
+		// refused, the whole request with it
+		params["max_tokens"] = min(req.MaxTokens, provider.CommandCodeOutputOf(model))
 	}
 	if req.Temp != nil {
 		params["temperature"] = *req.Temp

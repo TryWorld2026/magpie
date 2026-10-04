@@ -54,7 +54,15 @@ type Model struct {
 	// Free is set by the plugin on a model the plan serves at no cost to
 	// its allowance (WorkBuddy's "credits": "x0.00")
 	Free bool `json:"free"`
-	Cost *struct {
+	// Rate is set by the plugin on a model whose price its vendor lists:
+	// the credits a request costs, as a multiple (Qoder's price_factor
+	// 0.5, WorkBuddy's "credits": "x0.03"), and RateWas the price before a
+	// discount running now. The plugin gives either as a number or as the
+	// vendor writes it ("x0.03"), on the model it lists (m.rate,
+	// m.rateWas); 0 is none.
+	Rate    float64 `json:"rate"`
+	RateWas float64 `json:"rateWas"`
+	Cost    *struct {
 		Input  float64 `json:"input"`
 		Output float64 `json:"output"`
 	} `json:"cost"`
@@ -86,6 +94,12 @@ type Provider struct {
 	// Accounts are the accounts signed in to it, the one kept under its
 	// own id first; SignedIn, AuthType and AccountID are that one's.
 	Accounts []Account `json:"accounts"`
+	// MaxConcurrency is how many requests the plugin says each of its
+	// accounts takes at once (magpie's own field, which OpenCode ignores:
+	// the auth hook's maxConcurrency, else package.json's
+	// magpie.maxConcurrency); 0 for none said. The user's setting on the
+	// provider goes over it.
+	MaxConcurrency int `json:"maxConcurrency,omitempty"`
 }
 
 // Account is one account a provider is signed in to: Key is where
@@ -103,9 +117,18 @@ type Account struct {
 }
 
 var (
-	provMu    sync.Mutex
-	provCache []Provider
-	provGood  bool
+	provMu      sync.Mutex
+	provWriteMu sync.Mutex
+	provCache   []Provider
+	// Failed reads keep the old list. Cached tries once per invalidation,
+	// with bounded retries, then waits for a sign-in or plugin change.
+	provGood   bool
+	provBusy   bool
+	provTried  bool
+	provCancel context.CancelFunc
+	// provEpoch counts the invalidations (forgetProviders), so a refresh
+	// that began before one doesn't put what it read over the newer state.
+	provEpoch uint64
 )
 
 func providersPath() string { return filepath.Join(settings.Dir(), "plugin-providers.json") }
@@ -123,6 +146,11 @@ func ListedAt() (time.Time, bool) {
 func forgetProviders() {
 	provMu.Lock()
 	provGood = false
+	provTried = false
+	provEpoch++
+	if provCancel != nil {
+		provCancel()
+	}
 	provMu.Unlock()
 }
 
@@ -133,15 +161,110 @@ func Providers(ctx context.Context) ([]Provider, error) {
 	if err := Call(ctx, "providers", map[string]any{"proxies": listingProxies()}, &ps); err != nil {
 		return nil, err
 	}
+	ps = commitProviders(ps, nil)
+	return ps, nil
+}
+
+// commitProviders keeps ps for Cached and on disk, with a list a plugin
+// fell back to replaced by the one it told last, and gives what was kept.
+// epoch, when given, is the invalidation the read began under: a newer
+// one that went by meanwhile stands, and ps is then only given back.
+func commitProviders(ps []Provider, epoch *uint64) []Provider {
+	// Serialize publishers without blocking Cached on Windows rename retries.
+	provWriteMu.Lock()
+	defer provWriteMu.Unlock()
 	provMu.Lock()
+	if epoch != nil && provEpoch != *epoch {
+		provMu.Unlock()
+		return ps
+	}
 	ps = keepListed(ps, provCache)
 	ps = keepUnloaded(ps, provCache)
-	provCache, provGood = ps, true
+	provCache, provGood, provTried = ps, true, true
 	provMu.Unlock()
 	if b, err := json.Marshal(ps); err == nil {
 		_ = writeWhole(providersPath(), b)
 	}
-	return ps, nil
+	return ps
+}
+
+// refreshDeadline bounds one providers RPC after host initialization: a plugin host
+// that stays alive but never answers the providers call must not leave
+// the refresh (and Refreshed, and Settle) waiting for ever.
+var refreshDeadline = 30 * time.Second
+
+// refreshTries is how many times one background refresh asks before it
+// gives up until the next invalidation; refreshBackoff is how long it waits
+// before the second ask, doubled for each one after.
+var (
+	refreshTries   = 3
+	refreshBackoff = 250 * time.Millisecond
+)
+
+// refreshProviders is one bounded ask of the plugins for their providers,
+// kept for Cached when it was answered while the invalidation it began
+// under still stood. Tests replace it to stall or fail an ask without Bun.
+var refreshProviders = func(ctx context.Context, epoch uint64) error {
+	var ps []Provider
+	if err := callWithTimeout(ctx, "providers", map[string]any{"proxies": listingProxies()}, &ps, refreshDeadline); err != nil {
+		return err
+	}
+	commitProviders(ps, &epoch)
+	return nil
+}
+
+// refreshProvidersWithRetry asks the plugins for their providers with
+// a deadline, retrying a failure with backoff a bounded number of times.
+// A failure keeps the providers already kept, as it keeps the ones on
+// disk; a newer invalidation during the refresh is not overwritten by it.
+func refreshProvidersWithRetry(ctx context.Context, epoch uint64) {
+	wait := refreshBackoff
+	for try := 0; try < refreshTries; try++ {
+		if try > 0 {
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return
+			}
+			wait *= 2
+		}
+		err := refreshProviders(ctx, epoch)
+		if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		// a failure keeps what is kept already, and is retried; one that
+		// began before a newer invalidation stops here rather than going
+		// on with answers for a state that is gone
+		provMu.Lock()
+		stale := provEpoch != epoch
+		provMu.Unlock()
+		if stale {
+			return
+		}
+	}
+}
+
+// Keep the same admission across intervening changes, so Refreshed waits for
+// the latest state too. Invalidation cancels only the old listing, not startup.
+func refreshProvidersInBackground(ctx context.Context, epoch uint64) {
+	defer refreshing.Done()
+	for {
+		if Running() || HasBun() {
+			refreshProvidersWithRetry(ctx, epoch)
+		}
+		provMu.Lock()
+		provCancel()
+		if provEpoch != epoch && !provGood && !provTried {
+			epoch = provEpoch
+			ctx, provCancel = context.WithCancel(context.Background())
+			provTried = true
+			provMu.Unlock()
+			continue
+		}
+		provBusy, provCancel = false, nil
+		provMu.Unlock()
+		return
+	}
 }
 
 // ProxyFor is the proxy choice (netproxy.With's) of the provider's
@@ -224,7 +347,7 @@ func keepUnloaded(ps, last []Provider) []Provider {
 		told[p.Spec] = true
 	}
 	installed := map[string]bool{}
-	for _, e := range Load().Plugins {
+	for _, e := range list().Plugins {
 		installed[e.Spec] = true
 	}
 	for _, p := range last {
@@ -239,7 +362,13 @@ func keepUnloaded(ps, last []Provider) []Provider {
 // had just been asked, without Bun; nil forgets them.
 func UseCached(ps []Provider) {
 	provMu.Lock()
-	provCache, provGood = ps, ps != nil
+	provCache, provGood, provTried = ps, ps != nil, ps != nil
+	// a refresh in flight began under what this replaces: what it read
+	// must not go over it
+	provEpoch++
+	if provCancel != nil {
+		provCancel()
+	}
 	provMu.Unlock()
 	// as asked with the plugins as they are now
 	listSeen.Lock()
@@ -250,8 +379,14 @@ func UseCached(ps []Provider) {
 // refreshing is Cached's refreshes in the background.
 var refreshing sync.WaitGroup
 
+// Refreshed waits for Cached's refreshes in the background to end, the
+// host left running: for tests that watch the providers' list on disk.
+func Refreshed() { refreshing.Wait() }
+
 // Settle waits for Cached's refreshes to end, then stops the host: for
-// tests, whose folders the host runs in go when they end.
+// tests, whose folders the host runs in go when they end. Each ask is
+// bounded and the retries are few, so this waits a bounded time even for
+// a host that never answers.
 func Settle() {
 	refreshing.Wait()
 	Restart()
@@ -272,6 +407,7 @@ func Settle() {
 // provider's sign-in is read afresh from plugin-auth.json.
 func Cached() []Provider {
 	checkList()
+	l := list() // one read of plugins.json for the whole call
 	provMu.Lock()
 	ps := provCache
 	good := provGood
@@ -281,13 +417,13 @@ func Cached() []Provider {
 			_ = json.Unmarshal(b, &ps)
 		}
 	}
-	if len(Load().Plugins) == 0 {
+	if len(l.Plugins) == 0 {
 		return nil
 	}
 	auth := readAuth()
 	out := make([]Provider, 0, len(ps))
 	on := map[string]bool{}
-	for _, e := range Load().Plugins {
+	for _, e := range l.Plugins {
 		if !e.Off {
 			on[e.Spec] = true
 		}
@@ -313,18 +449,23 @@ func Cached() []Provider {
 		}
 		out = append(out, p)
 	}
-	if !good && len(Load().Plugins) > 0 {
-		// refreshed in the background: a sign-in or the plugins changed
-		refreshing.Add(1)
-		go func() {
-			defer refreshing.Done()
-			if Running() || HasBun() {
-				_, _ = Providers(context.Background())
-			}
-		}()
+	if !good && len(l.Plugins) > 0 {
+		// refreshed in the background: a sign-in or the plugins changed.
+		// Whether one is already in flight is read and set under one lock,
+		// so two callers asking at once start one refresh, not two.
 		provMu.Lock()
-		provGood = true // one refresh at a time; a failure is retried on the next change
+		start := !provBusy && !provGood && !provTried
+		var ctx context.Context
+		if start {
+			ctx, provCancel = context.WithCancel(context.Background())
+			provBusy, provTried = true, true
+			refreshing.Add(1)
+		}
+		epoch := provEpoch
 		provMu.Unlock()
+		if start {
+			go refreshProvidersInBackground(ctx, epoch)
+		}
 	}
 	return out
 }
@@ -512,6 +653,8 @@ func SignOut(ctx context.Context, provider, account string) error {
 	if Running() {
 		return Call(ctx, "signOut", map[string]any{"provider": provider, "account": account}, nil)
 	}
+	unlock := lockAuth()
+	defer unlock()
 	var m map[string]json.RawMessage
 	b, err := steady.ReadFile(AuthPath())
 	if err != nil {
@@ -679,6 +822,9 @@ type UsageWindow struct {
 	ResetsAt  string   `json:"resetsAt"` // RFC 3339
 	ResetSecs int64    `json:"resetSecs"`
 	Display   string   `json:"display"`
+	Amount    float64  `json:"amount"` // of Limit, in Unit: the window's own count, used
+	Limit     float64  `json:"limit"`
+	Unit      string   `json:"unit"`
 	Span      float64  `json:"span"` // seconds
 	Model     string   `json:"model"`
 	Models    []string `json:"models"`

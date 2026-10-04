@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -96,7 +97,7 @@ func TestAnsweredRequestKeepsItsIDAndEndpoint(t *testing.T) {
 	if got.Session != "magpie-override" || got.NativeSession != "client-session" {
 		t.Fatalf("session headers lost: %+v", got)
 	}
-	if got.RequestID != "chatcmpl-77" || got.Endpoint != "/v1/chat/completions" || got.Error != "" || got.ErrType != "" {
+	if got.ResponseID == "" || got.ResponseID != clientResponseID(t, provider.Chat, rec.Body.String(), false) || got.RequestID != "chatcmpl-77" || got.Endpoint != "/v1/chat/completions" || got.Error != "" || got.ErrType != "" {
 		t.Errorf("%+v", got)
 	}
 }
@@ -121,6 +122,9 @@ func TestTurnedAwayRequestIsLogged(t *testing.T) {
 // its name for the error and the id of the request. The reply is that
 // status, not one guessed from the words, and the log has all three.
 func TestClaudeFailureKeepsClaudeCodesStatus(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a shell script stands in for Claude Code")
+	}
 	dir := t.TempDir()
 	script := `#!/bin/sh
 while read -r line; do
@@ -158,6 +162,9 @@ done
 // The id of an answered Claude Code request is the one on its messages,
 // given with its stream's usage.
 func TestClaudeAnswerKeepsClaudeCodesRequestID(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a shell script stands in for Claude Code")
+	}
 	dir := t.TempDir()
 	script := `#!/bin/sh
 while read -r line; do

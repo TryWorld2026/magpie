@@ -38,7 +38,7 @@ func Rename(from, to string) error {
 	// subscription itself can't
 	custom := i >= 0 && hasEndpoint(f.Providers[i])
 	_, signedIn := find(Accounts(), from)
-	sub := slices.Contains(accountIDs, from)
+	sub := subscriptionID(from)
 	if (signedIn || sub) && !custom {
 		return fmt.Errorf("%s is a subscription: its id is its agent's", from)
 	}
@@ -47,7 +47,7 @@ func Rename(from, to string) error {
 		return errors.New(`"magpie" is what agents call the gateway itself; pick another id`)
 	case to == strings.TrimSuffix(GroupPrefix, "/"):
 		return errors.New(`"group" starts the ids of routing groups; pick another id`)
-	case slices.Contains(accountIDs, to):
+	case subscriptionID(to):
 		return fmt.Errorf("%q is the id of the %s subscription; pick another", to, to)
 	}
 	if i < 0 {
@@ -72,6 +72,11 @@ func Rename(from, to string) error {
 			f.Providers[j].Fallback[k] = renamedRef(m, from, to)
 		}
 	}
+	for j, id := range f.Order {
+		if id == from {
+			f.Order[j] = to
+		}
+	}
 	for j := range f.Groups {
 		g := &f.Groups[j]
 		for k, m := range g.Members {
@@ -82,6 +87,9 @@ func Rename(from, to string) error {
 		}
 		for k, m := range g.Fast {
 			g.Fast[k] = renamedRef(m, from, to)
+		}
+		for k, m := range g.Off {
+			g.Off[k] = renamedRef(m, from, to)
 		}
 		g.Classifier = renamedRef(g.Classifier, from, to)
 		g.Pick = renamedRef(g.Pick, from, to)

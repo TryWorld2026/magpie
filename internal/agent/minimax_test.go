@@ -47,6 +47,7 @@ func miniMaxHome(t *testing.T) (home, path string) {
 	t.Helper()
 	home = t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	t.Setenv("MINIMAX_DATA_DIR", "")
@@ -118,6 +119,7 @@ func readMiniMax(t *testing.T, path string) (miniMaxFile, string) {
 // default and variant they had.
 func TestMiniMaxCode(t *testing.T) {
 	home, path := miniMaxHome(t)
+	visionOff(t) // flash is text-only only while no model describes images to it
 	a := miniMax(home)
 	if a.Path != path || !a.Detected() {
 		t.Fatalf("path %q, detected %v", a.Path, a.Detected())

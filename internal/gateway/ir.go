@@ -43,9 +43,10 @@ type Part struct {
 	Args json.RawMessage // a JSON object
 
 	// tool_result
-	CallID  string
-	IsError bool
-	Images  []Part // the images the tool returned beside its text
+	CallID     string
+	IsError    bool
+	Images     []Part         // the images the tool returned beside its text
+	Standalone map[string]any // native Responses notification with no call ID
 
 	// thinking
 	Signature string
@@ -58,6 +59,8 @@ type Part struct {
 type Hit struct {
 	Title string `json:"title"`
 	URL   string `json:"url"`
+	// PageAge is how old the search said the page is, "" when it didn't
+	PageAge string `json:"page_age,omitempty"`
 }
 
 // attachmentText is the fallback when a protocol cannot carry a Gemini file.
@@ -124,6 +127,9 @@ type Request struct {
 	// Anthropic upstream: a relay that serves only Claude Code turns a
 	// request without it away (#359).
 	Metadata json.RawMessage
+	// Schema is the JSON schema an Anthropic client asked the answer to fit
+	// (output_config.format, of type json_schema).
+	Schema json.RawMessage
 	// GeminiCompat is the upstream being Gemini's OpenAI-compatible API
 	// (AI Studio's, or a proxy in front of it on this machine or the LAN),
 	// which gives the model's thoughts only when asked in thinking_config.
@@ -136,10 +142,12 @@ type Request struct {
 // nsTool is a tool as a Responses client knows it: by its namespace and its
 // name in it (Codex's collaboration.spawn_agent). Search is Codex's own
 // tool search, offered to the model as a function and handed back as the
-// tool_search_call Codex runs.
+// tool_search_call Codex runs. Custom is a custom (freeform) tool, offered
+// as a function taking its input, its call handed back as the
+// custom_tool_call Codex runs.
 type nsTool struct {
 	Namespace, Name string
-	Search          bool
+	Search, Custom  bool
 }
 
 // EventKind is what a streamed event carries.
@@ -156,6 +164,7 @@ const (
 	KUsage                      // Usage
 	KError                      // Text
 	KSearch                     // Text (the query), Hits: a web search run for the model
+	KImage                      // Name (media type), Text (base64): an image the model made
 )
 
 // Event is one thing a streaming reply said.
@@ -191,7 +200,9 @@ type Usage struct {
 	// headers (Claude Code's own for a subscription); ErrType: what a
 	// failed request's error body called the error
 	RequestID string `json:"request_id,omitempty"`
-	ErrType   string `json:"err_type,omitempty"`
+	// ResponseID is the final client response ID, independent of request headers.
+	ResponseID string `json:"response_id,omitempty"`
+	ErrType    string `json:"err_type,omitempty"`
 }
 
 // prompt is every token the prompt came to, as OpenAI's and Gemini's
@@ -222,6 +233,9 @@ func (u *Usage) add(v Usage) {
 	}
 	if v.RequestID != "" {
 		u.RequestID = v.RequestID
+	}
+	if v.ResponseID != "" {
+		u.ResponseID = v.ResponseID
 	}
 	if v.ErrType != "" {
 		u.ErrType = v.ErrType
@@ -305,6 +319,9 @@ func (c *collector) add(ev Event) {
 	case KSearch:
 		c.closeTool()
 		c.res.Parts = append(c.res.Parts, Part{Kind: Search, Text: ev.Text, Hits: ev.Hits})
+	case KImage:
+		c.closeTool()
+		c.res.Parts = append(c.res.Parts, Part{Kind: Image, MediaType: ev.Name, Data: ev.Text})
 	}
 }
 
@@ -319,6 +336,18 @@ func (c *collector) finish() Result {
 		}
 	}
 	return c.res
+}
+
+// saidAnything reports whether a reply has more than thinking: text, a
+// call, a search or an image. A turn that only thought and then failed is
+// the failure, not an answer with nothing in it.
+func saidAnything(parts []Part) bool {
+	for _, p := range parts {
+		if p.Kind != Thinking {
+			return true
+		}
+	}
+	return false
 }
 
 // hasTool reports whether a result calls any tool.
@@ -464,18 +493,33 @@ func effortOf(s string) string {
 // effortRank orders the reasoning levels agents and vendors name.
 var effortRank = []string{"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 
+// ByStrength is efforts weakest first, in effortRank's order; a level it
+// doesn't know keeps its place among the others of its kind, after them.
+func ByStrength(efforts []string) []string {
+	rank := func(e string) int {
+		if i := slices.Index(effortRank, e); i >= 0 {
+			return i
+		}
+		return len(effortRank)
+	}
+	out := slices.Clone(efforts)
+	slices.SortStableFunc(out, func(a, b string) int { return rank(a) - rank(b) })
+	return out
+}
+
 // fitEffort is the level of the model's own nearest the one asked for — a
 // tie goes up — or the one asked for when the model's aren't known. Codex
 // asks "medium" of a model it was given no levels for, and an agent's
 // setting can outlive the model it was picked for; GLM-5.3 takes low, high
 // and max only.
 //
-// Codex's ultra is max to a model without an ultra of its own (a routing
-// group offers it when a ChatGPT model in it does): sent as max, or the
-// nearest the model has below it.
+// Codex's ultra is no API's level, whatever a list says (ChatGPT's lists
+// it for Codex's picker; magpie offers it on Copilot's gpt-6.1-sol, #656):
+// it is sent as max, or the nearest the model has below it.
 func fitEffort(want string, levels []string) string {
-	if want == "ultra" && !slices.Contains(levels, want) {
+	if want == "ultra" {
 		want = "max"
+		levels = slices.DeleteFunc(slices.Clone(levels), func(l string) bool { return l == "ultra" })
 	}
 	if len(levels) == 0 || slices.Contains(levels, want) {
 		return want

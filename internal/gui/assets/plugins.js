@@ -2,15 +2,20 @@
 // signs in to through someone else's code. Discover lists the plugins
 // magpie suggests (the community repo's list, with what npm says of each
 // now) and finds the rest on npm; Installed is what was added, to sign in
-// with, update, switch off or remove. Everything comes from
-// /api/plugins/market; a sign-in happens in the Providers add sheet, as
-// every other subscription's does.
+// with, update, switch off or remove. Each part is drawn as it comes
+// (#488): what's installed from /api/plugins, the plugins suggested from
+// /api/plugins/listings, and what npm says of them (versions, downloads)
+// from /api/plugins/npm after; a sign-in happens in the Providers add
+// sheet, as every other subscription's does.
 (() => {
   const page = $("#view-plugins");
   if (!page) return;
 
-  let market = null;     // /api/plugins/market
-  let failed = "";       // why the market couldn't be loaded
+  let mine = null;       // /api/plugins: what's installed
+  let listings = null;   // /api/plugins/listings: the plugins suggested
+  const npm = {};        // /api/plugins/npm: package → what npm says of it
+  let failed = "";       // why what's installed couldn't be loaded
+  let failedList = "";   // ...and the plugins suggested
   let tab = "discover";
   try { tab = localStorage.getItem("magpie.pluginTab") || tab; } catch {}
   let query = "";
@@ -18,6 +23,8 @@
   let searchTimer = 0;
   const busy = new Map(); // package → "add" | "remove" | "upgrade" | "off"
   let asking = null;     // { pkg, op }: a remove or switch-off waiting on the user's yes
+  let checking = false;  // Check for updates: npm being asked now
+  let checked = null;    // ...and what it said: { at, by: spec → check }
   let shown = "";
 
   const SEARCH = "M7 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8z M10 10l3 3";
@@ -31,10 +38,23 @@
   const isPath = (p) => /^file:\/\//.test(p) || /^\./.test(p) || /^\//.test(p) || /^[A-Za-z]:[\\/]/.test(p);
   // ...and is known by the folder's name, not its whole path
   const label = (spec) => { const n = name(spec); return isPath(n) ? n.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || n : n; };
+  // one added from a git repository (github:owner/repo, git+https://…), as
+  // the plugin store tells them apart: known by the package it installed
+  const isGit = (p) => !isPath(p) && (/^(?:(?:github|gitlab|bitbucket):|git\+[a-z]+:\/\/|git:\/\/)\S+$/.test(p) || /^https?:\/\/(?:www\.)?(?:github\.com|gitlab\.com|bitbucket\.org)\/\S+$/.test(p) || /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9_.-]+(?:#\S+)?$/.test(p));
+  // ...and its page on the web, for the plugin's Source link
+  const gitWeb = (p) => {
+    const s = p.replace(/#.*$/, "");
+    const m = /^(github|gitlab|bitbucket):(.+)$/.exec(s) || (/^[^:]+\/[^:]+$/.test(s) && ["", "github", s]);
+    if (m) return "https://" + { github: "github.com", gitlab: "gitlab.com", bitbucket: "bitbucket.org" }[m[1]] + "/" + m[2];
+    const u = s.replace(/^git\+/, "").replace(/\.git$/, "");
+    return /^https?:\/\//.test(u) ? u : "";
+  };
   const lang = () => (document.documentElement.lang || "").startsWith("zh") ? "zh" : "en";
   const summary = (l) => l.summary?.[lang()] || l.summary?.en || l.npm?.description || "";
   const count = (n) => n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "k" : String(n || 0);
-  const entryOf = (pkg) => market?.state.plugins.find((e) => name(e.spec) === pkg);
+  const entryOf = (pkg) => mine?.plugins?.find((e) => name(e.spec) === pkg);
+  // npm has the versions of a package: not a folder's, nor a git one's
+  const onNPM = (spec) => !isPath(spec) && !isGit(spec);
   // the providers a plugin signs in to, as the add sheet knows them
   const subsOf = (pkg) => (providers?.plugins || []).filter((x) => name(x.spec) === pkg);
   const newer = (a, b) => {
@@ -52,18 +72,64 @@
     return box;
   }
 
-  async function load() {
-    const first = !market;
-    if (first) draw();
+  // npm's answers, put where the cards and rows read them: on the
+  // listing and the entry themselves, so a plugin's page opened before
+  // npm answered has them too
+  function merge() {
+    for (const l of listings || []) if (npm[l.package]) l.npm = npm[l.package];
+    for (const e of mine?.plugins || []) if (onNPM(e.spec) && npm[name(e.spec)]?.version) e.latest = npm[name(e.spec)].version;
+  }
+  // redrawn as a part comes: the search field keeps its focus
+  function redraw() {
+    const q = page.querySelector(".pm-find input");
+    const typing = q && document.activeElement === q;
+    draw();
+    if (typing) page.querySelector(".pm-find input")?.focus({ preventScroll: true });
+  }
+  async function loadMine() {
     try {
-      const [m] = await Promise.all([api("plugins/market"), providers ? null : loadProviders().catch(() => {})]);
-      market = m;
+      mine = await api("plugins");
       failed = "";
     } catch (e) {
       failed = e.message;
     }
-    draw();
-    window.renderPluginDot?.();
+    merge();
+  }
+  async function loadListings() {
+    try {
+      const r = await api("plugins/listings");
+      listings = r.listings || [];
+      failedList = "";
+    } catch (e) {
+      failedList = e.message;
+    }
+    merge();
+  }
+  // what npm says of the plugins suggested and those installed: drawn
+  // when it comes, never waited on
+  async function askNPM(only) {
+    const names = [...new Set([...(listings || []).map((l) => l.package), ...(mine?.plugins || []).filter((e) => onNPM(e.spec)).map((e) => name(e.spec))])]
+      .filter((n) => !only || !npm[n]);
+    if (!names.length) return;
+    try {
+      const r = await api("plugins/npm?names=" + encodeURIComponent(names.join(",")));
+      Object.assign(npm, r.npm || {});
+    } catch {}
+    merge();
+    // one npm said nothing of, now or ever: as one it doesn't have
+    for (const l of listings || []) if (!l.npm) l.npm = { weekly: 0 };
+    drawBody();
+  }
+
+  async function load() {
+    if (!mine && !listings) draw();
+    const parts = [
+      loadMine().then(() => { redraw(); window.renderPluginDot?.(); }),
+      loadListings().then(redraw),
+      providers ? null : loadProviders().then(drawBody, () => {}),
+    ];
+    await Promise.all(parts);
+    askNPM();
   }
   window.loadPlugins = load;
   // pluginQuery: Discover, looking for q (the add sheet found nothing by it)
@@ -79,14 +145,16 @@
 
   async function refresh() {
     try {
-      const [m, p] = await Promise.all([api("plugins/market"), api("providers")]);
-      market = m;
+      const [m, p] = await Promise.all([api("plugins"), api("providers")]);
+      mine = m;
       providers = p;
+      merge();
       // the Providers page owns the dialog as it draws: only drawn when shown
       if (view === "providers") renderProviders();
     } catch (e) { status(e.message, "err"); }
     draw();
     window.renderPluginDot?.();
+    askNPM(true);
   }
 
   async function act(pkg, op, body, done) {
@@ -104,8 +172,57 @@
       status(e.message, "err");
     }
   }
+  // Check for updates: npm asked now, not what it said within the hour,
+  // for each installed plugin's newest version. Each row then says so (an
+  // update, up to date, or why it couldn't be checked), and its Update, or
+  // Update all, installs it as before. Nothing is installed by the check.
+  async function checkUpdates() {
+    if (checking || busy.size) return;
+    checking = true;
+    draw();
+    try {
+      const r = await api("plugins/check", {});
+      mine = r.state || mine;
+      const by = {};
+      for (const c of r.plugins || []) {
+        by[c.spec] = c;
+        // npm's answer now is the one the rows read
+        if (c.latest) npm[c.package] = { ...(npm[c.package] || {}), version: c.latest };
+      }
+      checked = { at: r.at, by };
+      merge();
+      const asked = (r.plugins || []).filter((c) => c.status === "update" || c.status === "current" || c.status === "unknown");
+      const ups = asked.filter((c) => c.status === "update" && !c.off).length;
+      const unknown = asked.filter((c) => c.status === "unknown");
+      if (asked.length && unknown.length === asked.length) {
+        status(t("Couldn't check for updates: {error}", { error: whyText(unknown[0]) }), "err", 8000);
+      } else {
+        let msg = ups ? (ups === 1 ? t("1 plugin has an update") : t("{n} plugins have updates", { n: ups })) : t("Every plugin is up to date");
+        if (unknown.length) {
+          msg += " · " + t("{n} couldn't be checked: {error}", { n: unknown.length, error: whyText(unknown[0]) });
+          status(msg, "warn", 8000);
+        } else status(msg, "ok");
+      }
+    } catch (e) {
+      status(t("Couldn't check for updates: {error}", { error: e.message }), "err", 8000);
+    }
+    checking = false;
+    draw();
+    window.renderPluginDot?.();
+  }
+  // why npm said nothing of a plugin, in the page's words
+  function whyText(c) {
+    switch (c.why) {
+      case "offline": return t("npm couldn't be reached — check your connection or proxy");
+      case "limited": return t("npm is turning requests away for now (too many); try again in a few minutes");
+      case "missing": return t("npm doesn't have it");
+      default: return t("npm answered with an error: {error}", { error: c.error || "" });
+    }
+  }
+  const checkedAt = () => checked ? new Date(checked.at).toLocaleTimeString(document.documentElement.lang || undefined, { hour: "2-digit", minute: "2-digit" }) : "";
+
   // the built-ins with accounts this plugin could run in their place
-  const movableOf = (pkg) => (market?.state.movable || []).filter((c) => c.package === pkg);
+  const movableOf = (pkg) => (mine?.movable || []).filter((c) => c.package === pkg);
   // move: a built-in's accounts onto its plugin, installing it if need be,
   // as its editor's Runs on does
   async function move(c) {
@@ -135,9 +252,13 @@
     }
   }
   const moveButton = (b, c, here) => {
-    b.classList.add("go", "move");
-    b.textContent = here ? t("Move {name} here", { name: c.name }) : t(c.accounts === 1 ? "Move my {n} {name} account" : "Move my {n} {name} accounts", { name: c.name, n: c.accounts });
-    b.title = t("Runs {name} on this plugin in place of the built-in, with the same accounts; nothing changes if one doesn't work through it", { name: c.name });
+    // one word beside the name, as Install is: the card already says whose
+    // accounts, the title says how many and what it does (a whole sentence
+    // was a solid bar under the card that broke onto two lines)
+    b.classList.add("get", "move");
+    b.textContent = t("Move");
+    b.title = (here ? t("Move {name} here", { name: c.name }) : t(c.accounts === 1 ? "Move my {n} {name} account" : "Move my {n} {name} accounts", { name: c.name, n: c.accounts }))
+      + " — " + t("Runs {name} on this plugin in place of the built-in, with the same accounts; nothing changes if one doesn't work through it", { name: c.name });
     b.disabled = busy.size > 0;
     b.onclick = (ev) => { ev.stopPropagation(); move(c); };
     return b;
@@ -155,9 +276,17 @@
     if (op === "add" || op === "upgrade" || op === "move") {
       b.classList.add("busy");
       if (op === "move") b.classList.add("move");
-      b.append(el("span", "spin"), el("span", "", op === "move" ? t("Moving…") : op === "upgrade" ? t("Updating…") : market?.state.bun ? t("Installing…") : t("Getting Bun…")));
+      b.append(el("span", "spin"), el("span", "", op === "move" ? t("Moving…") : op === "upgrade" ? t("Updating…") : mine?.bun ? t("Installing…") : t("Getting Bun…")));
       b.disabled = true;
-      if (!market?.state.bun) b.title = t("Plugins run on Bun {v}, downloaded once", { v: market?.state.bunVersion || "" });
+      if (!mine?.bun) b.title = t("Plugins run on Bun {v}, downloaded once", { v: mine?.bunVersion || "" });
+      return b;
+    }
+    // not known yet whether it's installed, or whether npm has it: a
+    // button that waits, rather than one that says the wrong thing
+    if (!mine || (!e && listed && !listed.npm)) {
+      b.classList.add("busy");
+      b.append(el("span", "spin"));
+      b.disabled = true;
       return b;
     }
     if (!e) {
@@ -185,18 +314,22 @@
     // signed in to nothing yet, with a built-in's accounts to bring
     const c = !subs.some((x) => x.signedIn) && movableOf(pkg)[0];
     if (c) return moveButton(b, c, true);
-    if (out) {
+    // one of its subscriptions signed in (Qoder, beside Qoder CN; #556): the
+    // card says it is, rather than a Sign in that reads as signed out; the
+    // Installed row offers the others by name
+    const on = subs.find((x) => x.signedIn);
+    if (out && !on) {
       b.classList.add("go");
       b.textContent = t("Sign in");
       b.title = subs.length > 1 ? t("Sign in to {name}", { name: out.name }) : "";
       b.onclick = (ev) => { ev.stopPropagation(); pluginSignIn(out.id); };
       return b;
     }
-    if (subs.length) {
+    if (on) {
       b.classList.add("done");
       b.append(glyph(CHECK, 11, 2), el("span", "", t("Signed in")));
-      b.title = t("Open {name} in Providers", { name: subs[0].name });
-      b.onclick = (ev) => { ev.stopPropagation(); openProvider(subs[0].id); };
+      b.title = t("Open {name} in Providers", { name: on.name });
+      b.onclick = (ev) => { ev.stopPropagation(); openProvider(on.id); };
       return b;
     }
     b.classList.add("done");
@@ -225,11 +358,7 @@
       by.append(v);
     } else by.append(el("span", "", l.npm?.publisher || l.package));
     who.append(by);
-    const act = actionFor(l.package, l.name, l);
-    // a move says whose accounts: too long for the top row, it has one of its own
-    const own = act.classList.contains("move");
-    top.append(logo(l.icon), who);
-    if (!own) top.append(act);
+    top.append(logo(l.icon), who, actionFor(l.package, l.name, l));
     const sum = el("p", "pm-sum", summary(l));
     const meta = el("div", "pm-meta");
     if (l.npm?.weekly) {
@@ -239,7 +368,20 @@
       meta.append(d);
     }
     if (l.npm?.version) meta.append(el("span", "pm-ver", "v" + (e?.version || l.npm.version)));
-    if (e && e.latest && e.version && newer(e.latest, e.version)) meta.append(el("span", "pm-chip up", t("Update")));
+    if (e && e.latest && e.version && newer(e.latest, e.version)) {
+      // the chip says there is an update, so it is the one that brings it
+      // (Discord: 显示更新但是好像没有更新按钮)
+      const b = busy.get(l.package) || busy.get(e.spec);
+      const up = el("button", "pm-chip up", b === "upgrade" ? t("Updating…") : t("Update to {v}", { v: "v" + e.latest }));
+      up.type = "button";
+      up.disabled = busy.size > 0 || checking || !!e.off;
+      up.onclick = (ev) => {
+        ev.stopPropagation();
+        act(l.package, "upgrade", { spec: e.spec }, () => status(t("{name} updated to v{v}", { name: l.name, v: e.latest }), "ok"));
+      };
+      up.onkeydown = (ev) => ev.stopPropagation();
+      meta.append(up);
+    }
     if (e?.error && !e.off) meta.append(el("span", "pm-chip bad", t("Didn't load")));
     else if (e?.off) meta.append(el("span", "pm-chip", t("Off")));
     if (l.replaces) {
@@ -248,7 +390,6 @@
       meta.append(b);
     }
     c.append(top, sum, meta);
-    if (own) c.append(act);
     c.onclick = () => detail(l);
     c.onkeydown = (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); detail(l); } };
     return c;
@@ -277,7 +418,7 @@
 
   function head() {
     const h = el("div", "lib-head pm-head");
-    const n = market?.state.plugins.length || 0;
+    const n = mine?.plugins?.length || 0;
     const tabs = segs([["discover", t("Discover")], ["installed", t("Installed") + (n ? " · " + n : "")]], tab, (id) => {
       tab = id;
       try { localStorage.setItem("magpie.pluginTab", id); } catch {}
@@ -307,9 +448,45 @@
     };
     q.onkeydown = (ev) => { ev.stopPropagation(); if (ev.key === "Escape" && q.value) { q.value = ""; q.oninput(); } };
     find.append(q);
-    h.append(tabs, el("span", "grow"), find);
+    h.append(tabs, el("span", "grow"), mirrorSwitch(), find);
     h.classList.toggle("stuck", page.scrollTop > 0);
     return h;
+  }
+
+  // 「国内镜像」: the list, npm's packages and answers, and Bun asked of
+  // mirrors in China first (npmmirror, jsDelivr); none before what's
+  // installed has come, which says how it is set
+  let mirrorSaving = false;
+  function mirrorSwitch() {
+    const on = !!mine?.mirror;
+    const b = el("button", "pm-mirror" + (on ? " on" : ""));
+    b.type = "button";
+    b.hidden = !mine;
+    b.disabled = mirrorSaving;
+    b.setAttribute("role", "switch");
+    b.setAttribute("aria-checked", on ? "true" : "false");
+    b.title = t("Download the plugin list, plugins and Bun from mirrors in China first (npmmirror, jsDelivr), their official addresses after. Each is a copy of the very file, checked as the original is");
+    const sw = el("span", "lib-switch" + (on ? " on" : ""));
+    sw.append(el("i"));
+    b.append(el("span", "", t("Mirrors in China")), sw);
+    b.onclick = async () => {
+      if (mirrorSaving || !mine) return;
+      mirrorSaving = true;
+      mine.mirror = !on;
+      draw();
+      try {
+        const r = await api("plugins/mirror", { on: !on });
+        mine.mirror = r.mirror;
+        // the list again, now from the mirror, and npm's answers with it
+        if (r.mirror) loadListings().then(() => { redraw(); askNPM(); });
+      } catch (e) {
+        mine.mirror = on;
+        status(t(e.message), "err");
+      }
+      mirrorSaving = false;
+      redraw();
+    };
+    return b;
   }
 
   async function searchNPM(s) {
@@ -341,17 +518,17 @@
     shown = key;
     body.replaceChildren();
     // the search field keeps its focus: only the body is redrawn while typing
-    if (failed && !market) {
-      body.append(el("p", "pm-empty", t("Couldn't load the plugins: {error}", { error: failed })));
+    if (tab === "installed") return drawInstalled();
+    if (failedList && !listings) {
+      body.append(el("p", "pm-empty", t("Couldn't load the plugins: {error}", { error: failedList })));
       return;
     }
-    if (tab === "installed") return drawInstalled();
-    if (!market) {
+    if (!listings) {
       body.append(intro(), skeleton(6));
       return;
     }
     const f = query.trim().toLowerCase();
-    const ls = market.listings.filter((l) => !f || [l.name, l.package, summary(l), (l.providers || []).join(" "), l.npm?.publisher || ""].join(" ").toLowerCase().includes(f));
+    const ls = listings.filter((l) => !f || [l.name, l.package, summary(l), (l.providers || []).join(" "), l.npm?.publisher || ""].join(" ").toLowerCase().includes(f));
     if (!f) {
       body.append(intro());
       // magpie's community's alone: others' plugins are found by a search
@@ -361,10 +538,10 @@
       return;
     }
     if (ls.length) body.append(section(t("Suggested"), "", ls));
-    const known = new Set(market.listings.map((l) => l.package));
+    const known = new Set(listings.map((l) => l.package));
     const box = el("section", "pm-sec");
     const h = el("div", "pm-sechead");
-    h.append(el("h3", "", t("On npm")), el("span", "", t("OpenCode plugins anyone published — read what one does before you install it")));
+    h.append(el("h3", "", t("On npm")), el("span", "", t("OpenCode plugins and pi packages anyone published — read what one does before you install it")));
     box.append(h);
     if (!hits) box.append(el("p", "pm-note", t("Type two letters or more to search npm")));
     else if (hits.loading) box.append(skeleton(2));
@@ -383,7 +560,7 @@
     const box = el("div", "pm-intro");
     const text = el("div", "pm-introtext");
     text.append(el("h2", "", t("Subscriptions, as plugins")));
-    text.append(el("p", "", t("Plugins sign in to coding plans and make their requests; the models then work in every agent, like any provider's. They're OpenCode's provider plugins, run on Bun.")));
+    text.append(el("p", "", t("Plugins sign in to coding plans and make their requests; the models then work in every agent, like any provider's. They're OpenCode's provider plugins or pi's packages, run on Bun.")));
     const trust = el("p", "pm-trust");
     trust.append(glyph(SHIELD, 12, 1.5), el("span", "", t("A plugin is someone else's code with your sign-in: install the ones you trust.")));
     text.append(trust);
@@ -398,7 +575,7 @@
     const box = el("form", "pm-manual");
     box.append(el("span", "pm-mlabel", t("Have one in mind?")));
     const spec = el("input", "pm-minput");
-    spec.placeholder = t("npm package or a folder on this computer");
+    spec.placeholder = t("npm package, GitHub repo (github:owner/repo) or a folder");
     spec.spellcheck = false;
     spec.autocomplete = "off";
     spec.setAttribute("aria-label", t("Plugin"));
@@ -416,7 +593,7 @@
     box.append(spec);
     // a folder is picked, not typed, where magpie can show the system's
     // picker (`magpie web` can't, and the market says so)
-    if (market?.state.picker) box.append(browse(spec, go));
+    if (mine?.picker) box.append(browse(spec, go));
     box.append(go);
     return box;
   }
@@ -448,8 +625,12 @@
   }
 
   function drawInstalled() {
-    if (!market) { body.append(skeleton(2)); return; }
-    const es = market.state.plugins;
+    if (failed && !mine) {
+      body.append(el("p", "pm-empty", t("Couldn't load the plugins: {error}", { error: failed })));
+      return;
+    }
+    if (!mine) { body.append(skeleton(2)); return; }
+    const es = mine.plugins || [];
     if (!es.length) {
       const none = el("div", "pm-none");
       none.append(logo("", true), el("b", "", t("No plugins yet")), el("p", "", t("Find a subscription in Discover and install it; it signs in from here.")));
@@ -459,34 +640,73 @@
       body.append(none);
       return;
     }
+    // by name, in the order the reader picked (#481), not the order they
+    // were installed in
     const list = el("div", "list pm-list");
-    for (const e of es) list.append(installedRow(e));
+    const fill = () => list.replaceChildren(...[...es].sort(byName(sortOf("plugins"), shownName)).map(installedRow));
+    if (es.length > 1) {
+      const h = el("div", "row-head pm-listhead");
+      h.append(el("span", "grow"), sortBy("plugins", NAME_SORTS, fill));
+      body.append(h);
+    }
+    fill();
     body.append(list);
     const foot = el("div", "pm-foot");
     const outdated = es.filter((e) => e.latest && e.version && newer(e.latest, e.version));
-    foot.append(el("span", "", market.state.bun ? t("Plugins run on Bun {v}", { v: market.state.bunVersion }) : ""), el("span", "grow"));
+    foot.append(el("span", "", mine.bun ? t("Plugins run on Bun {v}", { v: mine.bunVersion }) : ""), el("span", "grow"));
+    // only npm has versions to ask for: a folder's or a git one's has none
+    if (es.some((e) => onNPM(e.spec))) {
+      const c = el("button", "text pm-check" + (checking ? " busy" : ""));
+      if (checking) c.append(el("span", "spin"));
+      c.append(el("span", "", checking ? t("Checking…") : t("Check for updates")));
+      c.title = t("Ask npm now for each plugin's newest version") + (checked ? "\n" + t("Last checked {time}", { time: checkedAt() }) : "");
+      c.disabled = checking || busy.size > 0;
+      c.onclick = () => checkUpdates();
+      foot.append(c);
+    }
     if (outdated.length) {
       const up = el("button", "text", busy.has("*") ? t("Updating…") : t("Update all ({n})", { n: outdated.length }));
-      up.disabled = busy.size > 0;
+      up.disabled = busy.size > 0 || checking;
       up.onclick = () => act("*", "update", {}, () => status(t("Plugins updated"), "ok"));
       foot.append(up);
     }
     body.append(foot);
   }
 
+  // an installed plugin's name as its row shows it: the market's, else the
+  // package's or the folder's
+  function shownName(e) {
+    const pkg = name(e.spec);
+    return (listings || []).find((x) => x.package === pkg)?.name || (isGit(e.spec) && e.package) || label(e.spec);
+  }
+
   function installedRow(e) {
     const pkg = name(e.spec);
-    const l = market.listings.find((x) => x.package === pkg);
+    const l = (listings || []).find((x) => x.package === pkg);
     const r = el("div", "row pm-row" + (e.off ? " off" : ""));
     const who = el("div", "who");
     const nm = el("div", "name");
-    nm.append(el("span", "", l?.name || label(e.spec)));
+    nm.append(el("span", "", shownName(e)));
     if (e.version) nm.append(el("span", "pm-ver", "v" + e.version));
-    if (e.latest && e.version && newer(e.latest, e.version)) nm.append(el("span", "pm-chip up", t("v{v} out", { v: e.latest })));
-    else if (e.autoUpdated && e.autoUpdated.to === e.version) {
+    const ck = checked?.by[e.spec];
+    if (e.latest && e.version && newer(e.latest, e.version)) {
+      const c = el("span", "pm-chip up", t("v{v} out", { v: e.latest }));
+      c.title = t("v{have} installed, v{v} on npm", { have: e.version, v: e.latest });
+      nm.append(c);
+    } else if (ck?.status === "unknown") {
+      // asked just now, and npm didn't say: the row says why
+      const c = el("span", "pm-chip warn");
+      c.append(el("span", "dot"), el("span", "", t("Couldn't check")));
+      c.title = whyText(ck);
+      nm.append(c);
+    } else if (e.autoUpdated && e.autoUpdated.to === e.version) {
       // magpie updated it by itself lately: the row says so, quietly
       const c = el("span", "pm-chip soft", t("Auto-updated"));
       c.title = t("magpie updated it from v{from} to v{to} on {date}", { from: e.autoUpdated.from, to: e.autoUpdated.to, date: new Date(e.autoUpdated.at).toLocaleDateString(document.documentElement.lang || undefined, { month: "short", day: "numeric" }) });
+      nm.append(c);
+    } else if ((ck?.status === "current" || ck?.status === "update") && e.version) {
+      const c = el("span", "pm-chip soft", t("Up to date"));
+      c.title = t("v{v} is the newest on npm", { v: e.version }) + "\n" + t("Last checked {time}", { time: checkedAt() });
       nm.append(c);
     }
     // the built-in subscriptions moved onto it: taking it away moves them
@@ -520,6 +740,7 @@
         const builtin = !x.signedIn && cands.some((c) => c.id === x.pid);
         s.append(el("span", "dot"), el("span", "", x.signedIn ? t("{name}: signed in", { name: x.name }) : builtin ? t("{name}: on magpie's built-in", { name: x.name }) : t("{name}: not signed in", { name: x.name })));
         if (builtin) s.title = t("{name} runs on magpie's built-in, with your accounts; Move {name} here runs it on this plugin", { name: x.name });
+        else if (!x.signedIn && subs.some((y) => y.signedIn)) s.title = t("{name} is a subscription of its own; {other} works without it", { name: x.name, other: subs.find((y) => y.signedIn).name });
         sub.append(s);
       }
     } else sub.textContent = e.providers.length ? t("Signs in to {names}", { names: e.providers.join(t(", ")) }) : t("Signs in to nothing magpie can use");
@@ -529,8 +750,18 @@
     const b = busy.get(pkg) || busy.get(e.spec);
     if (e.latest && e.version && newer(e.latest, e.version) && !e.off) {
       const up = el("button", "text", b === "upgrade" ? t("Updating…") : t("Update"));
-      up.disabled = busy.size > 0;
+      up.disabled = busy.size > 0 || checking;
+      // the community's would come by itself: Update brings it now
+      if (pkg.startsWith("@magpie-community/") && !/@(?!latest$)[^@/]+$/.test(e.spec.slice(pkg.length))) up.title = t("magpie updates it by itself within the hour; Update does it now");
       up.onclick = () => act(pkg, "upgrade", { spec: e.spec }, () => status(t("{name} updated to v{v}", { name: l?.name || pkg, v: e.latest }), "ok"));
+      val.append(up);
+    } else if (isGit(e.spec) && !e.off) {
+      // npm has no newer version of a git one to offer: Update fetches
+      // its repository again
+      const up = el("button", "text", b === "upgrade" ? t("Updating…") : t("Update"));
+      up.title = t("Fetches it from {repo} again", { repo: e.spec });
+      up.disabled = busy.size > 0;
+      up.onclick = () => act(pkg, "upgrade", { spec: e.spec }, () => status(t("{name} is up to date", { name: e.package || e.spec }), "ok"));
       val.append(up);
     }
     const here = !e.off && !e.error && !subs.some((x) => x.signedIn) && cands[0];
@@ -542,8 +773,12 @@
       val.append(mv);
     }
     if (!e.off && !e.error && subs.some((x) => !x.signedIn)) {
-      const s = el("button", "text" + (here ? "" : " primary"), t("Sign in"));
-      s.onclick = () => pluginSignIn(subs.find((x) => !x.signedIn).id);
+      // signed in to one of its subscriptions already (Qoder, beside Qoder
+      // CN; #556): a blue Sign in read as the plugin signed out, so the
+      // button names the one it signs in to and stays quiet
+      const out = subs.find((x) => !x.signedIn), some = subs.some((x) => x.signedIn);
+      const s = el("button", "text" + (here || some ? "" : " primary"), some ? t("Sign in to {name}", { name: out.name }) : t("Sign in"));
+      s.onclick = () => pluginSignIn(out.id);
       val.append(s);
     }
     const back = () => { if (moved.length) status(t("{names} is back on the built-in", { names }), "ok"); };
@@ -571,14 +806,15 @@
     rm.onclick = () => { if (moved.length) { asking = { pkg, op: "remove" }; draw(); } else remove(); };
     val.append(onoff, rm);
     r.append(val);
-    r.onclick = (ev) => { if (!ev.target.closest("button")) detail(l || { package: pkg, name: label(e.spec), npm: { version: e.latest } }); };
+    r.onclick = (ev) => { if (!ev.target.closest("button")) detail(l || (isGit(e.spec) ? { package: e.spec, name: e.package || e.spec, npm: { version: e.version, repository: gitWeb(e.spec) } } : { package: pkg, name: label(e.spec), npm: { version: e.latest } })); };
     return r;
   }
 
   // the plugin's page: what it is, what npm says of it, and its README
   async function detail(l) {
-    // a folder plugin: what it is comes from the folder, not from npm
-    const local = isPath(l.package);
+    // a folder plugin: what it is comes from the folder, not from npm; a
+    // git one's from the folder it was installed to
+    const local = isPath(l.package) || isGit(l.package);
     const ed = el("div", "editor pm-detail");
     const hd = el("div", "ehead pm-dhead");
     hd.append(logo(l.icon, true));

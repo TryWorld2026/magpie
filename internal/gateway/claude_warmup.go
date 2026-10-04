@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/yetone/magpie/internal/netproxy"
@@ -53,11 +54,7 @@ func askClaude(ctx context.Context, configDir, model string) error {
 	var out, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &stderr
 	runErr := cmd.Run()
-	var res struct {
-		IsError bool   `json:"is_error"`
-		Result  string `json:"result"`
-	}
-	if json.Unmarshal(out.Bytes(), &res) == nil && res.IsError {
+	if res, ok := claudeResult(out.Bytes()); ok && res.IsError {
 		return errors.New("Claude Code: " + clip(res.Result))
 	}
 	if runErr != nil {
@@ -94,15 +91,21 @@ func claudeUsage(ctx context.Context) (string, error) {
 	cmd := proc.CommandContext(ctx, binary, claudeUsageArgs()...)
 	cmd.Dir = tmp
 	cmd.Stdin = strings.NewReader("")
-	cmd.Env = netproxy.EnvWith(claudeProxy(ctx), cleanClaudeEnv(os.Environ()))
+	// CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC makes /usage skip its request
+	// and print only a reading another run left in the last hour, so it stays
+	// only when the user set it.
+	env := cleanClaudeEnv(os.Environ())
+	if os.Getenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC") == "" {
+		env = slices.DeleteFunc(env, func(e string) bool {
+			return strings.HasPrefix(e, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=")
+		})
+	}
+	env = append(env, "DISABLE_TELEMETRY=1", "DISABLE_ERROR_REPORTING=1", "DISABLE_AUTOUPDATER=1")
+	cmd.Env = netproxy.EnvWith(claudeProxy(ctx), env)
 	var out, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &stderr
 	runErr := cmd.Run()
-	var res struct {
-		IsError bool   `json:"is_error"`
-		Result  string `json:"result"`
-	}
-	if err := json.Unmarshal(out.Bytes(), &res); err == nil {
+	if res, ok := claudeResult(out.Bytes()); ok {
 		if res.IsError {
 			return "", errors.New("Claude Code: " + clip(res.Result))
 		}
@@ -116,6 +119,35 @@ func claudeUsage(ctx context.Context) (string, error) {
 		return "", runErr
 	}
 	return "", errors.New("Claude Code: " + clip(msg))
+}
+
+// claudeRun is the result Claude Code prints for a -p run with
+// --output-format json.
+type claudeRun struct {
+	Type    string `json:"type"`
+	IsError bool   `json:"is_error"`
+	Result  string `json:"result"`
+}
+
+// claudeResult reads the result from what claude -p --output-format json
+// printed: one object, or, when the user turned on Claude Code's verbose
+// output (its own config, which --setting-sources leaves on), an array of
+// every message, the result last.
+func claudeResult(b []byte) (claudeRun, bool) {
+	var res claudeRun
+	if json.Unmarshal(b, &res) == nil {
+		return res, true
+	}
+	var all []claudeRun
+	if json.Unmarshal(b, &all) != nil {
+		return claudeRun{}, false
+	}
+	for i := len(all) - 1; i >= 0; i-- {
+		if all[i].Type == "result" {
+			return all[i], true
+		}
+	}
+	return claudeRun{}, false
 }
 
 func claudeUsageArgs() []string {

@@ -96,6 +96,9 @@ func TestRefusalFailsOverToTheNextMember(t *testing.T) {
 		t.Fatalf("%d %s (a %d, b %d)", code, body, a.n, b.n)
 	}
 	r := s.trace.routes[len(s.trace.routes)-1]
+	if len(r.Usage) != 2 || r.Usage[0].Provider != "a" || r.Usage[0].CacheRead != 237000 || r.Usage[0].CacheWrite != 47000 || r.Usage[0].Output != 2 || r.Usage[1].Provider != "b" || r.Usage[1].Output != 4 {
+		t.Fatalf("refusal and answer accounting: %+v", r.Usage)
+	}
 	if len(r.Tries) != 2 || r.Tries[0].Fail != failRefused || r.Tries[0].Rest != nil || r.Tries[0].Status != 400 || r.Status != 200 {
 		t.Fatalf("tries: %+v", r.Tries)
 	}
@@ -116,6 +119,10 @@ func TestRefusalFailsOverToTheNextMember(t *testing.T) {
 		if r.Session != "override-session" || r.NativeSession != "native-session" || r.RequestID != []string{"req-a", "req-b"}[i] || r.Endpoint != "/v1/responses → /v1/messages" {
 			t.Fatalf("attempt %d lost request identity: %+v", i, r)
 		}
+	}
+
+	if recs[0].ResponseID != "" || recs[1].ResponseID != "resp_m2" {
+		t.Fatalf("only the delivered reply has a client response ID: %+v", recs)
 	}
 
 	for _, rec := range recs {

@@ -12,6 +12,7 @@ import (
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/codexcat"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 	"gopkg.in/yaml.v3"
@@ -23,6 +24,7 @@ func syncHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	t.Setenv("CODEX_HOME", "")
@@ -142,15 +144,15 @@ func TestMaxTokensWithinContextWindow(t *testing.T) {
 		pi, _ := json.Marshal(magpieProviderJSON("pi"))
 		cline, _ := json.Marshal(clineModels(""))
 		omp, _ := yaml.Marshal(ompProvider())
-		dshRoute, _ := yaml.Marshal(dshRouteConfig())
+		dshRoute, _ := yaml.Marshal(dshRouteConfig(magpieModels("dsh"), "", gateway.URL()))
 		droid, _ := json.Marshal(droidEntries())
 		qoder, _ := json.Marshal(qoderProvider("qoder", ""))
 		hanako, _ := json.Marshal(hanakoProvider())
 		opencode, _ := json.Marshal(magpieProviderJSON("opencode"))
-		zc, _ := json.Marshal(zcodeProviderJSON(filepath.Join(home, "none.json")))
+		zc, _ := json.Marshal(zcodeProviderJSON(filepath.Join(home, "none.json"), true))
 		crush, _ := json.Marshal(magpieProviderJSON("crush"))
 		rules, wb := filepath.Join(t.TempDir(), "provider_config.json"), filepath.Join(t.TempDir(), "models.json")
-		if err := zcodeRules(rules, true); err != nil {
+		if err := zcodeRules(rules, true, true); err != nil {
 			t.Fatal(err)
 		}
 		if err := workbuddyWrite(wb, true); err != nil {
@@ -198,7 +200,7 @@ func TestSyncCatalogRewritesAgentLists(t *testing.T) {
 	writeFile(t, crushCfg, crushBody)
 	codexDir := filepath.Join(home, ".codex")
 	codexCat := filepath.Join(codexDir, "magpie-models.json")
-	writeFile(t, filepath.Join(codexDir, "config.toml"), "model = \"relay/glm-4.6\"\nmodel_provider = \"magpie\"\nmodel_catalog_json = \""+codexCat+"\"\n")
+	writeFile(t, filepath.Join(codexDir, "config.toml"), "model = \"relay/glm-4.6\"\nmodel_provider = \"magpie\"\nmodel_catalog_json = '"+codexCat+"'\n")
 	writeFile(t, codexCat, `{"models":[]}`)
 
 	if err := provider.Save(provider.Provider{ID: "added", Name: "Added", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"m2"}}); err != nil {

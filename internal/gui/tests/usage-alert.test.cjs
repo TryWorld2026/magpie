@@ -1,5 +1,5 @@
 // Run with Node's test runner and Playwright on the module path; see README.md.
-// Usage alerts (#368): the Settings page's "Usage alert" and "Low balance
+// Allowance alerts (#368): the Settings page's "Allowance alert" and "Low balance
 // alert" rows start Off; On saves 80% (and 5 for a balance), the field
 // beside it saves the number typed, a share outside 1-100 is put back
 // unsaved, and a choice saved later elsewhere on the page keeps the alerts
@@ -77,15 +77,15 @@ async function wheelTo(page) {
 
 const words = {
   en: {
-    usage: "Usage alert", balance: "Low balance alert", off: "Off", on: "On",
+    usage: "Allowance alert", balance: "Low balance alert", off: "Off", on: "On",
     usageSub: "A notification when a 5-hour, weekly or monthly window reaches this share used, once each time it runs",
     balanceSub: "A notification when a balance falls to this amount, in its own currency or credits, once until it is topped up",
     denied: "Notifications are turned off for magpie in the system's settings",
     share: "Share used", amount: "Amount", cny: "¥ CNY",
   },
   zh: {
-    usage: "用量提醒", balance: "余额提醒", off: "关闭", on: "开启",
-    usageSub: "5 小时、每周或每月窗口用到这个比例时发一条系统通知，每个周期只提醒一次",
+    usage: "额度提醒", balance: "余额提醒", off: "关闭", on: "开启",
+    usageSub: "5 小时、每周或每月额度用到这个比例时发一条系统通知，每个周期只提醒一次",
     balanceSub: "余额降到这个数（按它自己的货币或积分）时发一条系统通知，充值回升前只提醒一次",
     denied: "系统设置里关闭了 magpie 的通知",
     share: "已用比例", amount: "金额", cny: "¥ 人民币",
@@ -118,7 +118,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const posted = async (n) => { for (let i = 0; i < 100 && posts.length < n; i++) await page.waitForTimeout(20); assert.equal(posts.length, n, "posts"); return posts[n - 1]; };
         const settled = () => page.waitForTimeout(300);
 
-        await page.goto("http://magpie.test/?view=settings");
+        await page.goto("http://magpie.test/?view=settings&tab=usage");
         const usageSegs = page.locator("#usageAlertSegs .opt"), balSegs = page.locator("#balanceAlertSegs .opt");
         await usageSegs.first().waitFor();
 
@@ -204,7 +204,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         page.setDefaultTimeout(5000);
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", server(lang, posts, "denied"));
-        await page.goto("http://magpie.test/?view=settings");
+        await page.goto("http://magpie.test/?view=settings&tab=usage");
         await page.locator("#usageAlertSegs .opt").first().waitFor();
         await wheelTo(page);
         // nothing said while every alert is off

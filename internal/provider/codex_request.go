@@ -227,12 +227,7 @@ func codexInstructions(model string) string {
 	}); ok {
 		return s
 	}
-	dir := os.Getenv("CODEX_HOME")
-	if dir == "" {
-		home, _ := os.UserHomeDir()
-		dir = filepath.Join(home, ".codex")
-	}
-	if s, ok := codexCLIPrompts.get(filepath.Join(dir, "models_cache.json"), model, codexPrompts); ok {
+	if s, ok := codexCLIPrompts.get(catalog.CodexModelsCache(), model, codexPrompts); ok {
 		return s
 	}
 	return codexcat.Prompt
@@ -377,6 +372,13 @@ func codexInput(input []any) []any {
 			continue
 		}
 		if it["type"] == "item_reference" {
+			continue
+		}
+		// Codex delivers standalone notifications without a call ID. The
+		// native backend understands their name/namespace and item ID;
+		// they are not historical results whose calls have gone missing.
+		if (it["type"] == "function_call_output" || it["type"] == "custom_tool_call_output") && (it["call_id"] == nil || it["call_id"] == "") {
+			out = append(out, it)
 			continue
 		}
 		delete(it, "id")

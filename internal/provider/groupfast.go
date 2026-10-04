@@ -52,6 +52,16 @@ func (g Group) IsFast(id string) bool {
 // A Claude subscription runs Claude Code itself, and a relay or a cloud
 // (Bedrock, Vertex) may refuse the field, so neither is.
 func CanFast(p Provider, model string) bool {
+	if p.IsPlugin() {
+		// Cursor's plugin, as the built-in, asks for the model's -fast one
+		// when the chat request says service_tier "priority"
+		pp, ok := PluginOf(p.ID)
+		if !ok || p.PluginProvider() != "cursor" || strings.HasSuffix(model, "-fast") {
+			return false
+		}
+		_, ok = pluginModel(pp, model+"-fast")
+		return ok
+	}
 	if p.Account != nil {
 		switch p.Account.Agent {
 		case "codex":
@@ -136,7 +146,7 @@ func (g *Group) SetMemberFast(id string, fast bool) {
 }
 
 // RenameMember has the group's member from go by to (its effort changed):
-// its rules, its pick and its fast mode follow it.
+// its rules, its pick, its fast mode and its being off follow it.
 func (g *Group) RenameMember(from, to string) {
 	for i, m := range g.Members {
 		if m == from {
@@ -154,6 +164,11 @@ func (g *Group) RenameMember(from, to string) {
 	for i, f := range g.Fast {
 		if f == from {
 			g.Fast[i] = to
+		}
+	}
+	for i, o := range g.Off {
+		if o == from {
+			g.Off[i] = to
 		}
 	}
 }

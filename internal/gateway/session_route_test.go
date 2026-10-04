@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // GET /v1/magpie/route tells an agent's UI where its session's turn went
@@ -102,7 +104,7 @@ func TestSessionRoute(t *testing.T) {
 	}
 	seq := int64(out["seq"].(float64))
 
-	// a long poll hears the turn end
+	// a long poll hears updates, including the turn end
 	polled := make(chan map[string]any, 1)
 	go func() {
 		_, o := get(here, "/v1/magpie/route?session=pi-1&wait=5&after="+strconv.FormatInt(seq, 10))
@@ -114,6 +116,12 @@ func TestSessionRoute(t *testing.T) {
 		t.Fatal("the turn got", c)
 	}
 	o := <-polled
+	// A try ending can wake the poll before the whole route is done.
+	// The handler has returned now; ask past that update for its end.
+	if rt, _ := o["route"].(map[string]any); rt != nil && rt["done"] == false {
+		after := int64(o["seq"].(float64))
+		_, o = get(here, "/v1/magpie/route?session=pi-1&wait=5&after="+strconv.FormatInt(after, 10))
+	}
 	if rt, _ := o["route"].(map[string]any); rt == nil || rt["done"] != true || rt["status"] != float64(200) || rt["model"] != "rb/m" {
 		t.Fatalf("polled: %v", o)
 	}
@@ -126,16 +134,34 @@ func TestSessionRoute(t *testing.T) {
 		t.Fatal("no session got", code)
 	}
 	// another machine needs the shared gateway's key, as the quotas do
-	key, none := "sk-magpie-k", ""
-	t.Cleanup(func() { lanKey.Store(&none) })
-	lanKey.Store(&key)
+	callerKeys, secrets := newCaller(t, "Session status")
+	key := secrets[0]
 	if code, _ := get("192.168.1.9:5000", "/v1/magpie/route?session=pi-1"); code != http.StatusUnauthorized {
 		t.Fatal("no key got", code)
 	}
 	if code, out := get("192.168.1.9:5000", "/v1/magpie/route?session=pi-1", "Authorization", "Bearer "+key); code != 200 || out["route"] == nil {
 		t.Fatalf("with the key: %d %v", code, out)
 	}
-	lanKey.Store(&none)
+	if code, out := get("192.168.1.9:5000", "/v1/magpie/route?session=pi-1", "x-api-key", key); code != 200 || out["route"] == nil {
+		t.Fatalf("with x-api-key: %d %v", code, out)
+	}
+	if code, out := get("192.168.1.9:5000", "/v1/magpie/route?session=pi-1&key="+key); code != 200 || out["route"] == nil {
+		t.Fatalf("with query key: %d %v", code, out)
+	}
+	if code, _ := get("192.168.1.9:5000", "/v1/magpie/route?session=pi-1", "Authorization", "Bearer wrong"); code != http.StatusUnauthorized {
+		t.Fatal("wrong key got", code)
+	}
+	if _, err := access.Update("off-key", access.Change{Key: callerKeys[0].ID}); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := get("192.168.1.9:5000", "/v1/magpie/route?session=pi-1", "Authorization", "Bearer "+key); code != http.StatusUnauthorized {
+		t.Fatal("disabled key got", code)
+	}
+	shared := settings.Load()
+	shared.LAN = false
+	if err := settings.Save(shared); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("MAGPIE_ADDR", "0.0.0.0:3425")
 	if code, _ := get("192.168.1.9:5000", "/v1/magpie/route?session=pi-1"); code != http.StatusForbidden {
 		t.Fatal("MAGPIE_ADDR, not shared, got", code)

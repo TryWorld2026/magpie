@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/signal"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -24,7 +24,7 @@ import (
 // — the subscriptions magpie remembers, how much of each one's allowance is
 // used, and switching the agent between them.
 func accountsCmd(args []string) error {
-	const usage = "usage: magpie accounts [claude|codex|grok|copilot|gemini|antigravity|zed|factory|mimo] [--json] | magpie accounts add <claude|codex|gemini|antigravity|zed|factory|mimo> | magpie accounts refresh [--json] | magpie accounts checkin [--json] | magpie accounts switch|forget <claude|codex|gemini|antigravity|zed|factory|mimo> <email> | magpie accounts project <gemini|antigravity> <email> <gcp-project-id>"
+	const usage = "usage: magpie accounts [claude|codex|grok|copilot|gemini|antigravity|zed|factory|mimo|<plugin>] [--json] | magpie accounts add <claude|codex|gemini|antigravity|zed|factory|mimo|<plugin>> | magpie accounts add copilot [--host <name>.ghe.com] | magpie accounts refresh [--json] | magpie accounts checkin [--json] | magpie accounts switch|forget <claude|codex|gemini|antigravity|zed|factory|mimo|<plugin>> <email> | magpie accounts project <gemini|antigravity> <email> <gcp-project-id>"
 	agentID := func(s string) (string, error) {
 		switch strings.ToLower(s) {
 		case "claude", "cc":
@@ -42,7 +42,11 @@ func accountsCmd(args []string) error {
 		case "mimo", "mimo-app", "xiaomi-mimo":
 			return provider.MiMoID, nil
 		}
-		return "", fmt.Errorf("%q: only Claude Code, Codex, Gemini CLI, Antigravity, Zed, Factory and Xiaomi MiMo accounts can be added and switched\n%s", s, usage)
+		// a plugin's subscription, by its provider's id or name, as a built-in's
+		if pp, err := pluginProvider(context.Background(), s); err == nil {
+			return provider.PluginID(pp.ID), nil
+		}
+		return "", fmt.Errorf("%q: only Claude Code, Codex, Gemini CLI, Antigravity, Zed, Factory, Xiaomi MiMo and plugins' accounts can be added and switched\n%s", s, usage)
 	}
 	if len(args) > 1 && args[1] == "project" {
 		if len(args) != 5 {
@@ -69,6 +73,27 @@ func accountsCmd(args []string) error {
 		return checkinWorkBuddy(len(args) > 2 && args[2] == "--json")
 	}
 	if len(args) > 1 && args[1] == "add" {
+		// a Copilot account by GitHub's device code, on github.com or an
+		// enterprise's <name>.ghe.com (#723)
+		if len(args) >= 3 && strings.EqualFold(args[2], "copilot") {
+			var host string
+			switch {
+			case len(args) == 5 && args[3] == "--host":
+				host = args[4]
+			case len(args) == 4 && strings.HasPrefix(args[3], "--host="):
+				host = strings.TrimPrefix(args[3], "--host=")
+			case len(args) != 3:
+				return fmt.Errorf("usage: magpie accounts add copilot [--host <name>.ghe.com]")
+			}
+			h, err := provider.CopilotHost(host)
+			if err != nil {
+				return err
+			}
+			if h != "" {
+				return addAccount("copilot:" + h)
+			}
+			return addAccount("copilot")
+		}
 		if len(args) != 3 {
 			return fmt.Errorf("%s", usage)
 		}
@@ -101,7 +126,7 @@ func accountsCmd(args []string) error {
 		if err := provider.SwitchLogin(id, args[3]); err != nil {
 			return err
 		}
-		if id == "gemini" || id == "antigravity" {
+		if _, plug := provider.PluginOf(id); plug || id == "gemini" || id == "antigravity" {
 			fmt.Println(green.Render("✓"), "magpie now uses", args[3], "for", id)
 			return nil
 		}
@@ -168,6 +193,7 @@ func accountsCmd(args []string) error {
 		} else if r.Error != "" {
 			line += "  " + muted.Render(r.Error)
 		}
+		line += quotaReadingCell(r.AsOf, r.Windows)
 		fmt.Println(line)
 	}
 	fmt.Println(faint.Render("  ● signed in · ○ takes over when it runs out · add one: magpie accounts add <agent> · switch: magpie accounts switch <agent> <email>"))
@@ -184,6 +210,7 @@ type accountRow struct {
 	Windows []quotaSpan `json:"windows"`
 	Error   string      `json:"error,omitempty"`
 	Lapsed  string      `json:"lapsed,omitempty"` // its sign-in has to be made again
+	AsOf    *time.Time  `json:"asOf,omitempty"`   // last reading when it couldn't be read now
 	// Resets are a Codex account's rate-limit resets, when it holds any.
 	Resets *provider.ResetCredits `json:"resets,omitempty"`
 }
@@ -196,14 +223,15 @@ func accountRows(ls []provider.Login, now time.Time) []accountRow {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	usage := map[string]map[string]provider.SubscriptionQuota{}
+	seen := map[string]bool{}
 	provider.AskClaudeUsage()
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, l := range ls {
-		if _, ok := usage[l.Agent]; ok {
+		if seen[l.Agent] {
 			continue
 		}
-		usage[l.Agent] = nil
+		seen[l.Agent] = true
 		wg.Add(1)
 		go func(agent string) {
 			defer wg.Done()
@@ -224,9 +252,11 @@ func accountRows(ls []provider.Login, now time.Time) []accountRow {
 			if r.Plan == "" {
 				r.Plan = q.Plan
 			}
-			r.Error, r.Resets = q.Error, q.Resets
-			for _, w := range q.Windows {
-				s := quotaSpan{Name: w.Name, Used: w.Used, Remaining: max(0, 100-w.Used), ResetsAt: w.ResetsAt, Display: w.Display}
+			r.Error, r.Resets, r.AsOf = q.Error, q.Resets, q.AsOf
+			// a pool's own windows stand in for the models' drawing on it,
+			// as the usage page shows them
+			for _, w := range provider.PooledWindows(q.Windows) {
+				s := quotaSpan{Name: w.Name, Used: w.Used, Remaining: max(0, 100-w.Used), ResetsAt: w.ResetsAt, Display: w.Display, Pool: w.Pool}
 				if s.ResetsAt == nil && w.ResetSecs > 0 {
 					t := now.Add(time.Duration(w.ResetSecs) * time.Second)
 					s.ResetsAt = &t
@@ -247,7 +277,22 @@ func quotaCell(w quotaSpan) string {
 		cell += " (" + w.Display + ")"
 	}
 	if w.ResetsAt != nil {
-		cell += muted.Render(" ↻" + untilShort(time.Until(*w.ResetsAt)) + " " + provider.ResetClock(*w.ResetsAt, time.Now()))
+		if !w.ResetsAt.After(time.Now()) {
+			cell += muted.Render(" · reset time passed " + w.ResetsAt.Local().Format("Jan 2 15:04"))
+		} else {
+			cell += muted.Render(" ↻" + untilShort(time.Until(*w.ResetsAt)) + " " + provider.ResetClock(*w.ResetsAt, time.Now()))
+		}
+	}
+	return cell
+}
+
+func quotaReadingCell(at *time.Time, ws []quotaSpan) string {
+	if at == nil {
+		return ""
+	}
+	cell := "  " + muted.Render("as of "+at.Local().Format("Jan 2 15:04")+" (cached)")
+	if slices.ContainsFunc(ws, func(w quotaSpan) bool { return w.ResetsAt != nil && !w.ResetsAt.After(time.Now()) }) {
+		cell += muted.Render(" · expired window; current allowance unknown")
 	}
 	return cell
 }
@@ -277,7 +322,7 @@ func addAccount(agentID string) error {
 			return fmt.Errorf("sign-in canceled")
 		}
 	}
-	if provider.Moved(agentID) {
+	if _, plug := provider.PluginOf(agentID); plug || provider.Moved(agentID) {
 		return pluginLogin(context.Background(), agentID, "")
 	}
 	st, err := provider.StartSignIn(agentID)
@@ -300,7 +345,7 @@ func addAccount(agentID string) error {
 		fmt.Println("and confirm the code", st.Code)
 	}
 	openInBrowser(st.URL)
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := interruptContext()
 	defer stop()
 	if st.PasteCallback || st.PasteCode {
 		if st.PasteCode {
@@ -333,6 +378,8 @@ func addAccount(agentID string) error {
 			fmt.Println(green.Render("✓"), st.User, "is already listed — its sign-in was renewed")
 		} else if st.Using {
 			fmt.Println(green.Render("✓"), agentID, "is signed in as", st.User)
+		} else if strings.HasPrefix(agentID, "copilot") {
+			fmt.Println(green.Render("✓"), "added", st.User, muted.Render("· with the other Copilot accounts in magpie's window"))
 		} else {
 			fmt.Println(green.Render("✓"), "added", st.User, muted.Render("· use it: magpie accounts switch "+agentID+" "+st.User))
 		}
@@ -350,6 +397,8 @@ func openInBrowser(url string) {
 		cmd = proc.Command("open", url)
 	case "windows":
 		cmd = proc.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	case "android":
+		cmd = proc.Command("termux-open-url", url)
 	default:
 		cmd = proc.Command("xdg-open", url)
 	}
@@ -402,12 +451,13 @@ func refreshAccounts(asJSON bool) error {
 }
 
 // checkinWorkBuddy: `magpie accounts checkin` — WorkBuddy's daily check-in
-// (签到) for each WorkBuddy (China) account not in yet today, now, and how
-// each stands. The setting does it on its own once a day.
+// (签到) for each WorkBuddy (China) account not in yet today, and Trae CN's
+// (每日签到) for each Trae CN account, now, and how each stands. The
+// settings do it on their own once a day.
 func checkinWorkBuddy(asJSON bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	rs := provider.CheckInWorkBuddy(ctx)
+	rs := append(provider.CheckInWorkBuddy(ctx), provider.CheckInTrae(ctx)...)
 	if rs == nil {
 		rs = []provider.WorkBuddyCheckin{}
 	}
@@ -422,6 +472,9 @@ func checkinWorkBuddy(asJSON bool) error {
 		}
 		if asJSON {
 			continue
+		}
+		if r.By == "trae" {
+			r.User = "Trae CN " + r.User
 		}
 		switch r.Outcome {
 		case provider.CheckinClaimed, provider.CheckinDone:
@@ -445,10 +498,10 @@ func checkinWorkBuddy(asJSON bool) error {
 		}
 	}
 	if !asJSON && len(rs) == 0 {
-		fmt.Println(muted.Render("no WorkBuddy (China) account is signed in"))
+		fmt.Println(muted.Render("no WorkBuddy (China) or Trae CN account is signed in"))
 	}
 	if failed > 0 {
-		return fmt.Errorf("%d of %d WorkBuddy accounts couldn't check in", failed, len(rs))
+		return fmt.Errorf("%d of %d accounts couldn't check in", failed, len(rs))
 	}
 	return nil
 }

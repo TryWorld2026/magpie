@@ -298,7 +298,8 @@ func TestCodexAccountDraws(t *testing.T) {
 	if ds := Drawers(*p); len(ds) != 2 || ds[0].ID != "gpt-image-2" || ds[1].ID != "gpt-image-2.5" {
 		t.Fatalf("drawers %v", ds)
 	}
-	if m, ok := drawer(); !ok || m != "codex/gpt-image-2.5" {
+	// Automatic asks for what Codex CLI asks for: a plan may be refused 2.5
+	if m, ok := drawer(); !ok || m != "codex/gpt-image-2" {
 		t.Fatalf("drawer = %q %v", m, ok)
 	}
 	s := New()
@@ -311,7 +312,7 @@ func TestCodexAccountDraws(t *testing.T) {
 	if paths[0] != "/backend-api/codex/images/generations" || !strings.Contains(bodies[0], `"model":"gpt-image-2"`) {
 		t.Fatalf("asked %v %v", paths, bodies)
 	}
-	if head.Get("chatgpt-account-id") != "acct-1" || head.Get("Accept") != "application/json" || head.Get("originator") != "codex_cli_rs" || head.Get("x-codex-imagegen-request-id") == "" {
+	if head.Get("chatgpt-account-id") != "acct-1" || head.Get("Accept") != "application/json" || head.Get("originator") != "codex_cli_rs" || head.Get("x-codex-imagegen-request-id") == "" || head.Get("x-codex-image-turn-id") == "" {
 		t.Fatalf("headers %v", head)
 	}
 	// an edit goes as JSON, the image a data URL: the backend turns multipart away
@@ -324,11 +325,88 @@ func TestCodexAccountDraws(t *testing.T) {
 	}
 }
 
+// chatgpt.com's 403 for a ChatGPT account's images says what it likely
+// means, and Automatic asks for the model Codex CLI does (#545).
+func TestCodexDrawRefused(t *testing.T) {
+	codexSignedIn(t)
+	var models []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct{ Model string }
+		json.NewDecoder(r.Body).Decode(&req)
+		models = append(models, req.Model)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		io.WriteString(w, `{"detail":"Forbidden"}`)
+	}))
+	defer up.Close()
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	defer func() { provider.CodexBase = was }()
+	code, _, raw := postImages(t, New(), "/v1/images/generations", "application/json", `{"prompt":"a magpie"}`)
+	if code != 403 || !strings.Contains(raw, "Forbidden") || !strings.Contains(raw, "plan or workspace may not draw") {
+		t.Fatalf("%d %s", code, raw)
+	}
+	if len(models) != 1 || models[0] != "gpt-image-2" {
+		t.Fatalf("asked for %v", models)
+	}
+}
+
+// A ChatGPT account whose plan won't draw (chatgpt.com: 403
+// {"detail":"Forbidden"}) hands the drawing to the next account on, as a
+// Plus account further down draws it (#545); the one refused doesn't rest
+// for text over it, and the next drawing asks it first again.
+func TestCodexDrawMovesToNextAccount(t *testing.T) {
+	codexSignedIn(t, "plus@example.com")
+	var mu sync.Mutex
+	var tried []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		tried = append(tried, r.Header.Get("chatgpt-account-id"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if r.Header.Get("chatgpt-account-id") == "acct-1" {
+			w.WriteHeader(http.StatusForbidden)
+			io.WriteString(w, `{"detail":"Forbidden"}`)
+			return
+		}
+		io.WriteString(w, `{"created":1,"data":[{"b64_json":"`+base64.StdEncoding.EncodeToString(pngBytes)+`"}],"usage":{"input_tokens":5,"output_tokens":196}}`)
+	}))
+	defer up.Close()
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	defer func() { provider.CodexBase = was }()
+	s := New()
+	code, a, raw := postImages(t, s, "/v1/images/generations", "application/json", `{"prompt":"a magpie"}`)
+	if code != 200 || len(a.Data) != 1 {
+		t.Fatalf("%d %s", code, raw)
+	}
+	mu.Lock()
+	if strings.Join(tried, ",") != "acct-1,acct-2" {
+		t.Fatalf("tried %v", tried)
+	}
+	tried = nil
+	mu.Unlock()
+	restingUntil.Lock()
+	rests := len(restingUntil.m)
+	restingUntil.Unlock()
+	if rests != 0 {
+		t.Fatalf("%d accounts rest after a drawing was refused", rests)
+	}
+	postImages(t, s, "/v1/images/generations", "application/json", `{"prompt":"a magpie"}`)
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(tried, ",") != "acct-1,acct-2" {
+		t.Fatalf("second drawing tried %v", tried)
+	}
+}
+
 // grokSignedIn gives the test's HOME the Grok CLI's sign-in, and a CLI to find.
 func grokSignedIn(t *testing.T) {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	t.Setenv("GROK_HOME", filepath.Join(home, ".grok"))

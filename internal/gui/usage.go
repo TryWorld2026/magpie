@@ -9,9 +9,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"time"
 
+	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/provider"
@@ -29,14 +31,16 @@ type usageGroup struct {
 
 type usageJSON struct {
 	usage.Summary
-	Agents []usageGroup `json:"agents"`
-	Models []usageGroup `json:"models"`
-	Path   string       `json:"path"`
+	Agents     []usageGroup `json:"agents"`
+	Models     []usageGroup `json:"models"`
+	Accounts   []usageGroup `json:"accounts"`
+	CallerKeys []usageGroup `json:"callerKeys"`
+	Path       string       `json:"path"`
 }
 
 func usageState(p usage.Period) usageJSON {
 	s := usage.Summarize(p)
-	out := usageJSON{Summary: s, Agents: []usageGroup{}, Models: []usageGroup{}, Path: tilde(usage.Path())}
+	out := usageJSON{Summary: s, Agents: []usageGroup{}, Models: []usageGroup{}, Accounts: []usageGroup{}, Path: tilde(usage.Path())}
 	agents := map[string]*agent.Agent{}
 	for _, a := range agent.Clients() {
 		agents[a.ID] = a
@@ -65,7 +69,41 @@ func usageState(p usage.Period) usageJSON {
 		}
 		out.Models = append(out.Models, ug)
 	}
+	// each subscription account's share, by the account that answered
+	// (#557); Name "" is the calls whose record names none, the page
+	// saying "account not recorded"
+	for _, g := range s.Accounts {
+		ug := usageGroup{Group: g, Name: g.Account, Sub: g.Provider, Icon: "generic"}
+		if p, ok := providers[g.Provider]; ok {
+			ug.Sub = p.Name
+			if p.Icon != "" {
+				ug.Icon = p.Icon
+			}
+		}
+		out.Accounts = append(out.Accounts, ug)
+	}
+	out.CallerKeys = callerUsageGroups(s)
 	return out
+}
+
+func callerUsageGroups(s usage.Summary) []usageGroup {
+	keys := []usageGroup{}
+	current, _ := access.List()
+	names := map[string]string{}
+	for _, k := range current {
+		names[k.ID] = k.Name
+	}
+	for _, g := range s.CallerKeys {
+		n := names[g.CallerKeyID]
+		if n == "" {
+			n = g.CallerKeyName
+		}
+		if n == "" {
+			n = g.CallerKeyID
+		}
+		keys = append(keys, usageGroup{Group: g, Name: n, Icon: "generic"})
+	}
+	return keys
 }
 
 func periodOf(s string) usage.Period {
@@ -76,37 +114,57 @@ func periodOf(s string) usage.Period {
 	return usage.Month
 }
 
+// csvStamp names the selected day, or the period when no day is selected.
+func csvStamp(p usage.Period, day string) string {
+	if _, err := time.Parse(time.DateOnly, day); err == nil {
+		return "magpie-requests-day-" + day
+	}
+	return "magpie-requests-" + string(p) + "-" + time.Now().Format(time.DateOnly)
+}
+
 func ledgerFilter(q url.Values) usage.Filter {
 	id, _ := strconv.ParseInt(q.Get("route"), 10, 64)
-	return usage.Filter{RouteID: id, Model: q.Get("model"), Agent: q.Get("agent"), Provider: q.Get("provider"), Failed: q.Get("failed") == "1", Query: q.Get("q")}
+	return usage.Filter{Day: q.Get("day"), RouteID: id, Model: q.Get("model"), Agent: q.Get("agent"), Provider: q.Get("provider"), Account: q.Get("account"), CallerKey: q.Get("callerKey"), Failed: q.Get("failed") == "1", Query: q.Get("q"), Computer: q.Get("computer")}
 }
 
 // ledgerRow is a usage.Row with the names the page shows it by.
 type ledgerRow struct {
 	usage.Row
-	AgentName    string `json:"agentName"`
-	Icon         string `json:"icon"` // the agent's
-	ProviderName string `json:"providerName"`
-	Access       string `json:"access,omitempty"` // known account/route type, independent of model maker
-	PricingModel string `json:"pricing_model,omitempty"`
+	CallerKeyLabel string `json:"callerKeyLabel,omitempty"`
+	AgentName      string `json:"agentName"`
+	Icon           string `json:"icon"` // the agent's
+	ProviderName   string `json:"providerName"`
+	Access         string `json:"access,omitempty"` // known account/route type, independent of model maker
+	PricingModel   string `json:"pricing_model,omitempty"`
+	// ComputerName is the other computer a call was made on, shared through sync (#542)
+	ComputerName string `json:"computerName,omitempty"`
 }
 
 type ledgerJSON struct {
-	Period usage.Period `json:"period"`
-	Rows   []ledgerRow  `json:"rows"`
-	Offset int          `json:"offset"`
-	Total  int          `json:"total"` // the rows the filter keeps, on every page
-	// Series: those rows by hour, day or week (Bucket), for the chart
+	CallerKeys []usageGroup `json:"callerKeys"`
+	Period     usage.Period `json:"period"`
+	Rows       []ledgerRow  `json:"rows"`
+	Offset     int          `json:"offset"`
+	Total      int          `json:"total"` // the rows the filter keeps, on every page
+	// Series: the period by hour, day or week (Bucket), before the day filter
 	Bucket string              `json:"bucket"`
 	Series []usage.SeriesPoint `json:"series"`
 	// By: the rows told apart by provider, agent and model, the most tokens
 	// first. The one by a dimension the filter has picked is of the rows
 	// without that pick, so the others are still there to switch to.
-	By map[string][]ledgerShare `json:"by"`
+	By      map[string][]ledgerShare `json:"by"`
+	ChartBy map[string][]ledgerShare `json:"chartBy,omitempty"`
+	Day     string                   `json:"day,omitempty"`
 	usage.Totals
 	// Agents and Providers: those with calls in the period, for the filters
 	Agents    []ledgerAgent `json:"agents"`
 	Providers []ledgerAgent `json:"providers"`
+	// Accounts: the subscription accounts that answered calls in the
+	// period, for the Account filter (#557)
+	Accounts []ledgerAccount `json:"accounts"`
+	// Computers: this one ("this", no name) and the others whose usage
+	// sync brought (#542), for the filter; none while there are none
+	Computers []ledgerShare `json:"computers,omitempty"`
 }
 
 // ledgerShare is a usage.Share with the name and logo the page shows it by.
@@ -114,6 +172,13 @@ type ledgerShare struct {
 	usage.Share
 	Name string `json:"name"`
 	Icon string `json:"icon,omitempty"`
+}
+
+// ledgerAccount is a subscription account the Account filter offers: its
+// name, and the providers it answered for, by name.
+type ledgerAccount struct {
+	ID        string   `json:"id"`
+	Providers []string `json:"providers"`
 }
 
 type ledgerAgent struct {
@@ -160,8 +225,14 @@ func ledgerPage(p usage.Period, f usage.Filter, offset, limit int) ledgerJSON {
 		}
 		return a
 	}
-	out := ledgerJSON{Period: p, Rows: make([]ledgerRow, 0, len(page)), Offset: offset, Total: l.Total, Totals: l.Sum, Agents: []ledgerAgent{}, Providers: []ledgerAgent{}}
+	out := ledgerJSON{Period: p, Rows: make([]ledgerRow, 0, len(page)), Offset: offset, Total: l.Total, Totals: l.Sum, Agents: []ledgerAgent{}, Providers: []ledgerAgent{}, Accounts: []ledgerAccount{}}
 	out.Bucket, out.Series = l.Bucket, l.Series
+	out.Day = f.Day
+	out.CallerKeys = callerUsageGroups(usage.Summary{CallerKeys: l.CallerKeys})
+	callerLabels := map[string]string{}
+	for _, g := range out.CallerKeys {
+		callerLabels[g.CallerKeyID] = g.Name
+	}
 	for _, r := range page {
 		a := who(r.Agent)
 		lr := ledgerRow{Row: r, AgentName: a.Name, Icon: a.Icon, ProviderName: names[r.Provider]}
@@ -176,6 +247,13 @@ func ledgerPage(p usage.Period, f usage.Filter, offset, limit int) ledgerJSON {
 		if lr.ProviderName == "" {
 			lr.ProviderName = r.Provider
 		}
+		lr.CallerKeyLabel = callerLabels[r.CallerKeyID]
+		if r.Computer != "" {
+			lr.ComputerName = l.Names[r.Computer]
+			if lr.ComputerName == "" {
+				lr.ComputerName = r.Computer
+			}
+		}
 		out.Rows = append(out.Rows, lr)
 	}
 	for _, id := range l.Agents {
@@ -184,24 +262,52 @@ func ledgerPage(p usage.Period, f usage.Filter, offset, limit int) ledgerJSON {
 	for _, id := range l.Providers {
 		out.Providers = append(out.Providers, which(id))
 	}
+	// one choice per account, most used first, with the providers it
+	// answered for: the same email may be a Codex and a Claude account
+	at := map[string]int{}
+	for _, g := range l.Accounts {
+		name := which(g.Provider).Name
+		if i, ok := at[g.Account]; ok {
+			if a := &out.Accounts[i]; !slices.Contains(a.Providers, name) {
+				a.Providers = append(a.Providers, name)
+			}
+			continue
+		}
+		at[g.Account] = len(out.Accounts)
+		out.Accounts = append(out.Accounts, ledgerAccount{ID: g.Account, Providers: []string{name}})
+	}
 	// what each is of: the rows of the filter, or, for the dimension the
 	// filter has picked, of the rows without that pick
-	out.By = map[string][]ledgerShare{}
-	for _, d := range usage.Dimensions {
-		shares := []ledgerShare{}
-		for _, s := range l.By[d] {
-			ls := ledgerShare{Share: s, Name: s.ID}
-			switch d {
-			case "provider":
-				a := which(s.ID)
-				ls.Name, ls.Icon = a.Name, a.Icon
-			case "agent":
-				a := who(s.ID)
-				ls.Name, ls.Icon = a.Name, a.Icon
+	sharesJSON := func(by map[string][]usage.Share) map[string][]ledgerShare {
+		out := map[string][]ledgerShare{}
+		for _, d := range usage.Dimensions {
+			shares := []ledgerShare{}
+			for _, s := range by[d] {
+				ls := ledgerShare{Share: s, Name: s.ID}
+				switch d {
+				case "provider":
+					a := which(s.ID)
+					ls.Name, ls.Icon = a.Name, a.Icon
+				case "agent":
+					a := who(s.ID)
+					ls.Name, ls.Icon = a.Name, a.Icon
+				}
+				shares = append(shares, ls)
 			}
-			shares = append(shares, ls)
+			out[d] = shares
 		}
-		out.By[d] = shares
+		return out
+	}
+	out.By = sharesJSON(l.By)
+	if l.ChartBy != nil {
+		out.ChartBy = sharesJSON(l.ChartBy)
+	}
+	for _, s := range l.Computers {
+		ls := ledgerShare{Share: s, Name: l.Names[s.ID]}
+		if s.ID != usage.ThisComputer && ls.Name == "" {
+			ls.Name = s.ID
+		}
+		out.Computers = append(out.Computers, ls)
 	}
 	return out
 }
@@ -283,7 +389,7 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 		p := periodOf(q.Get("period"))
 		rows, _, _ := usage.Ledger(p, ledgerFilter(q))
 		rw.Header().Set("Content-Type", "text/csv; charset=utf-8")
-		rw.Header().Set("Content-Disposition", `attachment; filename="magpie-requests-`+string(p)+"-"+time.Now().Format("2006-01-02")+`.csv"`)
+		rw.Header().Set("Content-Disposition", `attachment; filename="`+csvStamp(p, q.Get("day"))+`.csv"`)
 		usage.WriteCSV(rw, rows)
 	})
 	// the rows the ledger shows, all its pages, as a CSV in Downloads
@@ -297,7 +403,7 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 			return
 		}
 		dir := downloads()
-		stamp := "magpie-requests-" + string(p) + "-" + time.Now().Format("2006-01-02")
+		stamp := csvStamp(p, q.Get("day"))
 		name := filepath.Join(dir, stamp+".csv")
 		for i := 2; ; i++ { // never over an earlier one
 			if _, err := os.Stat(name); err != nil {
@@ -324,7 +430,36 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 		defer cancel()
-		writeJSON(rw, provider.Quotas(ctx))
+		// a WorkBuddy (China) account's card says how its daily check-in
+		// went (#694)
+		writeJSON(rw, provider.WithCheckins(provider.Quotas(ctx)))
+	})
+	// WorkBuddy's daily check-in pressed now, from the Usage card, for
+	// each account not in yet today, as `magpie accounts checkin` does; the
+	// card is read again after
+	mux.HandleFunc("POST /api/usage/workbuddy-checkin", func(rw http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
+		defer cancel()
+		rs := provider.CheckInWorkBuddy(ctx)
+		if rs == nil {
+			rs = []provider.WorkBuddyCheckin{}
+		}
+		writeJSON(rw, rs)
+	})
+	// and Trae CN's, for each Trae CN account (#694)
+	mux.HandleFunc("POST /api/usage/trae-checkin", func(rw http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
+		defer cancel()
+		rs := provider.CheckInTrae(ctx)
+		if rs == nil {
+			rs = []provider.WorkBuddyCheckin{}
+		}
+		writeJSON(rw, rs)
+	})
+	// what was left of each window over time, for the quota cards' curves
+	// (#651); ?days= back
+	mux.HandleFunc("GET /api/usage/quotas/history", func(rw http.ResponseWriter, r *http.Request) {
+		writeJSON(rw, provider.QuotaHistories(provider.QuotaHistorySince(r.URL.Query().Get("days"), time.Now()), "", ""))
 	})
 	// spends one of a Codex account's rate-limit resets, which the page
 	// has asked the user about first; what it did comes back

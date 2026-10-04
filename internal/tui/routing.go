@@ -34,7 +34,7 @@ func (m *model) reloadGroups() {
 	m.grow = clamp(m.grow, len(m.groups))
 }
 
-var routings = []string{"", provider.Ordered, provider.Rotate, provider.LeastUsed, provider.Manual}
+var routings = []string{"", provider.Ordered, provider.Rotate, provider.LeastUsed, provider.Pace, provider.Manual}
 
 func routingName(v string) string {
 	switch v {
@@ -44,6 +44,8 @@ func routingName(v string) string {
 		return "rotate"
 	case provider.LeastUsed:
 		return "least used"
+	case provider.Pace:
+		return "weekly pace"
 	case provider.Manual:
 		return "manual"
 	}
@@ -423,7 +425,7 @@ func (m model) updateGroup(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			in.SetValue(fmt.Sprint(g.Context))
 		}
 		m.openAsk(ask{crumbs: []string{"routing", g.Name, "context"}, input: in, empty: true,
-			hint: "how long a request agents are told the group takes, rather than its shortest model's",
+			hint: "how long a request agents are told the group takes, rather than its largest model's",
 			onEnter: func(v string) tea.Cmd {
 				return saveGroup(g.ID, func(g *provider.Group) error {
 					if v == "" {

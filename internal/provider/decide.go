@@ -2,12 +2,12 @@ package provider
 
 // A provider with a decision API (Provider.Decide) — TypeSafe's System One,
 // which Jev answers, or Jev as Vercel's AI Gateway or Cloudflare's Workers
-// AI serve it — serves no conversation. Given a message and typed
-// questions it answers with a choice and how likely each option was, so a
+// AI serve it — answers typed questions about a message with a choice and
+// how likely each option was, so a
 // routing group can ask it, as a user's turn begins, which of its rules'
 // intents the message is and how hard the turn is to think about (see
-// gateway/decide.go). Its models are never in the list agents pick from,
-// nor members of a group: they are only a group's classifier.
+// gateway/decide.go). A provider may also serve conversations; only its
+// decision models are excluded from agents' lists and group members.
 
 import (
 	"context"
@@ -17,6 +17,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -29,8 +30,49 @@ import (
 // picked none: TypeSafe's latest stable one.
 const JevLatest = "jev-latest"
 
+// BailianDecision is Alibaba Cloud Bailian's decision model, asked on the
+// same System One API as Jev (#647).
+const BailianDecision = "decision-model-preview"
+
+// bailianDecides reports whether base is Bailian's: a workspace's host or
+// the Token Plan's, <x>.<region>.maas.aliyuncs.com. Its /models lists
+// Qwen's chat models, never the decision model.
+func bailianDecides(base string) bool {
+	h := HostOf(base)
+	return strings.HasSuffix(h, ".maas.aliyuncs.com") || strings.HasSuffix(h, ".maas.qianwenaiapi.com")
+}
+
+// ownDecideModels are a System One provider's models that its vendor's
+// list may not name: the ones picked for a decision-only provider (a
+// vendor's own decision model needn't be called jev-…), else Bailian's.
+func (p Provider) ownDecideModels() []catalog.Model {
+	var out []catalog.Model
+	if p.DecideOnly() {
+		for _, m := range p.Models {
+			if m = strings.TrimSpace(m); m != "" {
+				out = append(out, catalog.Model{ID: m})
+			}
+		}
+	}
+	if len(out) == 0 && bailianDecides(p.Decide) {
+		out = []catalog.Model{{ID: BailianDecision, Name: "Decision model (preview)"}}
+	}
+	return out
+}
+
 // Decides reports whether the provider is a decision API.
 func (p Provider) Decides() bool { return p.Decide != "" }
+
+// DecideOnly reports whether the provider has no conversation endpoint.
+func (p Provider) DecideOnly() bool {
+	return p.Decides() && p.Chat == "" && p.Responses == "" && p.Anthropic == ""
+}
+
+// DecidesModel distinguishes Jev from the conversation models a gateway
+// also serves. A dedicated decision API may use any model name.
+func (p Provider) DecidesModel(model string) bool {
+	return p.Decides() && (p.DecideOnly() || jevID(model))
+}
 
 // The ways a decision API is asked, by where it is (DecideVia): TypeSafe's
 // own System One; Vercel's AI Gateway, at its TypeSafe API (System One's
@@ -71,6 +113,30 @@ func (p Provider) Jev() string {
 	case ViaCloudflare:
 		return "typesafe/jev"
 	}
+	if own := p.ownDecideModels(); len(own) > 0 {
+		return own[0].ID
+	}
+	// a gateway that serves conversations too names its Jev its own way
+	// (OpenCode Zen's jev-1.13): the one its list has, the free one where
+	// it is asked with no key of the user's
+	if !p.DecideOnly() {
+		if live, _, ok := catalog.Live(p.ID); ok {
+			var jevs []string
+			for _, m := range live {
+				if jevID(m.ID) {
+					jevs = append(jevs, m.ID)
+				}
+			}
+			if len(jevs) > 0 {
+				if p.IsOpenCode() && p.Key == OpenCodeAnonymousKey {
+					if i := slices.IndexFunc(jevs, func(id string) bool { return strings.HasSuffix(id, "-free") }); i >= 0 {
+						return jevs[i]
+					}
+				}
+				return jevs[0]
+			}
+		}
+	}
 	return JevLatest
 }
 
@@ -78,10 +144,22 @@ func (p Provider) Jev() string {
 // list when fetched, else Jev's aliases (a gateway's one Jev).
 func (p Provider) decideModels() []catalog.Model {
 	if live, _, ok := catalog.Live(p.ID); ok && len(live) > 0 {
-		return live
+		if p.DecideOnly() {
+			return live
+		}
+		var out []catalog.Model
+		for _, m := range live {
+			if p.DecidesModel(m.ID) {
+				out = append(out, m)
+			}
+		}
+		return out
 	}
 	if p.DecideVia() != ViaSystemOne {
 		return []catalog.Model{{ID: p.Jev(), Name: "Jev"}}
+	}
+	if own := p.ownDecideModels(); len(own) > 0 {
+		return own
 	}
 	return []catalog.Model{{ID: JevLatest, Name: "Jev"}, {ID: "jev-preview", Name: "Jev (preview)"}}
 }
@@ -208,8 +286,14 @@ func Deciders() []Entry {
 		if !p.Decides() || !p.On() {
 			continue
 		}
-		for _, m := range p.Exposed() {
-			out = append(out, Entry{ID: p.ID + "/" + m.ID, Model: m.ID, Name: m.Name, Provider: p})
+		ms := p.Exposed()
+		if !p.DecideOnly() && len(p.Models) == 0 {
+			ms = p.decideModels() // the conversation picker's limit does not hide Jev
+		}
+		for _, m := range ms {
+			if p.DecidesModel(m.ID) {
+				out = append(out, Entry{ID: p.ID + "/" + m.ID, Model: m.ID, Name: m.Name, Provider: p})
+			}
 		}
 	}
 	return out
@@ -218,8 +302,8 @@ func Deciders() []Entry {
 // IsDecider reports whether a classifier ("provider/model") is a decision
 // provider's model.
 func IsDecider(id string) bool {
-	p, _, ok := Resolve(id)
-	return ok && p.Decides()
+	p, model, ok := Resolve(id)
+	return ok && p.DecidesModel(model)
 }
 
 // RouteDecider is the decision provider a System One model names, and the
@@ -257,7 +341,7 @@ func RouteDecider(model string) (Provider, string, error) {
 	}
 	var listed []Provider
 	for _, p := range on {
-		for _, m := range p.Available() {
+		for _, m := range p.decideModels() {
 			if m.ID == model {
 				listed = append(listed, p)
 				break
@@ -343,7 +427,10 @@ func DecideRouteStatus(err error) int {
 // jev-latest (Vercel: typesafe-ai/jev, Cloudflare: typesafe/jev). Preview
 // and other unlisted names are none: the channel has no such model.
 func resolveDecideModel(p Provider, name string) (string, bool) {
-	for _, m := range p.Available() {
+	if !p.DecidesModel(name) {
+		return "", false
+	}
+	for _, m := range p.decideModels() {
 		if m.ID == name {
 			return name, true
 		}
@@ -399,6 +486,10 @@ func (p Provider) fetchDecide(ctx context.Context) ([]catalog.Model, error) {
 		}
 		return p.decideModels(), nil
 	}
+	// Bailian lists its chat models only: its decision model is asked
+	if bailianDecides(p.Decide) {
+		return p.decideAsked(ctx)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.Decide+"/models", nil)
 	if err != nil {
 		return nil, err
@@ -412,17 +503,82 @@ func (p Provider) fetchDecide(ctx context.Context) ([]catalog.Model, error) {
 	}
 	defer res.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	// a vendor's own decision model, picked by name, is asked when its
+	// list isn't there or doesn't name it
+	own := len(p.ownDecideModels()) > 0
 	if res.StatusCode != http.StatusOK {
+		if own && res.StatusCode != http.StatusUnauthorized && res.StatusCode != http.StatusForbidden {
+			return p.decideAsked(ctx)
+		}
 		return nil, fmt.Errorf("%s: %s", p.Name, APIError(b, res.Status))
 	}
 	ms, err := listedDecide(b)
+	if (err != nil || len(ms) == 0) && own {
+		return p.decideAsked(ctx)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%s: %s", p.Name, err)
 	}
 	if len(ms) == 0 {
 		return nil, fmt.Errorf("%s lists no models", p.Name)
 	}
+	if !p.DecideOnly() {
+		return ms, nil // do not replace a mixed provider's full model list
+	}
 	return ms, catalog.SaveLive(p.ID, p.Decide, ms)
+}
+
+// decideAsked is a System One provider's own models once the first of
+// them answered the smallest question, a yes-or-no, at POST …/systemone:
+// what checks its key and model when no list names them.
+func (p Provider) decideAsked(ctx context.Context) ([]catalog.Model, error) {
+	ms := p.ownDecideModels()
+	if len(ms) == 0 {
+		ms = []catalog.Model{{ID: p.Jev()}}
+	}
+	if err := p.AskSystemOne(ctx, ms[0].ID); err != nil {
+		return nil, err
+	}
+	if !p.DecideOnly() {
+		return ms, nil
+	}
+	return ms, catalog.SaveLive(p.ID, p.Decide, ms)
+}
+
+// AskSystemOne sends model the smallest System One question at p's
+// decision API, and says why it wasn't answered.
+func (p Provider) AskSystemOne(ctx context.Context, model string) error {
+	u, err := p.DecideURL(ctx)
+	if err != nil {
+		return err
+	}
+	body, _ := json.Marshal(map[string]any{"model": model,
+		"state":     map[string]any{"text": "ping"},
+		"questions": map[string]any{"ok": map[string]any{"type": "noul", "instructions": "Is this a test?"}}})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if err := p.Sign(ctx, req, Chat, nil); err != nil {
+		return err
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s: %v", p.Name, err)
+	}
+	defer res.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s: %s", p.Name, APIError(b, res.Status))
+	}
+	var out struct {
+		Answers map[string]json.RawMessage `json:"answers"`
+	}
+	if json.Unmarshal(b, &out) != nil || len(out.Answers) == 0 {
+		return fmt.Errorf("%s: no System One answers at %s", p.Name, u)
+	}
+	return nil
 }
 
 // listedDecide reads a decision provider's model list. TypeSafe's is

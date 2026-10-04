@@ -45,6 +45,17 @@ func PluginID(id string) string {
 	return id
 }
 
+// subscriptionID is whether id is a subscription's, a built-in's or an
+// installed plugin's, signed in or not: a provider of the user's own never
+// takes it, or it would hide that subscription once signed in.
+func subscriptionID(id string) bool {
+	if slices.Contains(accountIDs, id) {
+		return true
+	}
+	_, ok := PluginOf(id)
+	return ok
+}
+
 // IsPlugin is whether the provider is a plugin's.
 func (p Provider) IsPlugin() bool { return p.Account != nil && p.Account.plugin != nil }
 
@@ -59,7 +70,7 @@ func (p Provider) PluginProvider() string {
 
 // PluginOf is the plugin provider magpie's provider id is, when it is one.
 func PluginOf(id string) (plugin.Provider, bool) {
-	for _, pp := range plugin.Cached() {
+	for _, pp := range heldPlugins() {
 		if PluginID(pp.ID) == id {
 			return pp, true
 		}
@@ -71,7 +82,7 @@ func PluginOf(id string) (plugin.Provider, bool) {
 // first account.
 func pluginAccounts() []Provider {
 	var out []Provider
-	for _, pp := range plugin.Cached() {
+	for _, pp := range heldPlugins() {
 		if movingNow(pp.ID) {
 			continue // shown once the move is through (migrate.go)
 		}
@@ -144,6 +155,7 @@ func pluginCatalog(pp plugin.Provider) []catalog.Model {
 			ID: m.ID, Name: m.Name, Provider: pp.ID, Released: m.Released,
 			APIs: []string{string(pluginProtocol(pp.ID, m))}, Images: m.Image,
 			Context: m.Input, Output: m.Output, Free: m.Free,
+			Rate: m.Rate, RateWas: m.RateWas,
 		}
 		if c.Context == 0 {
 			c.Context = m.Context
@@ -191,6 +203,21 @@ func pluginAccountCatalog(pp plugin.Provider, key string) []catalog.Model {
 	return all
 }
 
+// pluginLists is whether a plugin's account serves model, as the plugin
+// last told its list; one it told none of serves all of the provider's.
+func (a *Account) pluginLists(model string) bool {
+	pp := *a.plugin
+	if cur, ok := PluginOf(PluginID(pp.ID)); ok {
+		pp = cur
+	}
+	for _, ac := range pp.Accounts {
+		if ac.Key == a.pluginKey && ac.Models != nil {
+			return slices.Contains(ac.Models, model)
+		}
+	}
+	return true
+}
+
 // pluginProvider is the provider as one of its accounts, l as the
 // accounts list has it.
 func pluginProvider(pp plugin.Provider, l pluginLogin) Provider {
@@ -205,6 +232,11 @@ func pluginProvider(pp plugin.Provider, l pluginLogin) Provider {
 		// Codex's namespaced tools go to Grok flat, as the built-in sends
 		// them (#404): the plugin's own rewrite would leave them out
 		a.body = grokBody
+	}
+	if pp.ID == "zed" {
+		// an OpenAI model's request as Zed's cloud reads it: Codex's
+		// developer messages as system ones, its namespaced tools flat
+		a.body = ZedBody
 	}
 	a.models = func() []catalog.Model {
 		if cur, ok := PluginOf(id); ok {
@@ -263,6 +295,35 @@ func (p Provider) pluginAPIs(model string) []Protocol {
 		return []Protocol{pluginProtocol(pp.ID, m)}
 	}
 	return nil
+}
+
+// Origin is the scheme and host p's requests go to, for a URL of the
+// vendor's own outside its API (WorkBuddy's /v3/config beside its /v2): a
+// plugin's where its loader sends them, which p.Do then takes there through
+// the plugin; any other's its API's. "" when it has none.
+func (p Provider) Origin(ctx context.Context) string {
+	base := ""
+	if p.IsPlugin() {
+		pp := *p.Account.plugin
+		if cur, ok := PluginOf(p.ID); ok {
+			pp = cur
+		}
+		base = pp.API
+		if o, err := plugin.LoaderOptions(ctx, pp.ID, p.Account.pluginKey); err == nil {
+			base = firstOf(o.BaseURL, pp.API)
+		}
+	} else {
+		for _, pr := range p.Speaks() {
+			if base = p.Base(pr); base != "" {
+				break
+			}
+		}
+	}
+	scheme, rest, ok := strings.Cut(strings.TrimSpace(base), "://")
+	if !ok || HostOf(rest) == "" {
+		return ""
+	}
+	return scheme + "://" + HostOf(rest)
 }
 
 // pluginFetch sends a request the gateway made for a plugin's provider
@@ -325,6 +386,14 @@ func pluginFetch(pp plugin.Provider, account string, req *http.Request) (*http.R
 		// chat, responses and Anthropic's messages: the AI SDK's base
 		// ends where magpie's /v1 does
 		url = base + strings.TrimPrefix(rest, "/v1")
+	case strings.HasPrefix(rest, "https://") || strings.HasPrefix(rest, "http://"):
+		// a URL of the vendor's own outside the base (Provider.Origin's),
+		// signed by the plugin as its other requests: only at the host the
+		// plugin sends to, never anywhere else with the account's sign-in
+		if HostOf(rest) != HostOf(base) {
+			return nil, fmt.Errorf("%s's plugin sends to %s, not %s", pp.Name, HostOf(base), HostOf(rest))
+		}
+		url = rest
 	default:
 		url = base + rest
 	}
@@ -439,10 +508,16 @@ func firstOf(ss ...string) string {
 }
 
 // Do sends req, through the account's own transport when it has one (a
-// plugin's) and client otherwise.
+// plugin's), the client the account asks for this request when it asks
+// for one (ZCode's Start Plan: zcodeStartClient), and client otherwise.
 func (p Provider) Do(client *http.Client, req *http.Request) (*http.Response, error) {
 	if p.Account != nil && p.Account.transport != nil {
 		return p.Account.transport(req)
+	}
+	if p.Account != nil && p.Account.clientFor != nil {
+		if c := p.Account.clientFor(req); c != nil {
+			client = c
+		}
 	}
 	req.Header.Del(ConversationHeader)
 	return client.Do(req)

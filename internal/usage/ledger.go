@@ -44,15 +44,45 @@ func (r Record) Failed() bool { return r.Status >= 400 || r.Error != "" }
 // one provider, to the failed calls, and to the rows whose models, provider, host or
 // session hold Query (any case).
 type Filter struct {
-	RouteID  int64
-	Model    string // exact model selected in the ranking
-	Agent    string
-	Provider string // a provider's id, as the ledger's rows have it
-	Failed   bool
-	Query    string
+	Day       string // YYYY-MM-DD in the chart's local time zone; "" is the whole period
+	CallerKey string
+	RouteID   int64
+	Model     string // exact model selected in the ranking
+	Agent     string
+	Provider  string // a provider's id, as the ledger's rows have it
+	// Account narrows to the calls a subscription account answered, by its
+	// name as Record.Account gives it (#557)
+	Account string
+	Failed  bool
+	Query   string
+	// Computer narrows to the calls of one computer (#542): ThisComputer,
+	// OtherComputers, or another's id; "" is every computer's
+	Computer string
+}
+
+// OtherComputers is the Filter.Computer of every other computer's calls.
+const OtherComputers = "others"
+
+// computer is whether r is of the computers Computer picks.
+func (f Filter) computer(r Record) bool {
+	switch f.Computer {
+	case "":
+		return true
+	case ThisComputer:
+		return r.Computer == ""
+	case OtherComputers:
+		return r.Computer != ""
+	}
+	return r.Computer == f.Computer
 }
 
 func (f Filter) keeps(r Record) bool {
+	if f.Day != "" && r.Time.In(time.Local).Format(time.DateOnly) != f.Day {
+		return false
+	}
+	if f.CallerKey != "" && r.CallerKeyID != f.CallerKey {
+		return false
+	}
 	if f.RouteID != 0 && r.RouteID != f.RouteID {
 		return false
 	}
@@ -65,11 +95,17 @@ func (f Filter) keeps(r Record) bool {
 	if f.Provider != "" && r.Provider != f.Provider {
 		return false
 	}
+	if f.Account != "" && r.Account() != f.Account {
+		return false
+	}
+	if !f.computer(r) {
+		return false
+	}
 	if f.Failed && !r.Failed() {
 		return false
 	}
 	if q := strings.ToLower(strings.TrimSpace(f.Query)); q != "" {
-		return slices.ContainsFunc([]string{r.Requested, r.Model, r.Served, r.Provider, r.Host, r.Session, r.Effort, r.SessionProvider, r.SessionAccount, r.ProviderKeyID, r.ProviderKeyName}, func(s string) bool {
+		return slices.ContainsFunc([]string{r.Requested, r.Model, r.Served, r.Provider, r.Host, r.Session, r.Effort, r.SessionProvider, r.SessionAccount, r.ProviderKeyID, r.ProviderKeyName, r.Account(), r.CallerKeyID, r.CallerKeyName}, func(s string) bool {
 			return strings.Contains(strings.ToLower(s), q)
 		})
 	}
@@ -117,7 +153,7 @@ func LedgerOf(p Period, f Filter) Ledgered {
 	if reader == nil {
 		reader = sessions.Calls
 	}
-	rows, sum, agents, providers := ledgerWith(since, f, Load(gatewaySince), reader(since))
+	rows, sum, agents, providers := ledgerWithShared(since, f, Load(gatewaySince), reader(since), sharedRecords(since))
 	return Ledgered{rows, sum, agents, providers}
 }
 
@@ -188,13 +224,14 @@ const UnknownProvider = "session-unknown"
 // unknown, and what the file doesn't say is left out. Nothing
 // stood between the agent and the vendor, so what was sent is what the agent
 // asked for. Claude Code's file names the model it asked for (as it runs) and
-// the one the API answered with, which is the served model; Codex's names the
-// one it asked for.
+// the one the API answered with, which is the served model; Codex's and
+// OpenCode's name only the one they asked for (OpenCode's reply keeps the
+// model it was sent to, never the one the response named) (#680).
 func logRecord(c sessions.Call) Record {
 	r := Record{Time: c.Time, Agent: c.Agent, Provider: UnknownProvider, Model: c.Model, Served: c.Model, Requested: c.Requested,
 		Input: c.Input, Output: c.Output, CacheRead: c.CacheRead, CacheWrite: c.CacheWrite, Reasoning: c.Reasoning, Effort: c.Effort,
 		Millis: c.Millis, TTFT: c.TTFT, Session: c.Session, RequestID: c.RequestID, Error: c.ErrorText, ErrType: c.Error}
-	if c.Agent == "codex" {
+	if c.Agent == "codex" || c.Agent == "opencode" {
 		r.Requested, r.Served = c.Model, ""
 	}
 	if r.Requested != "" {
@@ -208,74 +245,30 @@ func logRecord(c sessions.Call) Record {
 // and an end within 2s. Fallback matches must be unique in both logs: an
 // ambiguous direct call stays visible. One gateway entry consumes one file call.
 func gatewayMatches(recs []Record, logs []sessions.Call) map[int]bool {
-	byID, bySession := map[string][]int{}, map[string][]int{}
+	gateway, local := &rowChunk{}, &rowChunk{}
 	for i, r := range recs {
-		if r.IsRejected() {
-			continue
-		}
-		if r.RequestID != "" {
-			byID[r.RequestID] = append(byID[r.RequestID], i)
-		}
-		session := r.NativeSession
-		if session == "" {
-			session = r.Session
-		}
-		if session != "" {
-			bySession[session] = append(bySession[session], i)
-		}
+		r.Agent = AgentOf(r.Agent)
+		gateway.add(Row{Record: r}, "", int64(i), false)
 	}
-	matched, used := map[int]bool{}, map[int]bool{}
-	for j, c := range logs {
-		if c.RequestID == "" {
-			continue
-		}
-		for _, i := range byID[c.RequestID] {
-			if !used[i] {
-				matched[j], used[i] = true, true
-				break
-			}
-		}
+	for i, c := range logs {
+		r := logRecord(c)
+		r.Agent = c.Agent // the native log already names its agent
+		local.add(Row{Record: r}, c.Msg, int64(i), c.Error != "")
 	}
-	candidates := map[int][]int{}
-	counts := map[int]int{}
-	for j, c := range logs {
-		if matched[j] || c.Session == "" {
-			continue
-		}
-		for _, i := range bySession[c.Session] {
-			r := recs[i]
-			if used[i] || c.RequestID != "" && r.RequestID != "" {
-				continue
-			}
-			// Empty successes carry too little evidence. Failed calls may have
-			// zero tokens, but both sources must agree that the call failed.
-			if c.Input+c.Output+c.CacheRead+c.CacheWrite == 0 && (c.Error == "" || !r.Failed()) {
-				continue
-			}
-			if (c.Error != "") != r.Failed() {
-				continue
-			}
-
-			if AgentOf(r.Agent) != c.Agent || r.Input != c.Input || r.Output != c.Output || r.CacheRead != c.CacheRead || r.CacheWrite != c.CacheWrite {
-				continue
-			}
-			end := r.Time.Add(time.Duration(r.Millis) * time.Millisecond)
-			if c.Time.Before(end.Add(-2*time.Second)) || c.Time.After(end.Add(2*time.Second)) {
-				continue
-			}
-			candidates[j] = append(candidates[j], i)
-			counts[i]++
-		}
-	}
-	for j, cs := range candidates {
-		if len(cs) == 1 && counts[cs[0]] == 1 {
-			matched[j] = true
-		}
+	matched := map[int]bool{}
+	for ref := range matchedBlocks([]*rowChunk{gateway}, []*rowChunk{local}, nil, time.Time{}, false) {
+		matched[ref.Index] = true
 	}
 	return matched
 }
 
 func ledgerWith(since time.Time, f Filter, recs []Record, logs []sessions.Call) (rows []Row, sum Totals, agents, providers []string) {
+	return ledgerWithShared(since, f, recs, logs, nil)
+}
+
+// ledgerWithShared is ledgerWith with the calls other computers made (#542),
+// priced and judged here as this computer's are.
+func ledgerWithShared(since time.Time, f Filter, recs []Record, logs []sessions.Call, others []SharedCall) (rows []Row, sum Totals, agents, providers []string) {
 	renamed := provider.Renamed()
 	// the upstream names in force now, read once for the lot: a row is
 	// judged by the names standing today, which is what Ledger says, and
@@ -332,6 +325,16 @@ func ledgerWith(since time.Time, f Filter, recs []Record, logs []sessions.Call) 
 		r.SessionProvider = c.Upstream
 		add(r, priceOf(r), "log")
 	}
+	for _, c := range others {
+		r := c.Record
+		if !since.IsZero() && r.Time.Before(since) {
+			continue
+		}
+		if id, ok := renamed[r.Provider]; ok {
+			r.Provider = id
+		}
+		add(r, priceOf(r), c.Source)
+	}
 	// the two logs, by when each call began
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Time.After(rows[j].Time) })
 	slices.Sort(agents)
@@ -362,11 +365,28 @@ func pricer() func(Record) *catalog.Price {
 	}
 }
 
+// NewPricer totals requests' token-bearing attempts at one snapshot of the
+// effective prices used by the ledger. Reuse it for one page of routes;
+// make it again on the next read so a changed tariff re-prices history.
+func NewPricer() func([]Record) Totals {
+	priceOf, renamed := pricer(), provider.Renamed()
+	return func(recs []Record) Totals {
+		var sum Totals
+		for _, r := range recs {
+			if id, ok := renamed[r.Provider]; ok {
+				r.Provider = id
+			}
+			sum.add(r, priceOf(r))
+		}
+		return sum
+	}
+}
+
 // CSVHeader is the ledger's columns, as WriteCSV writes them.
 var CSVHeader = []string{"time", "agent", "requested_model", "provider", "host", "model", "served_model", "swapped",
 	"effort", "input_tokens", "output_tokens", "cache_write_tokens", "cache_read_tokens", "reasoning_tokens",
-	"cost_usd", "duration_ms", "ttft_ms", "status", "error", "session", "kind", "provider_key_id", "provider_key_name", "route_id",
-	"request_id", "endpoint", "error_message", "error_type", "source", "rejected", "session_provider", "session_account", "session_official_login"}
+	"cost_usd", "duration_ms", "ttft_ms", "status", "error", "session", "kind", "provider_key_id", "provider_key_name", "provider_account", "route_id",
+	"request_id", "endpoint", "error_message", "error_type", "source", "rejected", "session_provider", "session_account", "session_official_login", "caller_key_id", "caller_key_name", "response_id"}
 
 // WriteCSV writes rows as CSV, a header first: times in RFC 3339 with
 // their offset, the cost in USD at the effective price (empty when unknown), error
@@ -391,8 +411,8 @@ func WriteCSV(w io.Writer, rows []Row) error {
 		}
 		cw.Write([]string{r.Time.Format(time.RFC3339), r.Agent, r.Requested, r.Provider, r.Host, r.Model, r.Served,
 			strconv.FormatBool(r.Swapped), r.Effort, n(r.Input), n(r.Output), n(r.CacheWrite), n(r.CacheRead), n(r.Reasoning),
-			cost, strconv.FormatInt(r.Millis, 10), ttft, n(r.Status), strconv.FormatBool(r.Failed()), r.Session, r.Kind, r.ProviderKeyID, r.ProviderKeyName, routeID,
-			r.RequestID, r.Endpoint, r.Error, r.ErrType, r.Source, strconv.FormatBool(r.IsRejected()), r.SessionProvider, r.SessionAccount, strconv.FormatBool(r.SessionOfficialLogin)})
+			cost, strconv.FormatInt(r.Millis, 10), ttft, n(r.Status), strconv.FormatBool(r.Failed()), r.Session, r.Kind, r.ProviderKeyID, r.ProviderKeyName, r.Account(), routeID,
+			r.RequestID, r.Endpoint, r.Error, r.ErrType, r.Source, strconv.FormatBool(r.IsRejected()), r.SessionProvider, r.SessionAccount, strconv.FormatBool(r.SessionOfficialLogin), r.CallerKeyID, r.CallerKeyName, r.ResponseID})
 	}
 	cw.Flush()
 	return cw.Error()
@@ -469,8 +489,8 @@ func (t *Totals) addRow(r Row) {
 	if r.TTFT > 0 && !r.Failed() {
 		t.Timed++
 		t.TTFT += r.TTFT
-		if r.Output > 0 && r.Millis > r.TTFT {
-			t.DecodeMs += r.Millis - r.TTFT
+		if w := DecodeWindow(r.Output, r.Millis, r.TTFT); w > 0 {
+			t.DecodeMs += w
 			t.DecodeOut += r.Output
 		}
 	}
@@ -502,6 +522,11 @@ func (r Row) key(by string) string {
 		return r.Provider
 	case "agent":
 		return r.Agent
+	case "computer":
+		if r.Computer == "" {
+			return ThisComputer
+		}
+		return r.Computer
 	}
 	return r.Model
 }
@@ -625,4 +650,23 @@ func LedgerSeries(p Period, rows []Row) (bucket string, pts []SeriesPoint) {
 		}
 	}
 	return bucket, pts
+}
+
+// Visit calls fn with each record from since on, as the ledger's index
+// reads usage.jsonl: only its blocks that reach since are decoded.
+func Visit(since time.Time, fn func(Record)) { readLogSnapshot().visit(since, fn) }
+
+// NewCoster prices one record at a time at the effective prices the
+// ledger uses, read once: its cost in USD, and false for a call with
+// tokens but no known price.
+func NewCoster() func(Record) (float64, bool) {
+	priceOf, renamed := pricer(), provider.Renamed()
+	return func(r Record) (float64, bool) {
+		if id, ok := renamed[r.Provider]; ok {
+			r.Provider = id
+		}
+		var t Totals
+		t.add(r, priceOf(r))
+		return t.Cost, t.Unpriced == 0
+	}
 }

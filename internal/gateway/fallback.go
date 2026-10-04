@@ -40,6 +40,20 @@ type candidate struct {
 	// fast is set on a member the group sends in its vendor's fast mode
 	// (Group.Fast)
 	fast bool
+	// rank is its place in its provider's own list of accounts or keys,
+	// the order the provider's page shows and a drag sets (#217)
+	rank int
+	// capped is set on an account left out as held at its usage cap
+	capped *capHold
+}
+
+// capHold is how an account is held at its usage cap: the cap, the share
+// of the fullest window at or past it, and when the last such window
+// renews (zero when one doesn't say).
+type capHold struct {
+	cap  int
+	used float64
+	back time.Time
 }
 
 // label names a candidate in a call's record: the provider, and the key
@@ -117,6 +131,14 @@ func perKey(p provider.Provider, model string, from provider.Protocol) []candida
 // protocol that suits the request best, and the others are tried only
 // after them, in the order they suit it.
 func perKeyOf(p provider.Provider, model string, from provider.Protocol) (out, aside, left []candidate) {
+	out, aside, left, _ = perKeyBarred(p, model, from)
+	return out, aside, left
+}
+
+// perKeyBarred is perKeyOf, and the accounts or keys the user set not to
+// serve the model (provider.AccountModels, #474): never tried, whatever
+// else there is — none, when every one of them is.
+func perKeyBarred(p provider.Provider, model string, from provider.Protocol) (out, aside, left, barred []candidate) {
 	if p.Account != nil {
 		also := p.AlsoOn()
 		var all []candidate
@@ -125,9 +147,43 @@ func perKeyOf(p provider.Provider, model string, from provider.Protocol) (out, a
 		if len(also) == 0 || !p.OwnPaused() {
 			all = append(all, candidate{p: p, model: model, rest: p.ID})
 		}
-		for _, q := range also {
-			all = append(all, candidate{p: q, model: model, rest: p.ID + "@" + q.Account.User})
+		for i, q := range also {
+			all = append(all, candidate{p: q, model: model, rest: p.ID + "@" + q.Account.User, rank: i + 1})
 		}
+		// kept signed in to an account of the user's choosing, the one
+		// signed in to stands at its own place in the order, not first
+		// (#524)
+		if ranks := p.LoginRanks(); ranks != nil {
+			at := func(c candidate) int {
+				if r, ok := ranks[strings.ToLower(c.p.Account.User)]; ok {
+					return r
+				}
+				return len(ranks)
+			}
+			slices.SortStableFunc(all, func(a, b candidate) int { return at(a) - at(b) })
+			for i := range all {
+				all[i].rank = i
+			}
+		}
+		all = slices.DeleteFunc(all, func(c candidate) bool {
+			if p.AccountServes(c.p.Account.User, model) {
+				return false
+			}
+			barred = append(barred, c)
+			return true
+		})
+		// an account at its usage cap is used up for routing until the
+		// window it filled renews: never tried, so groups, fallbacks and
+		// the other accounts take the request (provider/account_caps.go)
+		all = slices.DeleteFunc(all, func(c candidate) bool {
+			h := capHeld(p, c.p, model, time.Now())
+			if h == nil {
+				return false
+			}
+			c.capped = h
+			barred = append(barred, c)
+			return true
+		})
 		// an account whose plan lacks the model (a Free one behind a Plus)
 		// would only answer 400; it is tried only when none lists it
 		for _, c := range all {
@@ -138,13 +194,13 @@ func perKeyOf(p provider.Provider, model string, from provider.Protocol) (out, a
 			}
 		}
 		if len(out) == 0 {
-			return all, nil, nil
+			return all, nil, nil, barred
 		}
-		return out, nil, left
+		return out, nil, left, barred
 	}
 	keys := p.KeysOn()
 	var unlisted []candidate
-	for _, k := range keys {
+	for i, k := range keys {
 		q := p.WithKey(k)
 		if len(q.Speaks()) == 0 {
 			continue // made for a protocol this provider has no endpoint for
@@ -153,18 +209,25 @@ func perKeyOf(p provider.Provider, model string, from provider.Protocol) (out, a
 		if len(keys) > 1 {
 			rest += "#" + provider.KeyID(k.Key)
 		}
-		if !p.Serves(k, model) {
-			// the vendor lists the model to another key only
-			unlisted = append(unlisted, candidate{p: q, model: model, rest: rest})
+		if !p.AccountServes(provider.KeyID(k.Key), model) {
+			barred = append(barred, candidate{p: q, model: model, rest: rest, rank: i})
 			continue
 		}
-		out = append(out, candidate{p: q, model: model, rest: rest})
+		if !p.Serves(k, model) {
+			// the vendor lists the model to another key only
+			unlisted = append(unlisted, candidate{p: q, model: model, rest: rest, rank: i})
+			continue
+		}
+		out = append(out, candidate{p: q, model: model, rest: rest, rank: i})
 	}
 	if len(out) == 0 {
 		out, unlisted = unlisted, nil // no key lists it: try them all the same
 	}
+	if len(out) == 0 && len(barred) > 0 {
+		return nil, nil, nil, barred
+	}
 	if len(out) == 0 {
-		return []candidate{{p: p, model: model, rest: p.ID}}, nil, nil
+		return []candidate{{p: p, model: model, rest: p.ID}}, nil, nil, nil
 	}
 	sort.SliceStable(out, func(i, j int) bool { return keyFit(out[i].p, model, from) < keyFit(out[j].p, model, from) })
 	pool := out[:0:0]
@@ -175,7 +238,7 @@ func perKeyOf(p provider.Provider, model string, from provider.Protocol) (out, a
 			aside = append(aside, c)
 		}
 	}
-	return pool, aside, unlisted
+	return pool, aside, unlisted, barred
 }
 
 // keyFit ranks how well a key suits a request, best first: 0 fits, 1 needs
@@ -231,7 +294,8 @@ func (s *Server) candidates(p provider.Provider, model string, from provider.Pro
 func (s *Server) plan(p provider.Provider, model string, from provider.Protocol) ([]candidate, planned) {
 	var pl planned
 	add := func(q provider.Provider, m string, fallback bool) []candidate {
-		cs, aside, left := perKeyOf(q, m, from)
+		cs, aside, left, barred := perKeyBarred(q, m, from)
+		pl.left = append(pl.left, barredOf(barred, q, fallback, from, nil)...)
 		cs, wg := weigh(q, cs, m, from)
 		for i, c := range cs {
 			w := weighed(c, q, wg, fallback, from)
@@ -264,14 +328,19 @@ func (s *Server) plan(p provider.Provider, model string, from provider.Protocol)
 // weighed together as the group's routing says — in order, member by
 // member, each as its own provider's routing orders it; else all as one,
 // so a subscription whose allowance renews soonest goes first whichever
-// provider it is of. A group in the group is planned the same way by its
-// own routing, in its place when the group's is in order. A member's
-// fallbacks are not the group's.
+// provider it is of. A group in the group is planned by its own routing
+// alone, whatever the group's (#576): in order, in its place; else as
+// one, weighed with the rest by the one it would try first, and tried
+// whole where that one goes — the group's routing picks between its
+// groups, never within them. A member's fallbacks are not the group's.
 func (s *Server) planGroup(g provider.Group, ms []provider.Member, from provider.Protocol) ([]candidate, planned) {
 	var pl planned
 	var asides []candidate
 	var wAsides []Weighed
 	out := planLevel(g, ms, 0, from, &pl, &asides, &wAsides)
+	if sinks(g.Sink, g.Routing) {
+		out, pl.order = sinkPlanned(out, pl.order)
+	}
 	out, pl.order = append(out, asides...), append(pl.order, wAsides...)
 	if len(out) == 0 {
 		return nil, pl
@@ -284,7 +353,8 @@ func (s *Server) planGroup(g provider.Group, ms []provider.Member, from provider
 // those unlisted it gathers for planGroup to put last.
 func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.Protocol, pl *planned, asides *[]candidate, wAsides *[]Weighed) []candidate {
 	keys := func(m provider.Member) []candidate {
-		cs, aside, left := perKeyOf(m.Provider, m.Model, from)
+		cs, aside, left, barred := perKeyBarred(m.Provider, m.Model, from)
+		pl.left = append(pl.left, barredOf(barred, m.Provider, false, from, m.Groups())...)
 		// the effort the member is fixed at goes with each of its keys:
 		// the same model at another effort is another member's
 		for _, l := range [][]candidate{cs, aside, left} {
@@ -305,28 +375,75 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 		return cs
 	}
 	if g.Routing != provider.Ordered {
-		of := map[string]provider.Member{} // candidate → its model
-		var all []candidate
-		for _, m := range ms {
-			cs := keys(m)
-			for _, c := range cs {
-				of[c.seat()] = m
+		// what the group weighs: each of its models' keys or accounts,
+		// and each group in it as one — planned by its own routing, put
+		// where the one it would try first is, the rest of it after
+		type unit struct {
+			m     provider.Member // the model, for one of its keys
+			cs    []candidate     // a group in g: its own order
+			order []Weighed
+		}
+		var units []unit
+		var heads []candidate
+		at := map[string][]int{} // a head's seat → its units, in turn
+		add := func(u unit, head candidate) {
+			at[head.seat()] = append(at[head.seat()], len(units))
+			units, heads = append(units, u), append(heads, head)
+		}
+		for i := 0; i < len(ms); {
+			m := ms[i]
+			if len(m.Path) > depth+1 {
+				j := i + 1
+				for j < len(ms) && len(ms[j].Path) > depth+1 && ms[j].Path[depth] == m.Path[depth] {
+					j++
+				}
+				var sub planned
+				cs := planLevel(m.Via[depth], ms[i:j], depth+1, from, &sub, asides, wAsides)
+				pl.left = append(pl.left, sub.left...)
+				if len(cs) > 0 {
+					// weighed by the first it would try that isn't resting
+					head := cs[0]
+					for _, c := range cs {
+						if _, resting := restOf(c.restKey()); !resting {
+							if _, resting = restOf(c.restID()); !resting {
+								head = c
+								break
+							}
+						}
+					}
+					add(unit{cs: cs, order: sub.order}, head)
+				}
+				i = j
+				continue
 			}
-			all = append(all, cs...)
+			for _, c := range keys(m) {
+				add(unit{m: m}, c)
+			}
+			i++
 		}
 		routing := g.Routing
 		if routing == provider.Manual {
 			routing = "" // the member picked, its keys or accounts weighed smartly
 		}
-		cs, wg := weigh(provider.Provider{ID: provider.GroupPrefix + g.ID, Routing: routing}, all, "", from)
-		for i, c := range cs {
-			m := of[c.seat()]
-			w := weighed(c, m.Provider, wg, false, from)
-			w.Routing, w.Via = g.Routing, m.Groups()
-			w.Turn = i == 0 && g.Routing == provider.Rotate && len(cs) > 1
+		weighedHeads, wg := weigh(provider.Provider{ID: provider.GroupPrefix + g.ID, Routing: routing}, heads, "", from)
+		var out []candidate
+		for i, c := range weighedHeads {
+			k := at[c.seat()][0]
+			at[c.seat()] = at[c.seat()][1:]
+			u := units[k]
+			if u.cs != nil {
+				out = append(out, u.cs...)
+				pl.order = append(pl.order, u.order...)
+				continue
+			}
+			w := weighed(c, u.m.Provider, wg, false, from)
+			w.Routing, w.Via = g.Routing, u.m.Groups()
+			w.Sunk = nil // weighed as the group's, whose own Sink tells
+			w.Turn = i == 0 && g.Routing == provider.Rotate && len(weighedHeads) > 1
 			pl.order = append(pl.order, w)
+			out = append(out, c)
 		}
-		return cs
+		return out
 	}
 	var out []candidate
 	for i := 0; i < len(ms); {
@@ -352,6 +469,78 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 		i++
 	}
 	return out
+}
+
+// capHeld is how the account acct of p is held at its usage cap for
+// model at now, nil when it has no cap or is below it. Its windows are
+// those last read (allowances), as smart routing weighs them.
+func capHeld(p, acct provider.Provider, model string, now time.Time) *capHold {
+	if acct.Account == nil {
+		return nil
+	}
+	cap := p.AccountCap(acct.Account.User)
+	if cap <= 0 {
+		return nil
+	}
+	held, used, back := allowances(acct.Account.UsageAgent())[acct.Account.User].CapHeld(model, cap, now)
+	if !held {
+		return nil
+	}
+	return &capHold{cap: cap, used: used, back: back}
+}
+
+// cappedError says why a request for model went nowhere when every account
+// that could take it is held at its usage cap, as the vendor's own refusal
+// would when all are used up; the soonest one is back is the wait.
+func cappedError(model string, ws []Weighed, now time.Time) (string, time.Time) {
+	var held []string
+	var soonest time.Time
+	for _, w := range ws {
+		if w.Capped == 0 {
+			continue
+		}
+		s := fmt.Sprintf("%s (%s) is at %.0f%% of a usage window, past its %d%% cap", w.Name, w.Who, w.Used, w.Capped)
+		if w.CapBack != nil {
+			s += ", until " + w.CapBack.Local().Format("Jan 2 15:04")
+			if soonest.IsZero() || w.CapBack.Before(soonest) {
+				soonest = *w.CapBack
+			}
+		}
+		held = append(held, s)
+	}
+	return fmt.Sprintf("usage cap reached: every account that serves %q is held at the usage cap set on it in magpie — %s. magpie uses it again once that window renews; raise or lift the cap in magpie (Providers → the account's cap, or magpie provider account-cap)", model, strings.Join(held, "; ")), soonest
+}
+
+// barredOf is how the trace tells the accounts or keys the user set not
+// to serve the model: left out, as those not listing it are.
+func barredOf(cs []candidate, q provider.Provider, fallback bool, from provider.Protocol, via []string) []Weighed {
+	var out []Weighed
+	for _, c := range cs {
+		w := weighed(c, q, weighing{}, fallback, from)
+		w.Unlisted, w.Via = true, via
+		if h := c.capped; h != nil {
+			w.Capped, w.Used = h.cap, h.used
+			if !h.back.IsZero() {
+				w.CapBack = &h.back
+			}
+		} else {
+			w.Barred = true
+		}
+		out = append(out, w)
+	}
+	return out
+}
+
+// barredError says why a request for model went nowhere when every account
+// or key that could take it was set not to serve it.
+func barredError(model string, ws []Weighed) string {
+	var names []string
+	for _, w := range ws {
+		if !slices.Contains(names, w.Name) {
+			names = append(names, w.Name)
+		}
+	}
+	return fmt.Sprintf("model %q is set not to be served by any account or key of %s: each one's own list of models leaves it out. Add it to an account's models in magpie (Providers → the account's Models), or pick another model", model, strings.Join(names, ", "))
 }
 
 // asideOf is how the trace tells the keys made for another protocol than
@@ -435,7 +624,7 @@ func restOf(id string) (Rest, bool) {
 
 // quotaWords are how vendors say "out of quota" or "slow down" when their
 // status code doesn't: some answer 400 or 403 with it.
-var quotaWords = regexp.MustCompile(`(?i)quota|insufficient|balance|credit|billing|exceeded|rate.?limit|usage.?limit|limit.?reached|hit your .*limit|limit.{0,24}resets|too many requests|overloaded|余额|额度|欠费|限流|频率|套餐|用量|上限`)
+var quotaWords = regexp.MustCompile(`(?i)quota|insufficient|balance|credit|billing|out of budget|budget (exceeded|exhausted)|exceeded|rate.?limit|usage.?limit|limit.?reached|hit your .*limit|limit.{0,24}resets|too many requests|overloaded|余额|额度|欠费|限流|频率|套餐|用量|上限`)
 
 // unservedWords are how a vendor says the model isn't one it serves this
 // key, or this way — words another provider, or key, may not answer with.
@@ -466,6 +655,10 @@ func shapeRefused(status int, body []byte) bool {
 // this key or provider can't serve it — not the request itself at fault.
 func retryable(status int, body []byte) bool {
 	switch {
+	case overflowed(status, body):
+		// a conversation too long for the model is as long on every
+		// account of it: the agent is told, and compacts
+		return false
 	case status == 401, status == 402, status == 403, status == 404, status == 408, status == 429, status >= 500:
 		return true
 	case status >= 400 && provider.EdgeBlocked(body):
@@ -478,10 +671,78 @@ func retryable(status int, body []byte) bool {
 	return false
 }
 
+// lateRests says whether a reply that broke off after it began, with this
+// error, was the vendor failing (#733): unreachable, overloaded, out of
+// quota. A conversation grown too long for the model, or a request the
+// vendor turned away as it reads, would fail the same at the next asked:
+// nobody rests for it.
+func lateRests(msg string) bool {
+	return !tooLong(http.StatusBadRequest, msg) && !refusedWords.MatchString(msg)
+}
+
+// unsaidMargin is how far past a model's window a request's estimate
+// must go to be taken as too long for it: estimate counts a token as four
+// bytes, which most text runs under (Devin counted 173,954 tokens of one
+// estimated at 151,851), so one past it by a fifth hardly fits.
+const unsaidMargin = 1.2
+
+// tooLongUnsaid says a failure that doesn't say why was the request being too
+// long for the model, as some vendors put it: Devin's 502 "capacity
+// issues", WorkBuddy's 400 "Invalid request parameters", Qoder's 400
+// "Error in upstream response" — each for a conversation well past the
+// model's window, and answered at a size it holds. Retried, or asked of
+// another account of the model, it fails the same, and the agent, told it
+// as a vendor's error, never compacts. The message it is told instead
+// says the prompt is too long. Not for a rate limit, an account's
+// trouble, a model it doesn't serve, or one already saying it overflowed.
+func tooLongUnsaid(p provider.Provider, model string, tokens, status int, body []byte) (string, bool) {
+	switch status {
+	case 400, 413, 422, 500, 502, 503, 504:
+	default:
+		return "", false
+	}
+	if overflowed(status, body) || failure(status, body) != failOther || quotaWords.Match(body) ||
+		unservedWords.Match(body) || refusedWords.Match(body) || provider.EdgeBlocked(body) {
+		return "", false
+	}
+	window := windowOf(p, model)
+	if window <= 0 || float64(tokens) < float64(window)*unsaidMargin {
+		return "", false
+	}
+	msg := fmt.Sprintf("prompt is too long: about %d tokens, more than %s's context window of %d", tokens, model, window)
+	said := strings.TrimSpace(vendorMessage(body))
+	if len(said) > 200 {
+		said = said[:200] + "…"
+	}
+	// the vendor's words, unless they'd read as a limit of another kind
+	if full := fmt.Sprintf("%s (%s answered %d: %s)", msg, p.Name, status, said); said != "" && tooLong(400, full) {
+		return full, true
+	}
+	return fmt.Sprintf("%s (%s answered %d)", msg, p.Name, status), true
+}
+
+// windowOf is the tokens a provider's model takes, where known: the
+// user's (Provider.ContextOf), else its catalog entry's.
+func windowOf(p provider.Provider, model string) int {
+	if n := p.ContextOf(model); n > 0 {
+		return n
+	}
+	for _, e := range provider.Served() {
+		if e.Group == "" && e.Provider.ID == p.ID && (e.Model == model || e.ID == model) && e.Context > 0 {
+			return e.Context
+		}
+	}
+	return 0
+}
+
 const (
 	// lastRetries is how many times the last one left is tried again after
 	// a failure that passes — a busy vendor, a dropped connection.
 	lastRetries = 2
+	// rateRetries is as many for a rate limit, which takes longer to
+	// clear than a busy moment: pauses of 1, 2 and 4s, or what Retry-After
+	// says, under half a minute in all
+	rateRetries = 3
 	// longestPause is the longest the vendor's Retry-After is waited for
 	// before that; longer, and the agent gets the error.
 	longestPause = 8 * time.Second
@@ -492,8 +753,8 @@ const (
 var retryPause = time.Second
 
 // passing says whether a failure is one that may be gone a moment later,
-// and how long to wait before trying the same one again.
-func passing(status int, header http.Header, again int) (time.Duration, bool) {
+// and how long to wait before trying the same one again, the again'th time.
+func passing(status int, header http.Header, body []byte, again int) (time.Duration, bool) {
 	wait := retryPause << again
 	if d := retryAfter(header, time.Now()); d > 0 {
 		wait = d
@@ -502,11 +763,31 @@ func passing(status int, header http.Header, again int) (time.Duration, bool) {
 	case wait > longestPause:
 		return 0, false
 	case status == 408, status == 500, status == 502, status == 503, status == 504, status == 529:
-		return wait, true
+		return wait, again < lastRetries
 	case status == 429:
-		return wait, retryAfter(header, time.Now()) > 0 // a rate limit says when
+		// a relay's 429 often says nothing of when (#503: "负载已饱和，请稍
+		// 后再试"); a plan used up or no money left won't clear in seconds
+		return wait, again < rateRetries && failure(status, body) == failRate && !creditWords.Match(body)
 	}
 	return 0, false
+}
+
+// withRoom is, of the candidates left, those another member than c's may
+// answer a request of about tokens that c's model found too long: not an
+// account of c's model at c's provider, which holds it no better, nor one
+// whose window it is known to be past.
+func withRoom(left []candidate, c candidate, tokens int) []candidate {
+	var out []candidate
+	for _, x := range left {
+		if x.p.ID == c.p.ID && x.model == c.model {
+			continue
+		}
+		if w := windowOf(x.p, x.model); w > 0 && tokens >= w {
+			continue
+		}
+		out = append(out, x)
+	}
+	return out
 }
 
 // matesFirst puts first, of the candidates left, the other keys or
@@ -578,6 +859,12 @@ type holdWriter struct {
 	tail  []byte // the end of the last write, for a marker split across two
 
 	first firstToken // when its first content and text came (#196)
+
+	// stop ends the try's request to the vendor: a stream whose error
+	// came before any content has failed, and one that kept its
+	// connection open after it — a 429 said as an event — kept the agent
+	// waiting with nothing sent, the next account never asked
+	stop func()
 }
 
 func newHoldWriter(w http.ResponseWriter, hold bool) *holdWriter {
@@ -722,6 +1009,9 @@ func (h *holdWriter) scan() {
 			continue
 		case eventError:
 			h.failure, h.failMsg = status, msg
+			if h.stop != nil {
+				h.stop()
+			}
 			return
 		case eventRefusal:
 			h.failure, h.failMsg, h.refused = status, msg, true
@@ -1381,6 +1671,10 @@ func pinTo(want string, cands []candidate, pl planned) ([]candidate, planned, in
 		return nil, pl, http.StatusTooManyRequests, AccountHeader + ": " + strings.Join(rests, "; ") + "; no other account is tried in its place"
 	}
 	for _, w := range pl.left {
+		if match(w) && w.Capped > 0 {
+			msg, _ := cappedError(w.Model, []Weighed{w}, time.Now())
+			return nil, pl, http.StatusTooManyRequests, AccountHeader + ": " + msg + "; no other account is tried in its place"
+		}
 		if match(w) {
 			return nil, pl, http.StatusBadRequest, fmt.Sprintf("%s: %s's plan doesn't list %s", AccountHeader, w.Who, w.Model)
 		}

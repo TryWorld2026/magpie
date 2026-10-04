@@ -10,6 +10,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -19,6 +20,16 @@ func init() {
 		pkg:    "@magpie-community/opencode-devin-auth",
 		min:    "0.1.5", // a failure's status and its sign-in mark as the built-in's
 		agents: []string{"devin"},
+		// a variant picked before the families were one model (swe-2-high)
+		// goes to Devin as it is, through the plugin too, which keeps the
+		// picks it is given; Adaptive and Fusion the built-in never served
+		served: func(model string, listed []string) bool {
+			if id := strings.ToLower(model); id == "adaptive" || id == "fusion" {
+				return true
+			}
+			base := devinBase(model)
+			return base != model && slices.Contains(listed, base)
+		},
 		out: func() ([]Moving, error) {
 			var out []Moving
 			for _, l := range devinLogins() {
@@ -97,7 +108,7 @@ func init() {
 	// names, as the built-in does: the homes stay where they are.
 	movers["grok"] = &mover{
 		pkg:    "@magpie-community/opencode-grok-auth",
-		min:    "0.1.5", // a failure's status and its sign-in mark as the built-in's; grok-4.7's reasoning levels; a token Grok refuses early reads as expired
+		min:    "0.1.6", // a failure's status and its sign-in mark as the built-in's; grok-4.7's reasoning levels; a token Grok refuses early reads as expired; the sign-in renewed ahead of time through auth.refresh
 		agents: []string{"grok"},
 		out: func() ([]Moving, error) {
 			var out []Moving
@@ -139,7 +150,7 @@ func init() {
 
 	movers[CommandCodePlanID] = &mover{
 		pkg:    "@magpie-community/opencode-commandcode-auth",
-		min:    "0.1.6", // a failure's status and its sign-in mark as the built-in's; a Go account lists Go's models
+		min:    "0.1.8", // a failure's status and its sign-in mark as the built-in's; a Go account lists Go's models; a model the plugin doesn't know takes pictures as models.dev says
 		agents: []string{CommandCodePlanID},
 		out: func() ([]Moving, error) {
 			var out []Moving
@@ -210,7 +221,7 @@ func init() {
 	// the plugin reads cursor-agent's token as the built-in does.
 	movers["cursor"] = &mover{
 		pkg:    "@magpie-community/opencode-cursor-auth",
-		min:    "0.1.5", // a failure's status and its sign-in mark as the built-in's
+		min:    "0.1.9", // a failure's status and its sign-in mark as the built-in's; Max Mode models retried in Max Mode; glm-5.3 listed; catalog entries written as CallDynamicTool calls, an empty turn retried (plugins #11); a tool step's usage from the dashboard's usage event, cache included (#676)
 		agents: []string{"cursor"},
 		out: func() ([]Moving, error) {
 			if CursorExecutable() == "" || cursorSignedOut() {

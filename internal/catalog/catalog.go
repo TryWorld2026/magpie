@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/filememo"
 )
 
@@ -50,13 +51,28 @@ type Model struct {
 	// Fast is set on a model Codex may ask for priority processing (its
 	// Fast mode): one a ChatGPT account serves.
 	Fast bool `json:",omitempty"`
+	// AgentsV2 is set on a model Codex is told multi-agent V2 for, so its
+	// Ultra hands work to Codex's agents: one offering Ultra that no
+	// ChatGPT account answers for (provider.Entry's).
+	AgentsV2 bool `json:",omitempty"`
 	// Draws is set on a vendor-listed model that makes images (gpt-image-1,
 	// a relay's flux): kept with the list for Settings → Images, never
 	// offered to agents as a model to talk to.
 	Draws bool `json:",omitempty"`
+	// Films is set on a model another magpie lists as one it makes videos
+	// with (a Remote magpie's Grok Imagine Video): kept with the list for
+	// its videos API, never offered as a model to talk to or draw with.
+	Films bool `json:",omitempty"`
 	// Free is set on a model a subscription serves at no cost to its
 	// allowance: WorkBuddy's "credits": "x0.00".
 	Free bool `json:",omitempty"`
+	// Rate is what a request costs of a subscription's credits, as a
+	// multiple, when its vendor lists it: Qoder's price_factor (0.5),
+	// WorkBuddy's "credits": "x0.03". 0 is not listed, or Free.
+	Rate float64 `json:",omitempty"`
+	// RateWas is the rate before a discount running now, when the vendor
+	// says it: Qoder's Qwen3.8-Flash at 0× with 0.1× struck through.
+	RateWas float64 `json:",omitempty"`
 	// Reasoning is set on a model that thinks, whether or not it takes
 	// levels: mimo-v2.6-flash thinks with a switch alone (#402).
 	Reasoning bool `json:",omitempty"`
@@ -166,13 +182,7 @@ var (
 )
 
 // CachePath is where `magpie sync` stores the models.dev catalog.
-func CachePath() string {
-	if x := os.Getenv("XDG_CACHE_HOME"); x != "" {
-		return filepath.Join(x, "magpie", "models.json")
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".cache", "magpie", "models.json")
-}
+func CachePath() string { return filepath.Join(appdir.Cache(), "models.json") }
 
 func opencodeCache() string {
 	home, _ := os.UserHomeDir()
@@ -479,6 +489,12 @@ func Thinks(id string) bool {
 	return thinks[bareID(id)]
 }
 
+// Knows reports whether models.dev lists a model of this id at all, under
+// any provider, as ContextOf and EffortsOf match it.
+func Knows(id string) bool {
+	return ContextOf(id) > 0 || len(EffortsOf(id)) > 0 || Thinks(id)
+}
+
 // SeesImages reports whether models.dev says a model of this id takes
 // images, as most of the providers it lists serving it do; for a vendor it
 // doesn't list, serving a model it knows from others ("z-ai/glm-5.3" is
@@ -753,11 +769,22 @@ func Providers() []string {
 	return ids
 }
 
+// CodexHome is where Codex CLI keeps its state: $CODEX_HOME, else ~/.codex.
+func CodexHome() string {
+	if dir := os.Getenv("CODEX_HOME"); dir != "" {
+		return dir
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".codex")
+}
+
+// CodexModelsCache is the model list Codex CLI keeps, under CodexHome.
+func CodexModelsCache() string { return filepath.Join(CodexHome(), "models_cache.json") }
+
 // Codex returns the models Codex itself lists, straight from the cache the
 // Codex CLI writes; there is no compiled-in list to fall back to.
 func Codex() []Model {
-	home, _ := os.UserHomeDir()
-	out, _ := filememo.Read("codex models", filepath.Join(home, ".codex", "models_cache.json"), parseCodex)
+	out, _ := filememo.Read("codex models", CodexModelsCache(), parseCodex)
 	return slices.Clone(out)
 }
 

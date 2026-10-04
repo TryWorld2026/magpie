@@ -1,6 +1,6 @@
 // Run with Node's test runner and Playwright on the module path; see README.md.
 // StringKe on Discord: the menu bar showed one account's use, never "the
-// one in use". Settings → Usage in the menu bar lists, for a subscription
+// one in use". Settings → Allowances in the menu bar lists, for a subscription
 // with several accounts, "Account in use" before each account by name;
 // ticked, it is saved as "claude|*" (the tray follows whichever account the
 // gateway goes to first), and the pill names the subscription. One with a
@@ -76,6 +76,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.route("**/*", server(lang, posts));
       await page.goto("http://magpie.test/?view=usage");
       await page.locator("#prefs").click();
+      await page.locator("#setTab-usage").click();
       const pill = page.locator("#trayUsagePick button");
       await pill.waitFor();
       await pill.scrollIntoViewIfNeeded();

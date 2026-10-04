@@ -12,6 +12,15 @@
 }
 /* the window's view is padded 2px at the top: the strip reaches over it */
 body.window .lib-head { top: -2px; margin: -2px -16px 0; padding: 8px 16px 4px; }
+@media (max-width: 760px), (pointer: coarse) and (max-width: 1024px) {
+  body.web .lib-head {
+    flex-wrap: wrap;
+    margin: -2px calc(-1 * var(--view-right)) 0 calc(-1 * var(--view-left));
+    padding: 8px var(--view-right) 4px var(--view-left);
+  }
+  body.web .lib-tabs { max-width: 100%; flex-wrap: wrap; }
+  body.web .lib-more { flex: none; }
+}
 .lib-head.stuck { box-shadow: 0 1px 0 var(--line-2); }
 .lib-tabs .opt { height: 24px; padding: 0 12px; font-size: 12.5px; }
 .lib-more { display: inline-flex; align-items: center; gap: 5px; }
@@ -100,6 +109,13 @@ body.window .lib-head { top: -2px; margin: -2px -16px 0; padding: 8px 16px 4px; 
 .lib-tag.lib-new.link { cursor: pointer; }
 .lib-tag.lib-new.link:hover { background: color-mix(in srgb, var(--accent) 22%, var(--accent-soft)); }
 .lib-tag.lib-unchecked { color: var(--faint); font-weight: 400; }
+.lib-tag.lib-signed { color: var(--green); background: var(--green-soft); }
+.lib-tag.lib-signed::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+
+/* magpie's sign-in to a remote server, in its editor (#615) */
+.lib-signin-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-height: 28px; }
+.lib-signin-line .note { font-size: 12px; color: var(--fg-2); }
+.lib-signin-err { margin-top: 6px; font-size: 12px; color: var(--red); line-height: 1.45; overflow-wrap: anywhere; }
 
 /* the switch */
 .lib-switch { flex: none; position: relative; width: 32px; height: 19px; border-radius: 10px; background: var(--line); transition: background .2s var(--ease); }
@@ -171,7 +187,7 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
 .lib-ag.warn::after { content: ""; position: absolute; top: -2px; right: -2px; width: 7px; height: 7px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 0 2px var(--card); }
 .lib-ag.blocked { opacity: .35; }
 .lib-ag.blocked:hover { background: none; }
-.lib-ag:active:not(:disabled) { transform: scale(.92); }
+.lib-ag:active:not(.blocked) { transform: scale(.92); }
 .editor .lib-agents { max-width: none; justify-content: flex-start; gap: 5px; }
 .editor .lib-ag { padding: 0 9px 0 6px; border-color: var(--line); }
 .editor .lib-ag.on { background: var(--accent-soft); border-color: color-mix(in srgb, var(--fg) 30%, transparent); }
@@ -180,6 +196,11 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
 /* in a list row they sit stacked like a hand of cards, on one line, and fan
    out when the pointer or focus comes to them */
 .lib-row > .lib-agents { flex-wrap: nowrap; gap: 0; max-width: none; padding-left: 4px; }
+/* Reserve the spread width between All and the icons. As the gaps grow,
+   this spacer shrinks by the same amount, keeping All and the row in place. */
+.lib-row > .lib-agents::before { content: ""; order: 1; flex: none; width: max(0px, calc((var(--lib-agent-count, 1) - 1) * 10px)); transition: width .22s var(--ease); }
+.lib-row > .lib-agents:hover::before, .lib-row > .lib-agents:focus-within::before { width: 0; }
+.lib-row > .lib-agents .lib-ag[data-agent] { order: 2; }
 .lib-row > .lib-agents .lib-ag { flex: none; width: 24px; min-width: 0; height: 24px; padding: 0 0 0 4px; justify-content: flex-start; background: var(--card); border-color: var(--line-2); box-shadow: none; transition: margin .22s var(--ease), background .14s, border-color .14s, transform .14s var(--ease); }
 .lib-row > .lib-agents .lib-ag .ic { width: 14px; height: 14px; }
 /* the ring in the card's colour that cuts each chip out of the one under
@@ -189,7 +210,7 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
 .lib-row > .lib-agents .lib-ag + .lib-ag { margin-left: -7px; }
 .lib-row > .lib-agents .lib-ag.on { border-color: var(--line); box-shadow: 0 1px 2px rgba(0, 0, 0, .08); }
 .lib-row > .lib-agents .lib-ag.via { border-style: dashed; }
-.lib-row > .lib-agents:hover .lib-ag + .lib-ag, .lib-row > .lib-agents:focus-within .lib-ag + .lib-ag { margin-left: 3px; }
+.lib-row > .lib-agents:hover .lib-ag[data-agent] + .lib-ag[data-agent], .lib-row > .lib-agents:focus-within .lib-ag[data-agent] + .lib-ag[data-agent] { margin-left: 3px; }
 .lib-row > .lib-agents:hover .lib-ag, .lib-row > .lib-agents:focus-within .lib-ag { box-shadow: none; }
 .lib-row > .lib-agents:hover .lib-ag:not(:focus-visible), .lib-row > .lib-agents:focus-within .lib-ag:not(:focus-visible) { outline-color: transparent; }
 .lib-row > .lib-agents .lib-ag:hover { background: var(--pill); z-index: 1; }
@@ -268,8 +289,17 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
 .lib-addpair { padding-left: 0; }
 .lib-addpair:hover { background: none; }
 .lib-editor .lib-picks { grid-column: 1 / -1; max-height: 320px; }
+.lib-editor .lib-keep { grid-column: 1 / -1; margin: 0 -6px; }
 .lib-confirm { grid-column: 1 / -1; margin: 0; font-size: 12.5px; line-height: 1.55; color: var(--fg-2); }
 .text.danger-fill { background: var(--red); color: #fff; }
+/* one agent's skills or servers on or off at once (#475) */
+.lib-byagent-sheet .lib-byagent-list { grid-column: 1 / -1; max-height: min(52vh, 420px); overflow: auto; }
+.lib-byagent-row { gap: 10px; }
+.lib-byagent-row > .ic { width: 20px; height: 20px; flex: none; }
+.lib-byagent-row .who { flex: 1; min-width: 0; }
+.lib-byagent-row .name { display: flex; align-items: center; gap: 6px; }
+.lib-byagent-row .lib-updall { height: 24px; padding: 0 9px; font-size: 12px; flex: none; }
+.lib-byagent-row .lib-updall:disabled { color: var(--faint); cursor: default; }
 .lib-reader { grid-template-columns: minmax(0, 1fr); }
 .lib-md { margin: 0; max-height: min(60vh, 520px); overflow: auto; font: 12px/1.6 var(--code); color: var(--fg-2); white-space: pre-wrap; overflow-wrap: anywhere; background: var(--card-2); border-radius: 8px; padding: 12px 14px; user-select: text; -webkit-user-select: text; }
 .lib-reader .bar .lib-path { max-width: 70%; }
@@ -284,6 +314,9 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
 #view-library .row-head { height: auto; min-height: 26px; margin: 18px 0 6px; padding: 0 2px; gap: 12px; }
 #view-library .row-head .note { min-width: 0; font-size: 11px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #view-library .row-head .lib-updall { height: 24px; padding: 0 9px; font-size: 12px; }
+/* every skill out of the library at once (#449): red from the start */
+#view-library .row-head .lib-everyrm { color: var(--red); }
+#view-library .row-head .lib-everyrm:hover { background: var(--red-soft); }
 
 /* the market: servers and skills to add, each with its own picture */
 .mk { display: flex; flex-direction: column; }
@@ -335,6 +368,7 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
 .mk-have { flex: none; display: inline-flex; align-items: center; gap: 4px; height: 26px; padding: 0 4px; font-size: 12px; color: var(--muted); }
 .mk-card.have .mk-icon { opacity: .9; }
 .mk-msg { grid-column: 1 / -1; padding: 22px 12px; text-align: center; font-size: 12px; color: var(--muted); }
+.mk-msg.mk-custom { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px 12px; padding: 14px 12px; overflow-wrap: anywhere; }
 .mk-msg.err { padding: 8px 12px; color: var(--amber); background: var(--amber-soft); border-radius: 8px; text-align: left; line-height: 1.45; }
 .mk-skel { gap: 12px; min-height: 104px; }
 .mk-skel .mk-who { gap: 7px; }
@@ -352,6 +386,8 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
 .lib-rtk-gain { margin: 6px 12px 10px; font-size: 12px; line-height: 1.5; color: var(--muted); }
 .lib-card > .lib-acts { padding: 0 12px 12px; }
 .lib-rtk-note { margin: 6px 12px 0; font-size: 12px; line-height: 1.5; color: var(--amber); }
+.lib-rtk-scope { opacity: .8; }
+.lib-rtk-err { color: var(--red); user-select: text; overflow-wrap: anywhere; }
 .lib-rtk-chart { margin: 0 12px 12px; padding: 10px 12px 8px; }
 .lib-rtk-chart .bars { height: 88px; }
 .lib-rtk-foot { display: flex; align-items: center; gap: 12px; margin-top: 8px; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
@@ -366,6 +402,26 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
 .lib-project { margin-bottom: 8px; }
 .lib-project.missing .lib-projhead .name { color: var(--muted); }
 .lib-projhead .lib-tags { max-width: 45%; overflow: hidden; flex-wrap: nowrap; }
+/* whether a server works, beside its name: a dot and a few words, the
+   whole reason in the tooltip; a click checks it again */
+.lib-srvwho { display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); align-items: center; }
+.lib-srvwho > .name { min-width: 0; }
+.lib-srvwho > .lib-health { justify-self: start; max-width: min(220px, 100%); }
+.lib-srvwho > :not(.name):not(.lib-health) { grid-column: 1 / -1; }
+.lib-health { display: inline-flex; flex: 0 1 auto; min-width: 0; align-items: center; gap: 5px; max-width: 220px; height: 17px; margin-left: 7px; padding: 0 6px; border-radius: 6px;
+  font: 400 11px var(--font); color: var(--muted); white-space: nowrap; transition: background .14s var(--ease); }
+.lib-health > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.lib-health[hidden] { display: none; }
+.lib-health:hover { background: var(--pill); }
+.lib-health::before { content: ""; flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--faint); }
+.lib-health.ok::before { background: var(--green); }
+.lib-health.auth { color: var(--amber); }
+.lib-health.auth::before { background: var(--amber); }
+.lib-health.err { color: var(--red); }
+.lib-health.err::before { background: var(--red); }
+.lib-health.checking::before { animation: lib-health-pulse 1s ease-in-out infinite alternate; }
+@keyframes lib-health-pulse { to { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .lib-health.checking::before { animation: none; } }
 .lib-tag.lib-dot::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--muted); }
 .lib-projopts { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 8px 12px 8px 49px; border-top: 1px solid var(--line-2); background: var(--card-2); }
 .lib-projopts .note { font-size: 11px; color: var(--faint); line-height: 1.45; min-width: 0; flex: 1 1 220px; }
@@ -381,6 +437,10 @@ input.lib-setname:focus { border-color: var(--accent); box-shadow: 0 0 0 3px col
 .lib-grouphead > .lib-logo, .lib-grouphead > .lib-glyph { align-self: center; margin-top: 0; }
 .lib-grouphead .lib-updall { height: 24px; padding: 0 9px; font-size: 12px; }
 .lib-have .ic.some { opacity: .4; }
+/* the skills' heading has the most on it: in a narrow window it goes on
+   to a second line rather than past the page's side */
+#view-library .row-head.lib-skillshead { flex-wrap: wrap; row-gap: 6px; }
+#view-library .row-head.lib-skillshead .lib-skillq { flex: 1 1 90px; max-width: 190px; }
 #view-library .row-head .lib-skillq { width: 190px; height: 24px; margin: 0; flex: 0 1 auto; min-width: 90px; }
 .lib-skillq::-webkit-search-cancel-button { -webkit-appearance: none; }
 /* a project's skills out of view are neither laid out nor painted until they near it */

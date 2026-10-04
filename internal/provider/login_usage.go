@@ -22,20 +22,30 @@ type loginUsageEntry struct {
 	q  SubscriptionQuota
 }
 
+// loginUsageFor, when set, stands in for LoginUsage's readings (tests),
+// as UsageClaudeVia does for Claude's own.
+var loginUsageFor func(ctx context.Context, agent string) map[string]SubscriptionQuota
+
+// LoginUsageVia has tests stand in for LoginUsage's readings.
+func LoginUsageVia(f func(ctx context.Context, agent string) map[string]SubscriptionQuota) {
+	loginUsageFor = f
+}
+
 // LoginUsage is the allowance used by each of an agent's accounts, by
 // user. What was fetched less than a minute ago comes from the cache; the
 // rest is asked for at once, as long as ctx allows.
 func LoginUsage(ctx context.Context, agent string) map[string]SubscriptionQuota {
+	if loginUsageFor != nil {
+		return loginUsageFor(ctx, agent)
+	}
 	out := map[string]SubscriptionQuota{}
-	var logins []Login
-	// a plugin's accounts are asked for by the provider's id or as
-	// plugin:<id>, read once a minute whichever names them
-	known := agent
-	if pp, ok := pluginOfAgent(agent); ok {
-		logins, known = pluginUsageLogins(pp), pluginAgent(pp)
-	} else if agent == "grok" {
-		return grokLoginUsage(ctx)
-	} else if logins, ok = builtinLogins(agent); !ok {
+	if agent == "grok" {
+		if _, ok := pluginOfAgent(agent); !ok {
+			return grokLoginUsage(ctx)
+		}
+	}
+	logins, known, ok := usageLogins(agent)
+	if !ok {
 		return out
 	}
 	c := &loginUsageCache
@@ -56,7 +66,7 @@ func LoginUsage(ctx context.Context, agent string) map[string]SubscriptionQuota 
 		go func(l Login) {
 			defer wg.Done()
 			q := keepLast(loginQuota(ctx, l), l.User)
-			if q.Error != "" && ok {
+			if q.Error != "" && ok && q.Provider != "claude" {
 				q = e.q // a hiccup keeps what was known
 			}
 			c.Lock()
@@ -73,6 +83,21 @@ func LoginUsage(ctx context.Context, agent string) map[string]SubscriptionQuota 
 	wg.Wait()
 	usageRead(agent, out) // a window not started: the warm-up looks now
 	return out
+}
+
+// usageLogins are the accounts whose allowance LoginUsage asks for, and
+// the agent they are read once a minute as: a plugin's accounts are asked
+// for by the provider's id or as plugin:<id>, whichever names them. False
+// for an agent that tells none, and for the built-in Grok, read by home.
+func usageLogins(agent string) (logins []Login, known string, ok bool) {
+	if pp, ok := pluginOfAgent(agent); ok {
+		return pluginUsageLogins(pp), pluginAgent(pp), true
+	}
+	if agent == "grok" {
+		return nil, agent, false
+	}
+	logins, ok = builtinLogins(agent)
+	return logins, agent, ok
 }
 
 // builtinLogins are the accounts of a built-in subscription whose
@@ -164,7 +189,11 @@ func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
 	if l.Agent == "copilot" {
 		for _, c := range copilotLogins(copilotConfigDir()) {
 			if strings.EqualFold(c.User, l.User) {
-				return copilotSubscriptionUsage(ctx, c.app.Token)
+				q := copilotSubscriptionUsage(ctx, c.app.Token, c.app.Host)
+				if q.Error == "" {
+					refreshCopilotEntitlement(c.app, q.Plan, q.AccessSKU)
+				}
+				return q
 			}
 		}
 		return SubscriptionQuota{Provider: l.Agent, Plan: l.Plan, Windows: []QuotaWindow{}, Error: "not signed in"}
@@ -193,7 +222,7 @@ func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
 			q.Windows, err = claudeWindows(ctx, l.User, true)
 		} else {
 			var plan string
-			if plan, q.Windows, q.Resets, err = codexWindows(ctx, tok, accountID); plan != "" {
+			if plan, q.Windows, q.Resets, q.Balance, err = codexWindows(ctx, tok, accountID); plan != "" {
 				q.Plan = plan
 			}
 			q.Until = codexUntil(codexLoginAuth(l), time.Now())
@@ -208,11 +237,11 @@ func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
 // CodexUsedUp reports whether the ChatGPT account Codex is signed in to has
 // used up its allowance for now; false when that isn't known.
 func CodexUsedUp(ctx context.Context) bool {
+	// read as LoginUsage has it, fetched at most once a minute: the agent
+	// package asks on every catalog sync
+	u := LoginUsage(ctx, "codex")
 	for _, l := range Logins("codex") {
-		if !l.Active {
-			continue
-		}
-		if usedUp(loginQuota(ctx, l)) {
+		if q, ok := u[l.User]; l.Active && ok && q.Error == "" && usedUp(q) {
 			return true
 		}
 	}

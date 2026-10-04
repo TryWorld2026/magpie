@@ -2,7 +2,10 @@ package library
 
 import (
 	"fmt"
+	"os"
 	"slices"
+
+	"github.com/yetone/magpie/internal/mcpauth"
 )
 
 // Result is what a change did to the agents.
@@ -20,6 +23,9 @@ type Result struct {
 	// Unimported are, for skills brought in together, the ones that
 	// couldn't be (What is skill:<name>)
 	Unimported []Problem `json:"unimported,omitempty"`
+	// Unremoved are, for skills taken out together, the ones that couldn't
+	// be (What is skill:<name>)
+	Unremoved []Problem `json:"unremoved,omitempty"`
 }
 
 // Problem is one thing that couldn't be given to an agent.
@@ -59,7 +65,12 @@ func (l *Library) sync() *Result {
 	shared := realDir(sharedSkillsDir())
 	for _, first := range []bool{true, false} {
 		for _, t := range all {
-			if (t.Skills != "" && realDir(t.Skills) == shared) == first {
+			switch {
+			case t.Desktop != nil:
+				if !first {
+					l.syncDesktopSkills(t, res)
+				}
+			case (t.Skills != "" && realDir(t.Skills) == shared) == first:
 				l.syncSkills(t, res, all)
 			}
 		}
@@ -117,10 +128,12 @@ func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
 			mine = append(mine, name)
 		}
 	}
+	base := gatewayOf(t)
 	for _, s := range l.MCP {
 		if !slices.Contains(s.Agents, id) {
 			continue
 		}
+		s := through(s, base)
 		if err := t.MCP.supports(s); err != nil {
 			res.fail(id, "mcp:"+s.Name, err)
 			continue
@@ -150,12 +163,16 @@ type AgentView struct {
 	MCP          string `json:"mcp,omitempty"`
 	Skills       string `json:"skills,omitempty"`
 	// ProjectSkills is the folder in a project it reads skills from
-	ProjectSkills string   `json:"projectSkills,omitempty"`
-	SkillsAlso    []string `json:"skillsAlso,omitempty"`
-	Note          string   `json:"note,omitempty"`
-	NoSSE         bool     `json:"noSSE,omitempty"`
-	NoRemote      bool     `json:"noRemote,omitempty"`
-	MCPVia        string   `json:"mcpVia,omitempty"`
+	ProjectSkills string `json:"projectSkills,omitempty"`
+	// ProjectMCP is the file, in a project, it reads MCP servers from
+	ProjectMCP string `json:"projectMCP,omitempty"`
+	// ProjectNoSSE: its project file can't take a server over SSE
+	ProjectNoSSE bool     `json:"projectNoSSE,omitempty"`
+	SkillsAlso   []string `json:"skillsAlso,omitempty"`
+	Note         string   `json:"note,omitempty"`
+	NoSSE        bool     `json:"noSSE,omitempty"`
+	NoRemote     bool     `json:"noRemote,omitempty"`
+	MCPVia       string   `json:"mcpVia,omitempty"`
 }
 
 // ServerView is a library server, and what each agent it's on made of it.
@@ -164,6 +181,9 @@ type ServerView struct {
 	Icon string `json:"icon,omitempty"`
 	// Problems are the agents it couldn't be given to, and why
 	Problems map[string]string `json:"problems,omitempty"`
+	// SignIn is magpie's sign-in to a streamable HTTP server, which the
+	// agents then use (#615)
+	SignIn *mcpauth.Status `json:"signIn,omitempty"`
 }
 
 // SkillView is a library skill as the page shows it.
@@ -178,6 +198,9 @@ type SkillView struct {
 	Missing     bool              `json:"missing,omitempty"` // its folder is gone
 	Problems    map[string]string `json:"problems,omitempty"`
 	Check       *SkillCheck       `json:"check,omitempty"` // what the last check for updates found
+	// Always are the agents that have it whatever the library gives them:
+	// it is kept in ~/.agents/skills, which they read themselves (#595)
+	Always []string `json:"always,omitempty"`
 }
 
 // View is the Library page.
@@ -210,7 +233,8 @@ func Read(problems []Problem) (*View, error) {
 	targets := Targets()
 	for _, t := range targets {
 		av := AgentView{ID: t.Agent.ID, Name: t.Agent.Name, Icon: t.Agent.Icon, Instructions: t.Instructions, Skills: t.Skills,
-			SkillsAlso: t.SkillsAlso, Note: t.Note, MCPVia: t.MCPVia, ProjectSkills: ProjectSkillsDir(t.Agent.ID)}
+			SkillsAlso: t.SkillsAlso, Note: t.Note, MCPVia: t.MCPVia, ProjectSkills: ProjectSkillsDir(t.Agent.ID), ProjectMCP: ProjectMCPFile(t.Agent.ID),
+			ProjectNoSSE: ProjectNoSSE(t.Agent.ID)}
 		if t.MCP != nil {
 			av.MCP = t.MCP.Path
 			av.NoSSE = t.MCP.supports(&Server{Transport: "sse"}) != nil
@@ -238,6 +262,10 @@ func Read(problems []Problem) (*View, error) {
 			s = &c
 		}
 		sv := ServerView{Server: s, Icon: serverIcon(l, s), Problems: of("mcp:" + s.Name)}
+		if s.Transport == "http" {
+			st := mcpauth.StatusOf(s.Name, s.URL)
+			sv.SignIn = &st
+		}
 		for _, t := range targets {
 			if t.MCP != nil && slices.Contains(s.Agents, t.Agent.ID) {
 				if err := t.MCP.supports(s); err != nil {
@@ -254,6 +282,24 @@ func Read(problems []Problem) (*View, error) {
 		sv := SkillView{Name: s.Name, Agents: append([]string{}, s.Agents...), Icon: skillIcon(s), Problems: of("skill:" + s.Name)}
 		if s.Source != nil {
 			sv.Source, sv.Kind = s.Source.String(), s.Source.Kind
+		}
+		// linked from a folder elsewhere is what the library's entry is, not
+		// what was written down when it came in: a linked folder moved in by
+		// hand is the library's own now, and Remove moves it to the backups
+		// (#595)
+		if p := skillDir(s.Name); linked(p) {
+			if sv.Kind != "folder" || realDir(s.Source.Dir) != realDir(p) {
+				sv.Kind, sv.Source = "folder", realDir(p)
+			}
+		} else if _, err := os.Lstat(p); err == nil && sv.Kind == "folder" {
+			sv.Kind, sv.Source = "", ""
+		}
+		if sharedHas(s.Name) {
+			for _, t := range targets {
+				if t.Skills != "" && (slices.Contains(readsShared, t.Agent.ID) || realDir(t.Skills) == realDir(sharedSkillsDir())) {
+					sv.Always = append(sv.Always, t.Agent.ID)
+				}
+			}
 		}
 		if o, ok := ccSwitchOrigin(s); ok {
 			o.Path = ""
@@ -292,7 +338,17 @@ func SaveServer(old string, s Server) (*Result, error) {
 			if i < 0 {
 				return fmt.Errorf("no server called %s", old)
 			}
+			// magpie's sign-in goes with a renamed server, before the agents
+			// are given it under its new name
+			if old != s.Name {
+				if err := mcpauth.Rename(old, s.Name); err != nil {
+					return err
+				}
+			}
 			l.MCP = slices.Delete(l.MCP, i, i+1)
+			if old != s.Name {
+				l.renameProjectServers(old, s.Name)
+			}
 		}
 		s.Agents = slices.Sorted(slices.Values(s.Agents))
 		l.MCP = append(l.MCP, &s)
@@ -312,22 +368,64 @@ func ServerAgents(name string, agents []string) (*Result, error) {
 	})
 }
 
+// EveryServerAgents gives every server in the library to the agents named,
+// or takes every one from them, in one write rather than one for each
+// server (#475). An agent not named keeps what it has, as with a server's
+// All chip; on gives an agent only the servers it can reach (no SSE for
+// Codex, no remote one for Claude Desktop), as its chips can't be lit for
+// the others.
+func EveryServerAgents(agents []string, on bool) (*Result, error) {
+	if len(agents) == 0 {
+		return nil, fmt.Errorf("no agents to give the servers to")
+	}
+	return change(func(l *Library) error {
+		mcp := map[string]*mcpFile{}
+		if on {
+			for _, t := range Targets() {
+				if t.MCP != nil {
+					mcp[t.Agent.ID] = t.MCP
+				}
+			}
+		}
+		for _, s := range l.MCP {
+			kept := slices.DeleteFunc(slices.Clone(s.Agents), func(a string) bool { return slices.Contains(agents, a) })
+			for _, a := range agents {
+				if on && mcp[a] != nil && mcp[a].supports(s) == nil {
+					kept = append(kept, a)
+				} else if on && slices.Contains(s.Agents, a) {
+					kept = append(kept, a) // one it has already stays, whatever it says of it
+				}
+			}
+			s.Agents = slices.Sorted(slices.Values(kept))
+		}
+		return nil
+	})
+}
+
 // RemoveServer takes a server out of the library and out of every agent
 // magpie gave it to.
 func RemoveServer(name string) (*Result, error) {
-	return change(func(l *Library) error {
+	res, err := change(func(l *Library) error {
 		i := slices.IndexFunc(l.MCP, func(x *Server) bool { return x.Name == name })
 		if i < 0 {
 			return fmt.Errorf("no server called %s", name)
 		}
 		k := serverKey(l.MCP[i])
 		l.MCP = slices.Delete(l.MCP, i, i+1)
+		for _, p := range l.Projects {
+			delete(p.Servers, name)
+		}
 		// its icon goes with it, unless another server runs the same thing
 		if !slices.ContainsFunc(l.MCP, func(x *Server) bool { return serverKey(x) == k }) {
 			delete(l.Icons, k)
 		}
 		return nil
 	})
+	if err == nil {
+		// its sign-in goes with it
+		_ = mcpauth.Forget(name)
+	}
+	return res, err
 }
 
 // ImportServer takes a server the agents have into the library: the agents

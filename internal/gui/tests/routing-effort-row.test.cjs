@@ -67,7 +67,7 @@ function measure(rows) {
       const r = document.createRange();
       r.selectNodeContents(n);
       const b = clipped(row, n.parentElement, r.getBoundingClientRect());
-      if (b.right - b.left > 0.5 && b.bottom - b.top > 0.5) texts.push({ text: n.textContent, cls: n.parentElement.className, ...b });
+      if (b.right - b.left > 0.5 && b.bottom - b.top > 0.5) texts.push({ text: n.textContent, cls: n.parentElement.closest(".ef") ? "ef" : n.parentElement.className, ...b });
     }
     const ef = row.querySelector(".ef"), e = ef.getBoundingClientRect(), shown = clipped(row, ef, e), rb = row.getBoundingClientRect();
     // the effort's "· " comes from ::before, inside its box: the box stands for it
@@ -115,8 +115,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           }
         }
         // the answered rows keep all their numbers
-        const meta = await page.locator(".rt-req").nth(1).locator(".meta").textContent();
+        const meta = await page.locator(".rt-req").nth(1).locator(".meta > span").first().textContent();
         assert.match(meta, lang === "zh" ? /秒 · 首字 4\.6 秒 · 142\.4k token$/ : /s · TTFT 4\.6 s · 142\.4k tokens$/);
+        assert.equal(await page.locator(".rt-req").nth(1).locator(".meta .cost").textContent(), "—");
         // no stripe down a row's side
         assert.equal(await page.locator(".rt-req").first().evaluate((e) => getComputedStyle(e).borderLeftColor === getComputedStyle(e).borderTopColor), true);
         assert.deepEqual(errors, []);

@@ -37,8 +37,35 @@ const toErr = (...xs) => process.stderr.write(xs.map((x) => (typeof x === "strin
 console.log = console.info = console.debug = console.warn = toErr
 process.stdout.write = (chunk, enc, cb) => process.stderr.write(chunk, enc, cb)
 
+// Nor may a program a plugin starts have them: one given the host's stdin
+// reads magpie's messages away (pi-devin-plus runs `devin auth login` with
+// stdio "inherit", which took the next requests as its answer and gave up,
+// "Login canceled"), and its stdout is the host's answers. It reads
+// nothing instead and writes to stderr. node:child_process starts every
+// program through Bun.spawn and Bun.spawnSync, so these see all of them.
+const own = (v, fd) => v === "inherit" || v === fd || v === (fd ? process.stdout : process.stdin)
+const guard = (o) => {
+  if (!o || typeof o !== "object") return o
+  o = { ...o }
+  if (Array.isArray(o.stdio)) {
+    o.stdio = [...o.stdio]
+    if (own(o.stdio[0], 0)) o.stdio[0] = "ignore"
+    if (own(o.stdio[1], 1)) o.stdio[1] = 2
+  }
+  if (own(o.stdin, 0)) o.stdin = "ignore"
+  if (own(o.stdout, 1)) o.stdout = 2
+  return o
+}
+for (const name of ["spawn", "spawnSync"]) {
+  const run = Bun[name]
+  Bun[name] = function (a, b) {
+    return Array.isArray(a) ? run.call(this, a, guard(b)) : run.call(this, guard(a))
+  }
+}
+
 let authPath = ""
 let modelsDevPath = ""
+let piPath = "" // pi.js, which loads pi's extensions
 let directory = process.cwd()
 let userConfig = {}
 const hooks = [] // {spec, hooks}
@@ -46,6 +73,8 @@ const loaded = [] // {spec, id, error}
 const loaders = new Map() // account → options the auth loader returned
 const sessions = new Map() // oauth sign-in in progress → its authorize result
 const inflight = new Map() // fetch id → AbortController
+const renewing = new Map() // account → its sign-in's renewal under way
+const unrenewed = new Map() // account → its last renewal that failed: {at, secret, gone}
 let config = { provider: {} } // what the plugins' config hooks made of it
 
 // ---- a provider's own proxy ---------------------------------------------------
@@ -238,18 +267,67 @@ function pause(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
 }
 
+// Two hosts run at once while one is restarted (the old one finishing its
+// calls), and magpie writes the file when no host runs: each change to it
+// is made under plugin-auth.json.lock, read afresh and written back with
+// only its own accounts changed, so a host never writes another's newer
+// token away with what it read before. Nothing awaits under the lock; one
+// held longer than AUTH_LOCK_STALE was left by a host that died.
+const AUTH_LOCK_STALE = 10 * 1000
+
+function lockAuth() {
+  const lock = authPath + ".lock"
+  fs.mkdirSync(path.dirname(authPath), { recursive: true })
+  for (const start = Date.now(); ; ) {
+    try {
+      fs.closeSync(fs.openSync(lock, "wx", 0o600))
+      return () => {
+        try {
+          fs.unlinkSync(lock)
+        } catch {}
+      }
+    } catch (e) {
+      if (e?.code !== "EEXIST" && e?.code !== "EPERM" && e?.code !== "EACCES") throw e
+    }
+    let old = false
+    try {
+      old = Date.now() - fs.statSync(lock).mtimeMs > AUTH_LOCK_STALE
+    } catch {}
+    if (old || Date.now() - start > 2 * AUTH_LOCK_STALE) {
+      try {
+        fs.unlinkSync(lock)
+      } catch {}
+    }
+    pause(5)
+  }
+}
+
+// changeAuth runs change on the file as it is now, under the lock, and
+// writes it back when change says it changed it.
+function changeAuth(change) {
+  const unlock = lockAuth()
+  try {
+    const all = readAuth()
+    const out = change(all)
+    if (out !== false) writeAuth(all)
+    return out
+  } finally {
+    unlock()
+  }
+}
+
 function setAuth(key, info) {
-  const all = readAuth()
-  all[key] = info
-  writeAuth(all)
+  changeAuth((all) => {
+    all[key] = info
+  })
   loaders.delete(key)
   send({ event: "auth", provider: providerOf(key), account: key })
 }
 
 function removeAuth(key) {
-  const all = readAuth()
-  delete all[key]
-  writeAuth(all)
+  changeAuth((all) => {
+    delete all[key]
+  })
   loaders.delete(key)
   send({ event: "auth", provider: providerOf(key), account: key })
 }
@@ -322,24 +400,28 @@ function uidOf(a) {
 // else the same secret) replaces that one's and goes. It gives where it is
 // kept.
 function settle(provider, key) {
-  const all = readAuth()
-  const now = all[key]
-  if (!now) return key
-  const who = whoOf(now)
-  const secret = secretOf(now)
-  for (const k of accountsOf(all, provider)) {
-    if (k === key) continue
-    const was = all[k]
-    const other = uidOf(now) && uidOf(was) && uidOf(now) !== uidOf(was)
-    if ((who && whoOf(was) === who && !other) || (!who && !whoOf(was) && secret && secretOf(was) === secret)) {
-      all[k] = now
-      delete all[key]
-      writeAuth(all)
-      loaders.delete(k)
-      loaders.delete(key)
-      send({ event: "auth", provider, account: k })
-      return k
+  const k = changeAuth((all) => {
+    const now = all[key]
+    if (!now) return false
+    const who = whoOf(now)
+    const secret = secretOf(now)
+    for (const k of accountsOf(all, provider)) {
+      if (k === key) continue
+      const was = all[k]
+      const other = uidOf(now) && uidOf(was) && uidOf(now) !== uidOf(was)
+      if ((who && whoOf(was) === who && !other) || (!who && !whoOf(was) && secret && secretOf(was) === secret)) {
+        all[k] = now
+        delete all[key]
+        return k
+      }
     }
+    return false
+  })
+  if (k) {
+    loaders.delete(k)
+    loaders.delete(key)
+    send({ event: "auth", provider, account: k })
+    return k
   }
   return key
 }
@@ -370,8 +452,14 @@ function makeClient() {
           // tokens over the old; nothing is merged. It goes to the
           // account the request is for.
           const key = keyFor(id)
-          const prev = readAuth()[key]
-          if (JSON.stringify(prev) !== JSON.stringify(body)) setAuth(key, body)
+          const kept = changeAuth((all) => {
+            if (JSON.stringify(all[key]) === JSON.stringify(body)) return false
+            all[key] = body
+          })
+          if (kept !== false) {
+            loaders.delete(key)
+            send({ event: "auth", provider: providerOf(key), account: key })
+          }
         }
         return { data: true }
       },
@@ -482,7 +570,26 @@ async function loadPlugins(list) {
     serverUrl: new URL("http://127.0.0.1:4096"),
     $: Bun.$,
   }
+  // pi's packages and extensions are loaded as pi loads them (pi.js)
+  let pi
+  if (piPath) {
+    try {
+      pi = await import(pathToFileURL(piPath).href)
+    } catch (e) {
+      toErr("pi.js:", e)
+    }
+  }
+  const pis = pi ? list.filter((p) => pi.isPi(p.target)) : []
+  if (pis.length) {
+    const h = { readAuth, changeAuth, keyFor, send, directory }
+    const got = await pi.load(h, pis).catch((e) => pis.map((p) => ({ spec: p.spec, error: String(e?.stack ?? e) })))
+    for (const r of got) {
+      for (const x of r.hooks ?? []) hooks.push(x)
+      loaded.push(r.error ? { spec: r.spec, error: r.error } : { spec: r.spec })
+    }
+  }
   for (const p of list) {
+    if (pis.includes(p)) continue
     try {
       let fns = []
       for (const file of entries(p.target)) {
@@ -616,8 +723,9 @@ async function info(id, key, strict) {
   for (const h of hooks) {
     const ph = h.hooks.provider
     if (ph?.id !== id || typeof ph.models !== "function") continue
+    const k = key ?? accountsOf(readAuth(), id)[0] ?? id
+    await fresh(id, k)
     const all = readAuth()
-    const k = key ?? accountsOf(all, id)[0] ?? id
     try {
       const given = JSON.parse(JSON.stringify(out))
       const l = { tried: false, lastOk: false }
@@ -681,6 +789,26 @@ function iconOf(a) {
   return ok(readJSON(path.join(dir, "package.json"))?.magpie?.icon)
 }
 
+// concurrencyOf is how many requests the plugin says each of its accounts
+// takes at once, magpie's own field: the auth hook's maxConcurrency, else
+// package.json's magpie.maxConcurrency. A whole number over 0, else none
+// (0); the user's setting on the provider goes over it.
+function concurrencyOf(a) {
+  const ok = (v) => (Number.isInteger(v) && v > 0 ? Math.min(v, 1000) : 0)
+  const own = ok(a.auth.maxConcurrency)
+  if (own || !a.target) return own
+  const dir = fs.statSync(a.target, { throwIfNoEntry: false })?.isDirectory() ? a.target : path.dirname(a.target)
+  return ok(readJSON(path.join(dir, "package.json"))?.magpie?.maxConcurrency)
+}
+
+// rateOf reads a model's credit rate as a plugin gives it: a number (0.5)
+// or as the vendor's picker writes it ("x0.03", "0.5×"); 0 is none, as is
+// one it can't read
+function rateOf(v) {
+  const n = typeof v === "string" ? Number(v.trim().replace(/^[x×]\s*|\s*[x×]$/gi, "")) : v
+  return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : 0
+}
+
 // providers lists each provider and its accounts' models, each asked
 // through its proxy (proxies[provider][key], "" the provider's own), as a
 // built-in fetches each account's list through the account's.
@@ -709,6 +837,7 @@ async function providers({ proxies } = {}) {
       methods: methods(a.auth),
       icon: iconOf(a),
       usage: typeof a.auth.usage === "function",
+      maxConcurrency: concurrencyOf(a),
       signedIn: keys.length > 0,
       authType: first?.type ?? "",
       accountId: whoOf(first),
@@ -739,6 +868,10 @@ async function providers({ proxies } = {}) {
           cost: m.cost,
           variants: Object.keys(m.variants ?? {}),
           free: m.free === true,
+          // what a request costs of the plan's credits, as a multiple,
+          // and before a discount running now (Qoder's price_factor)
+          rate: rateOf(m.rate),
+          rateWas: rateOf(m.rateWas),
         })),
     })
   }
@@ -759,10 +892,13 @@ function applies(prompt, inputs) {
 }
 
 // nextPrompt is the method's next question for inputs so far, as
-// OpenCode's CLI asks them: in order, those whose when/condition hold.
-function nextPrompt(provider, index, inputs) {
+// OpenCode's CLI asks them: in order, those whose when/condition hold. A
+// method may ask its own way (magpie's hook, which pi's sign-ins use, as
+// they ask as they go): ask(inputs) → the next question, or null.
+async function nextPrompt(provider, index, inputs) {
   const m = authOf(provider).methods[index]
   if (!m) throw new Error(`no sign-in method ${index} for ${provider}`)
+  if (typeof m.ask === "function") return (await m.ask(inputs)) ?? null
   for (const p of m.prompts ?? []) {
     if (p.key in inputs) continue
     if (!applies(p, inputs)) continue
@@ -852,12 +988,106 @@ async function apiKey({ provider, method, inputs, key, account }) {
   return { ok: true, ...save(provider, at, r, inputs, key) }
 }
 
+// ---- renewing a sign-in ------------------------------------------------------
+
+// A plugin may leave renewing its accounts' tokens to magpie (magpie's own
+// hook, which OpenCode ignores):
+//   auth.refresh(auth, provider) → the account's sign-in renewed: the
+//     fields to keep over the old ({ access, refresh, expires, … }), or
+//     nothing when there is nothing to renew. It throws when it can't; an
+//     error with signIn "expired" says the vendor turned the sign-in away
+//     for good, and the account is marked.
+//   auth.refreshLead: how long (ms) before expires a token is renewed,
+//     5 minutes when not said.
+// An OAuth sign-in whose expires is that close is renewed before its
+// loader, models, usage or a request runs, once at a time per account: the
+// requests that find it due wait for the one renewal (a vendor that spends
+// a refresh token once turns a second away). A renewal that fails leaves
+// the sign-in as it was, for the vendor's answer to tell, and isn't tried
+// again for RENEW_RETRY, or, turned away for good, till it is signed in
+// again.
+
+const RENEW_LEAD = 5 * 60 * 1000
+const RENEW_WAIT = 15 * 1000
+const RENEW_RETRY = 30 * 1000
+
+function leadOf(a) {
+  const v = a?.refreshLead
+  return Number.isFinite(v) && v >= 0 ? Math.min(v, 24 * 3600e3) : RENEW_LEAD
+}
+
+// renewAt is when the sign-in at key is due to be renewed, 0 for never: an
+// OAuth one with an expiry, of a plugin that renews through magpie.
+function renewAt(a, stored) {
+  if (typeof a?.refresh !== "function" || stored?.type !== "oauth") return 0
+  const exp = Number(stored.expires)
+  return Number.isFinite(exp) && exp > 0 ? Math.max(1, exp - leadOf(a)) : 0
+}
+
+// fresh renews the sign-in at key when it is due, waiting at most
+// RENEW_WAIT for it: a renewal that takes longer goes on, and is kept when
+// it ends, but what waits for it goes on with the sign-in as it is.
+async function fresh(provider, key) {
+  const a = auths().get(provider)?.auth
+  const stored = readAuth()[key]
+  const at = renewAt(a, stored)
+  if (!at || Date.now() < at) return
+  const f = unrenewed.get(key)
+  if (f && f.secret === secretOf(stored) && (f.gone || Date.now() - f.at < RENEW_RETRY)) return
+  let r = renewing.get(key)
+  if (!r) {
+    pending++ // the host doesn't leave in the middle of it
+    r = renew(provider, key, a).finally(() => {
+      renewing.delete(key)
+      // nor does magpie stop it in the middle of one (host.go's stop)
+      send({ event: "renewing", count: renewing.size })
+      done()
+    })
+    renewing.set(key, r)
+    send({ event: "renewing", count: renewing.size })
+  }
+  let t
+  await Promise.race([r, new Promise((ok) => (t = setTimeout(ok, RENEW_WAIT)))])
+  clearTimeout(t)
+}
+
+async function renew(provider, key, a) {
+  const was = readAuth()[key]
+  const at = renewAt(a, was)
+  if (!at || Date.now() < at) return // renewed meanwhile
+  let got
+  try {
+    got = await inScope(provider, key, () => a.refresh(JSON.parse(JSON.stringify(was)), provider))
+  } catch (e) {
+    unrenewed.set(key, { at: Date.now(), secret: secretOf(was), gone: e?.signIn === "expired" })
+    if (e?.signIn === "expired") send({ event: "signIn", provider, account: key, said: "expired" })
+    send({ event: "log", level: "error", message: `${auths().get(provider)?.spec ?? provider}: auth.refresh: ${e?.message ?? e}` })
+    return
+  }
+  if (!got || typeof got !== "object") return
+  // signed out, signed in again or renewed by another host while it ran:
+  // that one stands. Checked under the lock the save is made under, so
+  // nothing comes between the two.
+  const { type: _t, ...fields } = got
+  const kept = changeAuth((all) => {
+    const now = all[key]
+    if (!now || secretOf(now) !== secretOf(was) || now.access !== was.access) return false
+    all[key] = { ...was, ...fields, type: "oauth" }
+  })
+  if (kept === false) return
+  unrenewed.delete(key)
+  loaders.delete(key)
+  send({ event: "auth", provider, account: key })
+  send({ event: "signIn", provider, account: key, said: "renewed" })
+}
+
 // ---- requests ----------------------------------------------------------------
 
 // options is what the provider's auth loader returned for the account at
 // key, run once per sign-in as OpenCode runs it once per start. Run in
 // the account's scope, whatever the loader keeps (its fetch) saves to it.
 async function options(provider, key) {
+  await fresh(provider, key)
   if (loaders.has(key)) return loaders.get(key)
   const a = auths().get(provider)?.auth
   const stored = readAuth()[key]
@@ -892,7 +1122,9 @@ async function load({ provider, account, proxy }) {
 //     resets?: { count, until?, byWindow?, fiveHour?, weekly? } (the
 //       rate-limit resets the account may spend),
 //     windows?: [{ name, used (percent, 0–100), resetsAt? (ISO or ms),
-//       resetSecs?, display?, span? (seconds the window runs), model? (a
+//       resetSecs?, display?, amount? / limit? / unit? (the window's own
+//       count, when it counts in amounts: amount of limit used, in unit,
+//       "credits"), span? (seconds the window runs), model? (a
 //       word in the ids of the only models it counts), models? / notModels?
 //       (the ids it counts, or all but these), aside? (using it up doesn't
 //       stop the account) }],
@@ -911,6 +1143,7 @@ async function usageOf(provider, account) {
   if (typeof a?.usage !== "function") throw new Error(`${provider}'s plugin doesn't tell its usage`)
   const key = accountKey(provider, account)
   if (!readAuth()[key]) throw new Error("not signed in")
+  await fresh(provider, key)
   const p = await info(provider, key)
   const u = (await inScope(provider, key, () => a.usage(async () => readAuth()[key], JSON.parse(JSON.stringify(p))))) ?? {}
   const when = (v) => {
@@ -939,6 +1172,9 @@ async function usageOf(provider, account) {
       resetsAt: when(w?.resetsAt),
       resetSecs: Math.max(0, Math.round(num(w?.resetSecs))),
       display: text(w?.display),
+      amount: Math.max(0, num(w?.amount)),
+      limit: Math.max(0, num(w?.limit)),
+      unit: text(w?.unit),
       span: Math.max(0, num(w?.span)),
       model: text(w?.model),
       models: ids(w?.models),
@@ -1038,13 +1274,14 @@ const handlers = {
   async init(p) {
     authPath = p.authPath
     modelsDevPath = p.modelsDevPath ?? ""
+    piPath = p.piPath ?? ""
     directory = p.directory ?? directory
     userConfig = p.config ?? {}
     await loadPlugins(p.plugins ?? [])
     return { plugins: loaded }
   },
   providers: (p) => providers(p ?? {}),
-  prompt: (p) => ({ prompt: nextPrompt(p.provider, p.method, p.inputs ?? {}) }),
+  prompt: async (p) => ({ prompt: await nextPrompt(p.provider, p.method, p.inputs ?? {}) }),
   validate: (p) => ({ error: validate(p.provider, p.method, p.key, p.value) }),
   authorize,
   callback,
@@ -1084,12 +1321,18 @@ const handlers = {
   // take gives the accounts named (else every account of the provider) and
   // forgets them in one step: nothing renews a token between the two
   take(p) {
-    const all = readAuth()
     const out = {}
-    for (const k of p.accounts?.length ? p.accounts : accountsOf(all, p.provider)) {
-      if (!(k in all)) continue
-      out[k] = all[k]
-      removeAuth(k)
+    changeAuth((all) => {
+      for (const k of p.accounts?.length ? p.accounts : accountsOf(all, p.provider)) {
+        if (!(k in all)) continue
+        out[k] = all[k]
+        delete all[k]
+      }
+      if (!Object.keys(out).length) return false
+    })
+    for (const k of Object.keys(out)) {
+      loaders.delete(k)
+      send({ event: "auth", provider: providerOf(k), account: k })
     }
     return { auths: out }
   },

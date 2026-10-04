@@ -68,6 +68,10 @@ var codexDrawers = []catalog.Model{
 	{ID: "gpt-image-2.5", Name: "GPT Image 2.5", Released: "2026-06-01"},
 }
 
+// codexDrawer is the image model Codex CLI asks a ChatGPT account for, the
+// one Automatic picks there.
+const codexDrawer = "gpt-image-2"
+
 // grokDrawers are the image models a Grok subscription (SuperGrok, X Premium+)
 // draws with, at the Imagine API of the backend Grok Build's image_gen tool
 // calls: cli-chat-proxy.grok.com/v1/images/generations.
@@ -92,8 +96,11 @@ func drawsCodex(p provider.Provider) bool {
 // Drawers are the models a provider can draw with: its catalogs' models
 // that make images, those its own model list names that do, and those of
 // its own picks named for images; a ChatGPT account's GPT Image, a Grok
-// subscription's Grok Imagine.
+// subscription's Grok Imagine, a WorkBuddy plan's those its config lists.
 func Drawers(p provider.Provider) []catalog.Model {
+	if drawsWorkBuddy(p) {
+		return wbDrawers(p)
+	}
 	if drawsCodex(p) || drawsGrok(p) {
 		out := slices.Clone(codexDrawers)
 		if drawsGrok(p) {
@@ -142,10 +149,17 @@ func Drawers(p provider.Provider) []catalog.Model {
 func AutoDrawer() string {
 	best, bestCost, bestDate := "", 0.0, ""
 	for _, p := range provider.All() {
-		if !p.On() || p.Decides() {
+		if !p.On() || p.DecideOnly() || drawsWorkBuddy(p) {
+			// WorkBuddy's images cost the plan's credits: it draws only
+			// with its model picked or named
 			continue
 		}
 		for _, m := range Drawers(p) {
+			if drawsCodex(p) && m.ID != codexDrawer {
+				// Codex CLI draws with gpt-image-2 only; a plan may be
+				// refused the others (chatgpt.com: 403, #545)
+				continue
+			}
 			cost := 1e9
 			switch {
 			case drawsCodex(p), drawsGrok(p):
@@ -194,6 +208,16 @@ type drawn struct {
 
 func (s *Server) images(edit bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		inputBody, admitted := s.requestBody(w, r, provider.Chat)
+		if !admitted {
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(inputBody))
+		defer func() {
+			if r.MultipartForm != nil {
+				r.MultipartForm.RemoveAll()
+			}
+		}()
 		start := time.Now()
 		d, err := readDrawing(r)
 		if err != nil {
@@ -229,10 +253,15 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 			fail(404, fmt.Sprintf("magpie knows no model %q to draw with", d.Model))
 			return
 		}
+		var unmask func()
+		w, d.Prompt, unmask = redactedPrompt(w, d.Prompt)
+		defer unmask()
 		call.Provider, call.To = p.ID, provider.Chat
 		ctx, cancel := context.WithTimeout(r.Context(), drawTimeout)
 		defer cancel()
-		out, code, err := s.draw(ctx, p, model, d)
+		// the account that drew, or refused last, is the one recorded
+		drew, out, code, err := s.drawOnAccounts(ctx, p, model, d)
+		p = drew
 		call.Millis = time.Since(start).Milliseconds()
 		call.Status, call.Usage.Input, call.Usage.Output = code, out.Input, out.Output
 		if err == nil && len(out.Images) == 0 {
@@ -243,7 +272,7 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 		if p.Account == nil && p.Key != "" {
 			providerKeyID, providerKeyName = provider.KeyID(p.Key), p.KeyName
 		}
-		usage.Append(usage.Record{Time: start, Agent: call.Agent, Via: call.Via, Provider: p.ID, Host: p.Where(), Model: model, Requested: call.Model, ProviderKeyID: providerKeyID, ProviderKeyName: providerKeyName,
+		appendUsage(r, usage.Record{Operation: "generate_content", Time: start, Agent: call.Agent, Via: call.Via, Provider: p.ID, Host: p.Where(), Model: model, Requested: call.Model, ProviderKeyID: providerKeyID, ProviderKeyName: providerKeyName, ProviderAccount: accountOf(p),
 			Input: out.Input, Output: out.Output, Millis: call.Millis, Status: call.Status, Session: sessionOf(r.Header)})
 		if err != nil {
 			call.Error = err.Error()
@@ -320,7 +349,7 @@ func readDrawing(r *http.Request) (drawing, error) {
 			d.Mask = &pic
 		}
 	} else {
-		body, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			return d, err
 		}
@@ -474,9 +503,68 @@ func viaFor(p provider.Provider, model string) drawVia {
 	return viaChat
 }
 
+// drawOnAccounts is draw on a subscription's accounts in the order its
+// text requests go over them (the provider's candidates, without its
+// fallback models): one whose plan won't draw (chatgpt.com's 403
+// {"detail":"Forbidden"} for a plan without images) or is out of them
+// hands the request to the next, as a Plus account further down draws
+// what the pinned one may not (#545). The refusal is of images alone, so
+// no account rests for text over it. It answers with the account that
+// drew, or the last one's error when every one refused.
+func (s *Server) drawOnAccounts(ctx context.Context, p provider.Provider, model string, d drawing) (provider.Provider, drawn, int, error) {
+	if p.Account == nil {
+		out, code, err := s.draw(ctx, p, model, d)
+		return p, out, code, err
+	}
+	q := p
+	q.Fallback = nil
+	cs := s.candidates(q, model, provider.Chat)
+	// an account whose list lacks the image model is put aside for text
+	// when another's list is unknown; for drawing it is asked last
+	_, _, left, barred := perKeyBarred(q, model, provider.Chat)
+	for _, c := range left {
+		if !slices.ContainsFunc(cs, func(o candidate) bool { return accountOf(o.p) == accountOf(c.p) }) {
+			cs = append(cs, c)
+		}
+	}
+	if len(cs) == 0 && slices.ContainsFunc(barred, func(c candidate) bool { return c.capped != nil }) {
+		// every account is held at its usage cap
+		msg, _ := cappedError(model, barredOf(barred, q, false, provider.Chat, nil), time.Now())
+		return p, drawn{}, http.StatusTooManyRequests, errors.New(msg)
+	}
+	if len(cs) == 0 {
+		cs = []candidate{{p: p, model: model, rest: p.ID}}
+	}
+	var out drawn
+	var code int
+	var err error
+	for i, c := range cs {
+		p = c.p
+		out, code, err = s.draw(ctx, p, model, d)
+		if err == nil || ctx.Err() != nil || i+1 == len(cs) || !accountRefusedDrawing(code) {
+			break
+		}
+	}
+	return p, out, code, err
+}
+
+// accountRefusedDrawing says a failure to draw was the account's — its
+// sign-in, its plan, its allowance — not the request's, so another
+// account of the subscription may draw it.
+func accountRefusedDrawing(code int) bool {
+	switch code {
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests:
+		return true
+	}
+	return false
+}
+
 // draw asks the provider for d's images, on the API model draws on there,
 // and on the other when that one isn't served.
 func (s *Server) draw(ctx context.Context, p provider.Provider, model string, d drawing) (drawn, int, error) {
+	if drawsWorkBuddy(p) {
+		return s.drawWorkBuddy(ctx, p, model, d)
+	}
 	if drawsCodex(p) || drawsGrok(p) {
 		return s.drawImages(ctx, p, model, d)
 	}
@@ -515,6 +603,11 @@ func (s *Server) send(ctx context.Context, p provider.Provider, url, contentType
 
 // sendAs is send with the method: a video's progress is asked with a GET.
 func (s *Server) sendAs(ctx context.Context, p provider.Provider, method, url, contentType string, body []byte, sign bool) ([]byte, int, error) {
+	return s.sendWith(ctx, p, method, url, contentType, body, sign, nil)
+}
+
+// sendWith is sendAs with headers of the vendor's own besides.
+func (s *Server) sendWith(ctx context.Context, p provider.Provider, method, url, contentType string, body []byte, sign bool, extra http.Header) ([]byte, int, error) {
 	ctx = p.Via(ctx)
 	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
@@ -535,6 +628,7 @@ func (s *Server) sendAs(ctx context.Context, p provider.Provider, method, url, c
 			// signing asks of its Responses; the id is Codex CLI's own
 			req.Header.Set("Accept", "application/json")
 			req.Header.Set("x-codex-imagegen-request-id", newUUID())
+			req.Header.Set("x-codex-image-turn-id", newUUID())
 		}
 	} else {
 		// Google's API keys go in their own header
@@ -542,6 +636,9 @@ func (s *Server) sendAs(ctx context.Context, p provider.Provider, method, url, c
 		for k, v := range p.Headers {
 			req.Header[k] = []string{v}
 		}
+	}
+	for k, v := range extra {
+		req.Header[k] = v
 	}
 	res, err := p.Do(s.client, req) // a plugin's through the plugin
 	if err != nil {
@@ -556,7 +653,11 @@ func (s *Server) sendAs(ctx context.Context, p provider.Provider, method, url, c
 		return nil, 502, err
 	}
 	if res.StatusCode >= 300 {
-		return b, res.StatusCode, fmt.Errorf("%s: %d %s%s", provider.HostOf(url), res.StatusCode, http.StatusText(res.StatusCode), vendorSaid(vendorMessage(b)))
+		hint := ""
+		if drawsCodex(p) && res.StatusCode == http.StatusForbidden {
+			hint = fmt.Sprintf(" — ChatGPT turned %s's images away: its plan or workspace may not draw, or not with this model (Codex CLI draws with %s)", p.Name, codexDrawer)
+		}
+		return b, res.StatusCode, fmt.Errorf("%s: %d %s%s%s", provider.HostOf(url), res.StatusCode, http.StatusText(res.StatusCode), vendorSaid(vendorMessage(b)), hint)
 	}
 	return b, res.StatusCode, nil
 }
@@ -564,7 +665,20 @@ func (s *Server) sendAs(ctx context.Context, p provider.Provider, method, url, c
 // vendorMessage is the message of a vendor's error, or its body.
 func vendorMessage(b []byte) string {
 	var e struct {
-		Error json.RawMessage `json:"error"`
+		Error  json.RawMessage `json:"error"`
+		Errors struct {
+			Message string `json:"message"`
+		} `json:"errors"` // ModelScope's
+		Code json.RawMessage `json:"code"` // WorkBuddy's {code, msg}
+		Msg  string          `json:"msg"`
+	}
+	if json.Unmarshal(b, &e) == nil && e.Errors.Message != "" {
+		return e.Errors.Message
+	}
+	if json.Unmarshal(b, &e) == nil && len(e.Error) == 0 && e.Msg != "" {
+		if code := strings.Trim(string(e.Code), `"`); code != "" && code != "0" && code != "null" {
+			return e.Msg + " (" + code + ")"
+		}
 	}
 	if json.Unmarshal(b, &e) == nil && len(e.Error) > 0 {
 		var m struct {
@@ -584,6 +698,9 @@ func vendorMessage(b []byte) string {
 // drawImages asks an images API: generations, or edits with the images
 // sent along.
 func (s *Server) drawImages(ctx context.Context, p provider.Provider, model string, d drawing) (drawn, int, error) {
+	if isModelScope(p) {
+		return s.drawModelScope(ctx, p, model, d)
+	}
 	base := strings.TrimRight(p.Base(provider.Chat), "/")
 	if drawsCodex(p) || drawsGrok(p) {
 		base = strings.TrimRight(p.Base(provider.Responses), "/")
@@ -683,6 +800,12 @@ func (s *Server) drawImages(ctx context.Context, p provider.Provider, model stri
 	if err != nil {
 		return drawn{}, code, err
 	}
+	return readImagesAnswer(p, url, b, code)
+}
+
+// readImagesAnswer reads an images API's answer to url: its images, as bytes
+// or the URLs the vendor keeps them at, and what they cost.
+func readImagesAnswer(p provider.Provider, url string, b []byte, code int) (drawn, int, error) {
 	var res struct {
 		Data []struct {
 			B64     string `json:"b64_json"`
@@ -712,6 +835,10 @@ func (s *Server) drawImages(ctx context.Context, p provider.Provider, model stri
 		} else if e.URL != "" {
 			out.Images = append(out.Images, picture{URL: e.URL})
 		}
+	}
+	if len(out.Images) == 0 {
+		// an answer with no image says why, or is shown as it came
+		return out, 502, fmt.Errorf("%s answered with no image%s", provider.HostOf(url), vendorSaid(vendorMessage(b)))
 	}
 	return out, code, nil
 }

@@ -1,5 +1,14 @@
 package gateway
 
+// PLUGIN-SERVED (see AGENTS.md): Devin ("devin") is a deprecated built-in
+// subscription served by its plugin, @magpie-community/opencode-devin-auth,
+// once moved onto it (provider.Moved; the default for a new sign-in). A
+// moved one's sign-ins, models, requests and usage are all the plugin's,
+// never this code's (only the move, in migrate*.go, still reads its
+// accounts). A fix here alone doesn't reach those users; fix the plugin
+// (github.com/magpie-community/plugins, packages/devin) and raise the
+// mover's min in internal/provider/migrate_side.go.
+
 // A Devin subscription is served through the API the devin CLI talks to —
 // Windsurf's GetChatMessage, a Connect RPC in protobuf — the way a Kiro one
 // is (kiro.go): each request goes whole, the conversation with the caller's
@@ -286,6 +295,17 @@ type devinMsg struct {
 	thinking []Part // with Devin's own signatures
 }
 
+// inlineImages is the images that carry their bytes: Devin takes no URL.
+func inlineImages(ims []Part) []Part {
+	var out []Part
+	for _, im := range ims {
+		if im.Data != "" {
+			out = append(out, im)
+		}
+	}
+	return out
+}
+
 // buildDevin is the GetChatMessage request for r, to the model uid.
 func buildDevin(r *Request, uid, key string) []byte {
 	var msgs []devinMsg
@@ -350,7 +370,7 @@ func buildDevin(r *Request, uid, key string) []byte {
 					if p.IsError {
 						out = "Error: " + out
 					}
-					msgs = append(msgs, devinMsg{role: devinTool, callID: c.ID, text: out})
+					msgs = append(msgs, devinMsg{role: devinTool, callID: c.ID, text: out, images: inlineImages(p.Images)})
 					pending = append(pending[:i:i], pending[i+1:]...)
 					break
 				}

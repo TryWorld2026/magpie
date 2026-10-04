@@ -47,13 +47,21 @@ type Login struct {
 	// Returns is the account magpie signed the agent out of when it was
 	// spent, and signs it back in to once it has room again (#408).
 	Returns bool `json:"returns,omitempty"`
+
+	// first is the saved Claude account served in the place of Claude
+	// Code's own while it is signed out (claudeStandIn).
+	first bool
 }
 
 type savedLogin struct {
-	Agent string    `json:"agent"`
-	User  string    `json:"user"`
-	Plan  string    `json:"plan,omitempty"`
-	Seen  time.Time `json:"seen"`
+	// Order is the user-arranged routing order within this agent. Zero keeps
+	// the original alphabetical order for accounts not arranged yet.
+	Order     int       `json:"order,omitempty"`
+	Agent     string    `json:"agent"`
+	User      string    `json:"user"`
+	Plan      string    `json:"plan,omitempty"`
+	AccessSKU string    `json:"accessSku,omitempty"`
+	Seen      time.Time `json:"seen"`
 	// On puts the account in use beside the one the agent is signed in to:
 	// requests go to it when that one is out of quota (see logins_on.go).
 	On bool `json:"on,omitempty"`
@@ -75,6 +83,10 @@ type savedLogin struct {
 	// Lapsed why the vendor last refused to (logins_on.go, keepalive.go).
 	Renewed time.Time `json:"renewed,omitzero"`
 	Lapsed  string    `json:"lapsed,omitempty"`
+	// Refused is the Claude credential Anthropic refused (its version, in
+	// claude_auth.go): Lapsed holds while the account has that one, and
+	// says nothing of the one it is refreshed or signed in to next.
+	Refused string `json:"refused,omitempty"`
 	// Hidden is the agent's own sign-in removed in magpie, with the mark
 	// of the sign-in it was (side_logins.go): it is listed and tried no
 	// more until the agent signs in anew. The agent's files stay as they are.
@@ -83,6 +95,10 @@ type savedLogin struct {
 	// paused it in magpie (#263): the gateway passes over it while another
 	// of the agent's accounts is on, the agent staying signed in to it.
 	Paused bool `json:"paused,omitempty"`
+	// Held is the Claude account Claude Code itself was signed in to when
+	// magpie last looked: its saved copy is that very sign-in, which
+	// Claude Code's /logout revokes (claudeLoggedOut).
+	Held bool `json:"held,omitempty"`
 }
 
 var (
@@ -117,12 +133,22 @@ func writeLogins(ls []savedLogin) error {
 		if ls[i].Agent != ls[j].Agent {
 			return ls[i].Agent < ls[j].Agent
 		}
+		if ls[i].Order != ls[j].Order {
+			if ls[i].Order == 0 {
+				return false
+			}
+			if ls[j].Order == 0 {
+				return true
+			}
+			return ls[i].Order < ls[j].Order
+		}
 		return strings.ToLower(ls[i].User) < strings.ToLower(ls[j].User)
 	})
 	b, err := json.MarshalIndent(ls, "", "  ")
 	if err != nil {
 		return err
 	}
+	defer Changed() // an account added, switched or gone: All builds anew
 	return writePrivate(loginsPath(), append(b, '\n'))
 }
 
@@ -158,8 +184,14 @@ func writePrivate(path string, b []byte) error {
 func upsertLogin(ls []savedLogin, l savedLogin) []savedLogin {
 	for i := range ls {
 		if sameLogin(ls[i], l) {
+			// a refused Claude credential stays refused while it is the
+			// one the account has
+			if l.Agent == "claude" && l.Lapsed == "" && ls[i].Refused != "" && ls[i].Refused == claudeLoginVersion(l) {
+				l.Lapsed, l.Refused = ls[i].Lapsed, ls[i].Refused
+			}
 			l.On = l.On || ls[i].On
 			l.Paused = l.Paused || ls[i].Paused
+			l.Order = ls[i].Order
 			ls[i] = l
 			return ls
 		}
@@ -199,6 +231,10 @@ func dedupeLogins(ls []savedLogin) []savedLogin {
 		keep.On = previous.On || l.On
 		keep.Paused = previous.Paused || l.Paused
 		keep.First = previous.First || l.First
+		keep.Order = previous.Order
+		if keep.Order == 0 {
+			keep.Order = l.Order
+		}
 		out[found] = keep
 	}
 	return out
@@ -356,16 +392,15 @@ func savedButSignedOut() []Exclusion {
 	}
 	var out []Exclusion
 	for _, a := range loginAgents {
-		if saved[a] == 0 {
+		// Claude Code signed out, its saved accounts are served all the
+		// same (claudeStandIn)
+		if saved[a] == 0 || a == "claude" {
 			continue
 		}
 		if _, ok := liveLogin(a); ok {
 			continue
 		}
 		why, signIn := "nothing at "+codexAuthPath(), "codex login"
-		if a == "claude" {
-			why, signIn = claudeNotSignedInWhy(), "claude, then /login"
-		}
 		n := "1 account is"
 		if saved[a] > 1 {
 			n = fmt.Sprintf("%d accounts are", saved[a])
@@ -374,27 +409,6 @@ func savedButSignedOut() []Exclusion {
 			Why: fmt.Sprintf("%s saved in magpie, but it isn't signed in here (%s), and they are only offered beside the account it is signed in to. Sign in (%s) with this HOME.", n, why, signIn)})
 	}
 	return out
-}
-
-// claudeNotSignedInWhy says which of liveLogin's checks found no Claude Code
-// sign-in: its credentials (on a Mac, the keychain first), what
-// `claude auth status` says, or the account's name.
-func claudeNotSignedInWhy() string {
-	c, _, ok := claudeCredential()
-	if !ok {
-		if claudeKeychain {
-			return `no "Claude Code-credentials" in the keychain magpie could read, and nothing at ` + claudeCredentialsPath()
-		}
-		return "nothing at " + claudeCredentialsPath()
-	}
-	user, plan, signedOut := claudeIdentity()
-	if signedOut {
-		return "its credentials are there, but claude auth status says no one is signed in"
-	}
-	if u, _ := claudeSignedInUser(c.OAuth.SubscriptionType, plan, user); u == "" {
-		return "its credentials are there, but neither " + claudeProfilePath() + " nor claude auth status names the account"
-	}
-	return "its sign-in could not be read"
 }
 
 // liveLogin reads the account an agent is signed in to now.
@@ -471,9 +485,18 @@ func rememberLogins(force bool) {
 		}
 		l, ok := liveLogin(agent)
 		if !ok {
+			if agent == "claude" && claudeLoggedOut(ls) {
+				changed = true
+			}
 			continue
 		}
 		l.Seen = time.Now().UTC().Truncate(time.Second)
+		if agent == "claude" {
+			for i := range ls {
+				ls[i].Held = false
+			}
+			l.Held = true
+		}
 		ls = upsertLogin(ls, l)
 		changed = true
 	}
@@ -564,6 +587,10 @@ func Logins(agent string) []Login {
 	}
 	var out []Login
 	ls := readLogins()
+	standIn := ""
+	if _, ok := active["claude"]; !ok {
+		standIn = claudeStandIn(ls)
+	}
 	back := map[string]string{}
 	for a, user := range active {
 		if r, ok := loginReturnOf(a, user); ok {
@@ -575,10 +602,16 @@ func Logins(agent string) []Login {
 			continue
 		}
 		using := strings.EqualFold(active[l.Agent], l.User)
-		lg := Login{Agent: l.Agent, User: l.User, Plan: l.Plan, Seen: l.Seen, Active: using, On: using || l.On,
-			Paused: using && pausedOwn(ls, l.Agent, l.User)}
+		first := l.Agent == "claude" && strings.EqualFold(standIn, l.User)
+		lg := Login{Agent: l.Agent, User: l.User, Plan: l.Plan, Seen: l.Seen, Active: using, On: using || first || l.On,
+			Paused: (using || first) && pausedOwn(ls, l.Agent, l.User), first: first}
+		if l.Agent == "claude" {
+			lg.Lapsed = claudeSignedOut(l)
+		}
 		if !using {
-			lg.Lapsed = l.Lapsed
+			if l.Agent != "claude" {
+				lg.Lapsed = l.Lapsed
+			}
 			lg.Returns = l.On && strings.EqualFold(back[l.Agent], l.User)
 		}
 		out = append(out, lg)
@@ -587,15 +620,43 @@ func Logins(agent string) []Login {
 }
 
 // InUseLogin is the account of an agent's the gateway goes to first: the
-// one the agent is signed in to, unless it is paused, else the first other
-// one on; "" when the agent has none.
+// one the agent is signed in to, unless it is paused or has used its
+// allowance up — then the next one on that still has room — else the first
+// other one on; "" when the agent has none.
+// Kept signed in to one of the user's choosing, it is the first in the
+// order that is in use.
 func InUseLogin(agent string) string {
-	return inUseOf(Logins(agent))
+	ls := Logins(agent)
+	if keptAs(agent) != "" {
+		for _, l := range ls {
+			if (l.Active || l.On) && !l.Paused && l.Lapsed == "" {
+				return l.User
+			}
+		}
+	}
+	return inUseOf(ls, loginRoom(agent))
 }
 
-func inUseOf(ls []Login) string {
+func inUseOf(ls []Login, room func(user string) (known, spent bool)) string {
 	for _, l := range ls {
-		if l.Active && !l.Paused {
+		if (l.Active || l.first) && !l.Paused {
+			// The account the agent is signed in to leads, but magpie moves
+			// the sign-in only every few minutes (SwitchWhenSpent, and for
+			// the agents it signs in at all), while the gateway moves its
+			// requests as soon as an account is spent. So the one in use can
+			// still be spent here; the menu bar watching it would show an
+			// allowance already gone. When the account the agent is on has
+			// used up, and another is on with room, the gateway goes to that
+			// one, so report it. An allowance not known is never taken for
+			// spent, so a single account or a read that failed is left as it
+			// was. room is nil where the caller has no allowances to weigh.
+			if room != nil {
+				if known, spent := room(l.User); known && spent {
+					if next, ok := nextWithRoom(ls, l.User, room); ok {
+						return next
+					}
+				}
+			}
 			return l.User
 		}
 	}
@@ -605,6 +666,45 @@ func inUseOf(ls []Login) string {
 		}
 	}
 	return ""
+}
+
+// nextWithRoom is the account inUseOf moves to when the one in use is spent:
+// the first other one the gateway could take a request to — on, not paused,
+// not lapsed — whose allowance is known and not spent, the spares NextLogin
+// picks among. ok is false when none has room, and the account in use is
+// kept.
+func nextWithRoom(ls []Login, spent string, room func(user string) (known, spent bool)) (string, bool) {
+	for _, l := range ls {
+		if !l.On || l.Paused || l.Lapsed != "" || strings.EqualFold(l.User, spent) {
+			continue
+		}
+		if known, used := room(l.User); known && !used {
+			return l.User, true
+		}
+	}
+	return "", false
+}
+
+// loginRoom weighs an account against the share the gateway counts it spent
+// at (loginSwitching, the same SpentShareOf its routing). It reads the
+// allowances the gateway routes by, so the account reported as in use and
+// the one the gateway sends to agree on which is out (#209), and the menu
+// bar's "account in use" card follows the gateway rather than the sign-in
+// that lags behind it.
+func loginRoom(agent string) func(user string) (known, spent bool) {
+	al := Allowances(agent)
+	share, _ := loginSwitching(agent)
+	now := time.Now()
+	return func(user string) (bool, bool) {
+		a, ok := al[user]
+		if !ok {
+			return false, false // not read yet: unknown, never taken for spent
+		}
+		// The account-wide windows (For's "" model), as the gateway's
+		// usedPast does; a window whose reset passed is empty again there.
+		used, _ := a.For("", now)
+		return true, used >= share
+	}
 }
 
 // SwitchLogin signs an agent in to a remembered account. Sessions of the
@@ -679,11 +779,17 @@ func switchSavedLogin(agent, user string) (from string, _ error) {
 	}
 	if agent == "claude" {
 		// as Claude Code keeps it, if it has run on the account beside the
-		// one it is signed in to
-		if c, ok := readClaudeDir(claudeAccountDir(target.User)); ok {
-			if _, err := takeClaudeDir(target, c); err != nil {
-				return "", err
+		// one it is signed in to; never one that can't be used, which
+		// Claude Code would only be refused on
+		_, changed, err := syncClaudeDir(target)
+		if err != nil {
+			return "", err
+		}
+		if why := claudeSignedOut(*target); why != "" {
+			if changed {
+				_ = writeLogins(ls)
 			}
+			return "", fmt.Errorf("%s: %s", target.User, why)
 		}
 	}
 	want := *target
@@ -840,6 +946,7 @@ func ForgetAccounts() {
 
 // forgetAccountCaches makes the next look at the accounts read them afresh.
 func forgetAccountCaches() {
+	Changed() // the providers a request holds (All)
 	forgetClaudeCredential()
 	forgetClaudeStatus()
 	forgetCursorStatus()

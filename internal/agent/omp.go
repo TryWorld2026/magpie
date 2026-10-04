@@ -112,14 +112,26 @@ func ompDir(home string) string {
 }
 
 func omp(home string) *Agent {
-	dir := ompDir(home)
+	return ompAt(here(home), ompDir(home), func() ompProviderEntry { return ompProvider() })
+}
+
+// ompIn is omp in a WSL distro (see wsl.go): ~/.omp/agent, as the
+// distro's variables that move it aren't read. The omp there isn't the one
+// on Windows' PATH, so its version isn't known, and its models offer xhigh
+// rather than a max an older omp would refuse.
+func ompIn(at place) *Agent {
+	return ompAt(at, filepath.Join(at.home, ".omp", "agent"), func() ompProviderEntry { return ompProviderAt(at.gw(), "") })
+}
+
+// ompAt is omp with its agent folder at dir, magpie's entry in its
+// models.yml being entry's.
+func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
+	ompProvider := entry
 	// omp reads the .yml and falls back to the .yaml
 	pick := func(name string) string {
 		yml := filepath.Join(dir, name+".yml")
-		if _, err := os.Stat(yml); err != nil {
-			if _, err := os.Stat(filepath.Join(dir, name+".yaml")); err == nil {
-				return filepath.Join(dir, name+".yaml")
-			}
+		if !at.exists(yml) && at.exists(filepath.Join(dir, name+".yaml")) {
+			return filepath.Join(dir, name+".yaml")
 		}
 		return yml
 	}
@@ -316,7 +328,7 @@ func omp(home string) *Agent {
 			}
 			models := pick("models")
 			return wiringOff("omp", models, func(k string) (string, bool) { return edit.GetYAML(models, "providers."+magpieID+"."+k) },
-				"baseUrl", gatewayV1())
+				"baseUrl", at.v1())
 		},
 		Fields: []Field{
 			role("model", "model", "default", false),
@@ -379,6 +391,23 @@ type ompProviderEntry struct {
 	Models  []ompModel        `yaml:"models"`
 }
 
+// ompMaxSince is the first omp whose models.yml takes max as a thinking
+// effort (pi-ai 16.4.0); 16.3.5's schema stops at xhigh and turns the whole
+// file away over a max.
+const ompMaxSince = "16.4.0"
+
+// ompVersion is the version of the omp on PATH, "" when not known; a var so
+// tests can fake it.
+var ompVersion = func() string { return (&Agent{ID: "omp", Bin: "omp"}).InstalledVersion() }
+
+// ompTakesMax says whether omp at version v takes max in models.yml. One
+// whose version isn't known is taken for an older one: a max it refuses
+// costs every model magpie gives it, an xhigh in its place only the top
+// level of a model that has both.
+func ompTakesMax(v string) bool {
+	return v != "" && !Newer(ompMaxSince, v)
+}
+
 // ompProvider is magpie's entry in models.yml. The thinking efforts are the
 // levels omp offers for the model; on Chat it sends them as
 // reasoning_effort.
@@ -391,7 +420,12 @@ type ompProviderEntry struct {
 // /v1/messages (omp adds the /v1). That one thinks adaptively when it takes
 // nothing else, else on a budget: omp's anthropic-budget-effort would also
 // send output_config.effort, which Sonnet 4.5 and Haiku 4.5 refuse.
-func ompProvider() ompProviderEntry {
+func ompProvider() ompProviderEntry { return ompProviderAt(gateway.URL(), ompVersion()) }
+
+// ompProviderAt is ompProvider for an omp of version (as ompVersion) that
+// reaches the gateway at gw.
+func ompProviderAt(gw, version string) ompProviderEntry {
+	takesMax := ompTakesMax(version)
 	ms := []ompModel{}
 	for _, m := range magpieModels("omp") {
 		e := ompModel{ID: m.ID, Name: m.Name, Context: m.Context, MaxTokens: maxTokens(m)}
@@ -400,7 +434,7 @@ func ompProvider() ompProviderEntry {
 		case slices.Contains(m.APIs, string(provider.Responses)):
 			e.API = "openai-responses"
 		case slices.Contains(m.APIs, string(provider.Anthropic)):
-			e.API, e.BaseURL = "anthropic-messages", gateway.URL()
+			e.API, e.BaseURL = "anthropic-messages", gw
 			mode = "budget"
 			if gateway.AdaptiveThinking(m.ID) {
 				mode = "anthropic-adaptive"
@@ -417,10 +451,14 @@ func ompProvider() ompProviderEntry {
 		}
 		var efforts []string
 		for _, x := range ompEfforts { // in omp's order
-			// a model's efforts stop at xhigh (omp 16.3.5 turns the whole
-			// file away over a max): a model whose top is max offers xhigh,
-			// which the gateway fits to max
-			if x == "xhigh" && slices.Contains(m.Efforts, "max") || x != "max" && slices.Contains(m.Efforts, x) {
+			// before omp 16.4.0 a model's efforts stop at xhigh (16.3.5
+			// turns the whole file away over a max): a model whose top is
+			// max offers xhigh, which the gateway fits to max when the
+			// model has no xhigh of its own
+			if x == "max" && !takesMax {
+				continue
+			}
+			if slices.Contains(m.Efforts, x) || x == "xhigh" && !takesMax && slices.Contains(m.Efforts, "max") {
 				efforts = append(efforts, x)
 			}
 		}
@@ -430,7 +468,7 @@ func ompProvider() ompProviderEntry {
 		}
 		ms = append(ms, e)
 	}
-	return ompProviderEntry{BaseURL: gatewayV1(), API: "openai-completions", Auth: "none",
+	return ompProviderEntry{BaseURL: gw + "/v1", API: "openai-completions", Auth: "none",
 		Headers: map[string]string{"User-Agent": "omp"}, Models: ms}
 }
 
@@ -475,7 +513,7 @@ func ompOwnOptions(modelsFile, cur string) []Option {
 	}
 	at := map[string]int{}
 	var out []Option
-	for _, o := range append(opts, ownOptions("", cur)...) {
+	for _, o := range append(opts, ownOptionsFrom(ompRegistry, "", cur)...) {
 		i, dup := at[o.Value]
 		if !dup {
 			at[o.Value] = len(out)

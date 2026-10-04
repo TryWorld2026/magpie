@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -24,10 +25,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/source"
 )
 
 // Site is magpie's home; its /api/latest is the update feed.
@@ -66,16 +70,20 @@ var client = &http.Client{Timeout: 10 * time.Minute, Transport: proxied()}
 func proxied() http.RoundTripper {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.Proxy = netproxy.Func
-	return t
+	return netproxy.Dispatch(t)
 }
 
-// Latest asks the feed for the newest release.
-func Latest(ctx context.Context) (*Release, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", Feed(), nil)
+// Latest asks the feed for the newest release, its notes in English.
+func Latest(ctx context.Context) (*Release, error) { return LatestIn(ctx, "") }
+
+// LatestIn asks the feed for the newest release, its notes in lang (see
+// InLang): the app's language, which What's new follows.
+func LatestIn(ctx context.Context, lang string) (*Release, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", withLang(Feed(), lang), nil)
 	if err != nil {
 		return nil, err
 	}
-	res, err := client.Do(req)
+	res, err := source.Do(client, req)
 	if err != nil {
 		return nil, err
 	}
@@ -90,6 +98,7 @@ func Latest(ctx context.Context) (*Release, error) {
 	if parse(r.Version) == nil {
 		return nil, fmt.Errorf("update feed: no version")
 	}
+	r.Notes = InLang(r.Notes, lang)
 	return &r, nil
 }
 
@@ -273,8 +282,8 @@ func team(ctx context.Context, app string) string {
 // in its cache, to be moved in with the administrator's password.
 func stageDir(dir string) string {
 	if !Writable(dir) {
-		if cache, err := os.UserCacheDir(); err == nil {
-			return filepath.Join(cache, "magpie", "update")
+		if cache, err := appdir.SystemCache(); err == nil {
+			return filepath.Join(cache, "update")
 		}
 	}
 	return filepath.Join(dir, ".magpie-update")
@@ -367,6 +376,7 @@ func StageBinary(ctx context.Context, rel *Release) (string, error) {
 // InstallBinary swaps a staged binary in for exe, the running one, which
 // keeps going until it exits.
 func InstallBinary(staged, exe string) error {
+	var old string
 	if runtime.GOOS == "windows" {
 		// A running .exe cannot be overwritten, but it can be moved aside.
 		// What the last update moved aside may still be running too (a
@@ -374,17 +384,74 @@ func InstallBinary(staged, exe string) error {
 		// replaced then: this one goes beside it, under a name of its own.
 		// The download is kept, for another try.
 		RemoveOld(exe)
-		if err := os.Rename(exe, oldName(exe)); err != nil {
-			return fmt.Errorf("couldn't move %s aside to put the new version in: %w", filepath.Base(exe), err)
+		var err error
+		if old, err = moveAside(exe); err != nil {
+			return err
 		}
 	}
 	if err := os.Rename(staged, exe); err != nil {
-		if !NeedsAdmin(err) { // kept for InstallBinaryAsAdmin
+		if old != "" {
+			if restoreErr := os.Rename(old, exe); restoreErr != nil {
+				return errors.Join(err, fmt.Errorf("couldn't restore %s from %s: %w", filepath.Base(exe), old, restoreErr))
+			}
+		} else if !NeedsAdmin(err) { // kept for InstallBinaryAsAdmin
 			os.Remove(staged)
 		}
 		return err
 	}
 	return nil
+}
+
+// renameFile is os.Rename; tests make it fail.
+var renameFile = os.Rename
+
+// asideWaits are the pauses between tries at moving the running exe aside:
+// an antivirus scanning it or a sync client (OneDrive) reading it holds it
+// open, which Windows won't rename under, for a moment, and lets go.
+var asideWaits = []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond, 800 * time.Millisecond, 1500 * time.Millisecond}
+
+// Windows' errors for a file another program holds open without letting
+// it be renamed.
+const (
+	errSharingViolation syscall.Errno = 32
+	errLockViolation    syscall.Errno = 33
+)
+
+// moveAside moves the running exe out of the way of the new version, under
+// a name of its own, trying again for a few seconds while something has it
+// open. What it says when it can't is the reason and what to do: the error
+// is shown as is in the version row. On success it returns the actual name,
+// so a failed installation can put the running exe back.
+func moveAside(exe string) (string, error) {
+	var err error
+	for i := 0; ; i++ {
+		old := oldName(exe)
+		if err = renameFile(exe, old); err == nil {
+			return old, nil
+		}
+		if errors.Is(err, fs.ErrNotExist) || i == len(asideWaits) {
+			break
+		}
+		if i == 0 {
+			os.Chmod(exe, 0o755) // a read-only exe: the attribute off
+		}
+		time.Sleep(asideWaits[i])
+	}
+	why := err.Error()
+	var le *os.LinkError
+	if errors.As(err, &le) {
+		why = le.Err.Error() // the paths are known; the reason is what's new
+	}
+	var hint string
+	switch {
+	case errors.Is(err, errSharingViolation), errors.Is(err, errLockViolation):
+		hint = "another program has it open (often an antivirus or OneDrive): let magpie through it and restart to update again, or download the new version and put it in place of this one"
+	case errors.Is(err, fs.ErrPermission):
+		hint = "Windows doesn't let magpie change files in " + filepath.Dir(exe) + " (an antivirus' folder protection, or the folder's permissions): let magpie through, or download the new version and put it in place of this one"
+	default:
+		hint = "download the new version and put it in place of this one"
+	}
+	return "", fmt.Errorf("couldn't move %s aside to put the new version in: %s; %s", filepath.Base(exe), strings.TrimRight(why, ". 。"), hint)
 }
 
 // oldName is where a running exe is moved aside to: exe.old, or when
@@ -524,16 +591,22 @@ func download(ctx context.Context, a Asset, path string) error {
 }
 
 func fetch(ctx context.Context, a Asset, path string) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", a.URL, nil)
+	// through a mirror when one is given (mirror.go): the hash checked
+	// below is still the feed's
+	u := mirrored(mirrorOf(ctx), a.URL)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return err
 	}
-	res, err := client.Do(req)
+	res, err := source.Do(client, req)
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
+		if u != a.URL {
+			return fmt.Errorf("download %s through the mirror %s: %s", filepath.Base(path), strings.TrimSuffix(u, a.URL), res.Status)
+		}
 		return fmt.Errorf("download %s: %s", filepath.Base(path), res.Status)
 	}
 	f, err := os.Create(path)
@@ -556,6 +629,9 @@ func fetch(ctx context.Context, a Asset, path string) error {
 	}
 	if err == nil && !strings.EqualFold(hex.EncodeToString(h.Sum(nil)), a.SHA256) {
 		err = fmt.Errorf("%s does not match its checksum", filepath.Base(path))
+		if u != a.URL {
+			err = fmt.Errorf("%s from the mirror %s does not match its checksum from %s; not installed", filepath.Base(path), strings.TrimSuffix(u, a.URL), Site)
+		}
 	}
 	if err != nil {
 		os.Remove(path)

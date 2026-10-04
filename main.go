@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/imagemcp"
 	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/profile"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/sessions"
@@ -69,33 +71,43 @@ const usage = `magpie — one place to pick every agent's model
                                   which models an agent is shown: families (magpie provider/group set <id> family=…)
   magpie search [add <api> <key>|rm <api>]   Tavily, Brave, Exa, Firecrawl or SearXNG for web search when no provider can search
   magpie groups                   routing groups: several models agents pick as one, group/<id>
-  magpie group add <name> models=<m1>,<m2> [routing=smart|order|rotate|usage] [stays=auto|session|turn|off]
+  magpie group add <name> models=<m1>,<m2> [routing=smart|order|rotate|usage|pace] [stays=auto|session|turn|off]
   magpie group <id> | set <id> k=v… | rm <id>   show, change or remove one (magpie group help for more)
   magpie accounts [agent] [--json]  every subscription magpie knows, with each one's allowance used and when it resets
   magpie accounts add <agent>     sign in to one more Claude, ChatGPT or Google (Gemini CLI, Antigravity) subscription
+  magpie accounts add copilot [--host <name>.ghe.com]   one more Copilot account, on github.com or an enterprise's GHE.com
   magpie accounts switch <agent> <email>   sign the agent in to another of them
   magpie accounts refresh         renew the saved ChatGPT sign-ins now (the gateway does it daily)
   magpie accounts checkin         WorkBuddy's daily check-in (签到) for each WorkBuddy account, now (Settings can do it daily)
   magpie accounts project <gemini|antigravity> <email> <project>   the Google Cloud project a Google account's requests go to
   magpie plugin [add <package>|rm|update|on|off|login <provider>|logout <provider>]
-                                  OpenCode provider plugins: subscriptions signed in to, and served, through a plugin
+                                  OpenCode provider plugins and pi packages: subscriptions signed in to, and served, through a plugin
   magpie plugin move|migrate <subscription>   run a built-in subscription's accounts on its community plugin
   magpie plugin move-back|unmigrate <subscription>   go back to the built-in, with its accounts
 
   magpie serve                    run the gateway alone (the app runs it too)
   magpie healthcheck              exit 0 when the gateway answers (a container's HEALTHCHECK)
+  magpie gateway-key list|add <name>|rotate <id>|remove <id>   manage the keys clients use to call a shared gateway
+  magpie gateway-key limit <id> [off|day|week|month --tokens N --cost USD --cache-reads]   a key's own limit, and what it used
   magpie mcp image                the image and video generation MCP server an agent is given from the library (stdio)
-  magpie usage [today|7d|30d|all] tokens and cost per agent and model (30d)
-  magpie usage --csv [today|7d|30d|all]   every request as CSV: the model asked for, sent and served, tokens, cost, time, status
+  magpie usage [today|7d|30d|all] tokens and cost per agent, model and subscription account (30d)
+  magpie usage --csv [--account <name>] [today|7d|30d|all]   every request as CSV (or one account's): the model asked for, sent and served, tokens, cost, time, status, account
   magpie sessions [--model <m>] [--folder <f>] [--json]   the latest Claude Code, Codex, OpenCode and Pi sessions, with what each cost
   magpie sessions --days N|today|all [--model <m>] [--folder <f>] [--json]
                                   what every session spent, day by day, with the top models and folders (7 days)
   magpie quota [<provider>] [--json]  what is left of every subscription, plan and key balance
+  magpie quota wait <provider|account> [--timeout <d>] [--quiet]
+                                  block until that subscription (any of its accounts) or account has allowance again
   magpie sync                     refresh the model catalog and vendor model lists
   magpie agents                   list every supported agent
-  magpie update [check]           install the newest release (check: only say if there is one)
+  magpie update [check] [--proxy <url>] [--mirror <prefix>]
+                                  install the newest release (check: only say if there is one); --proxy: an
+                                  http(s):// or socks5:// proxy for it; --mirror: a GitHub download mirror put
+                                  before the github.com URL (none unless given; still checked against usemagpie.ai's SHA-256)
+  magpie update mirror [<prefix>|off]  the mirror every update, the app's own too, is downloaded through
+  magpie update auto [on|off] [30m|1h|6h|24h]  whether the app looks for updates by itself, and how often (6h)
 
-agents: claude (cc), codex, gemini, opencode (oc), mimocode, pi, goose, cursor, copilot, crush
+agents: claude (cc), codex, gemini, opencode (oc), mimocode, pi, goose, cursor, zed, copilot, crush
 `
 
 var (
@@ -110,20 +122,45 @@ func main() {
 		// Claude Code, signing in for magpie, handed over the page to open
 		return
 	}
+	endProbesOnSignal()
 	gateway.Version = version
 	netproxy.Install()
 	update.GUI = hasGUI
 	err := run(os.Args[1:])
+	proc.EndProbes() // a CLI still being asked something isn't left to init
 	sessions.Saved() // the session index kept, for the next run
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "magpie:", err)
-		os.Exit(1)
+		// a command with exit codes of its own (quota wait) says which
+		code := 1
+		var e exitError
+		if errors.As(err, &e) {
+			code = e.code
+		}
+		if msg := err.Error(); msg != "" {
+			fmt.Fprintln(os.Stderr, "magpie:", msg)
+		}
+		os.Exit(code)
 	}
 }
+
+// runTUI runs the TUI, which quits on Ctrl+C and SIGTERM itself once it
+// has started; it asks CLIs first, and a signal then ends those.
+func runTUI() error {
+	return tuiRun(ownSignals)
+}
+
+// tuiRun is tui.Run; a var so tests can stand in for it.
+var tuiRun = tui.Run
 
 func run(args []string) error {
 	if len(args) > 0 && args[0] == "healthcheck" {
 		return healthcheck() // every few seconds in a container: nothing else
+	}
+	if len(args) == 2 && args[0] == agent.DryRunArg {
+		// an agent disconnected on a copy of its files under a temporary
+		// home, for the Agents page to show what disconnecting changes
+		// (agent.DisconnectPreview)
+		return agent.DryRun(args[1])
 	}
 	makeDirs()
 	settings.Migrate()
@@ -139,6 +176,10 @@ func run(args []string) error {
 	gateway.StandIn = agent.StandIn
 	// the setup kept the same on every computer, by whichever serves
 	gateway.WhileServing = append(gateway.WhileServing, davsync.Run)
+	// and dsh's patch lists, which dsh reads live: a route left behind by
+	// something else writing the file fails every session there until
+	// magpie writes its own list again
+	gateway.WhileServing = append(gateway.WhileServing, agent.KeepDshWired)
 	// and the request archive, when it is on, goes to the bucket sync is to
 	gateway.ArchiveBucket = func() (gateway.Putter, bool) {
 		if b, ok := davsync.S3Bucket(); ok {
@@ -150,7 +191,7 @@ func run(args []string) error {
 		if hasGUI {
 			return runGUI(true, "")
 		}
-		return tui.Run()
+		return runTUI()
 	}
 	// a magpie:// link the system handed over (Windows, Linux): the app
 	// opens it for the user to confirm
@@ -162,7 +203,7 @@ func run(args []string) error {
 	}
 	switch args[0] {
 	case "tui":
-		return tui.Run()
+		return runTUI()
 	case "web":
 		return webCmd(args[1:])
 	case "app", "gui":
@@ -228,6 +269,8 @@ func run(args []string) error {
 		return groupCmd(args)
 	case "serve":
 		return serve()
+	case "gateway-key":
+		return gatewayKeys(args)
 	case "accounts", "account":
 		return accountsCmd(args)
 	case "usage":

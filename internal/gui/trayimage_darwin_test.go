@@ -82,6 +82,63 @@ func TestTrayImage(t *testing.T) {
 	}
 }
 
+// Hit-testing follows the image layout for both logo and plain cells.
+func TestTrayImageCellAt(t *testing.T) {
+	bird, err := os.ReadFile("tray.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cells, _, _ := trayUsageView(trayCards(), time.Now(), false)
+	const h = 22.0
+	_, w, _ := trayImagePNG(cells, bird, h, 2, false, false)
+	width := float64(w) / 2
+	if at := trayImageCellAt(cells, h, 5); at != -1 {
+		t.Errorf("a click by the bird says cell %d", at)
+	}
+	if at := trayImageCellAt(cells, h, width-0.5); at != len(cells)-1 {
+		t.Errorf("a click at the image's end says cell %d, want %d", at, len(cells)-1)
+	}
+	if at := trayImageCellAt(cells, h, width+1); at != -1 {
+		t.Errorf("a click past the image says cell %d", at)
+	}
+	if at := trayImageCellAt(nil, h, 5); at != -1 {
+		t.Errorf("no cells: cell %d", at)
+	}
+	from := make([]float64, len(cells))
+	for i := range cells {
+		from[i] = trayImageCellStart(cells, h, i)
+		if from[i] <= h || from[i] >= width {
+			t.Fatalf("cell %d begins at %g of %g", i, from[i], width)
+		}
+		if i > 0 && from[i] <= from[i-1] {
+			t.Fatalf("cell %d begins at %g, before the one before it at %g", i, from[i], from[i-1])
+		}
+	}
+	for i := range cells {
+		if at := trayImageCellAt(cells, h, from[i]+0.5); at != i {
+			t.Errorf("a click at %g (cell %d's start) says cell %d", from[i], i, at)
+		}
+		if i+1 < len(cells) {
+			if at := trayImageCellAt(cells, h, from[i+1]-0.5); at != i {
+				t.Errorf("a click at %g (before cell %d) says cell %d", from[i+1]-0.5, i+1, at)
+			}
+		}
+	}
+	if s := trayImageCellStart(cells, h, len(cells)); s != -1 {
+		t.Errorf("a cell past them all begins at %g", s)
+	}
+	// logos off (Settings): the same walk, the digits alone
+	plain := trayPlain(cells)
+	for i := range plain {
+		if s := trayImageCellStart(plain, h, i); s <= h || s >= width {
+			t.Errorf("plain cell %d begins at %g of %g", i, s, width)
+		}
+	}
+	if at := trayImageCellAt(plain, h, trayImageCellStart(plain, h, 0)+0.5); at != 0 {
+		t.Errorf("the first plain cell's click says cell %d", at)
+	}
+}
+
 // inkIn counts the pixels in r drawn in the bar's text colour.
 func inkIn(img image.Image, r image.Rectangle, dark bool) int {
 	n := 0
@@ -98,4 +155,104 @@ func inkIn(img image.Image, r image.Rectangle, dark bool) int {
 		}
 	}
 	return n
+}
+
+// A coloured logo is drawn as a template image is, in the bar's text colour
+// alone (the user: 去掉色彩满足 tray icon 样式): no colour left in it, and
+// Codex's white glyph on its blue tile is cut out of a tile of ink.
+func TestTrayImageMonoLogos(t *testing.T) {
+	bird, err := os.ReadFile("tray.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"codex-color", "claude-color", "gemini-color", "zcode", "alma"} {
+		icon, _ := trayIconFile(name)
+		for _, dark := range []bool{false, true} {
+			b, _, _ := trayImagePNG([]trayCell{{Icon: icon, Rows: []string{"5%", "7%"}}}, bird, 22, 2, dark, true)
+			img, err := png.Decode(bytes.NewReader(b))
+			if err != nil {
+				t.Fatal(err)
+			}
+			logo := image.Rect(48, 8, 48+28, 36)
+			for y := logo.Min.Y; y < logo.Max.Y; y++ {
+				for x := logo.Min.X; x < logo.Max.X; x++ {
+					r, g, b, _ := img.At(x, y).RGBA()
+					if max(r, g, b)-min(r, g, b) > 0x1800 {
+						t.Fatalf("%s, dark %v: colour at %d,%d: %x %x %x", name, dark, x, y, r>>8, g>>8, b>>8)
+					}
+				}
+			}
+			ink := inkIn(img, logo, dark)
+			if ink < 40 {
+				t.Errorf("%s, dark %v: the logo has %d px of ink", name, dark, ink)
+			}
+			if name == "codex-color" && ink > 28*28*85/100 {
+				t.Errorf("codex, dark %v: %d px of ink, its glyph not cut out", dark, ink)
+			}
+		}
+	}
+}
+
+// Each logo is as large as the next in the menu bar (the user: tray 上的
+// provider icon 大小不一致), whatever margin its file has round it: its ink
+// spans 12-14pt of the 14pt box, a solid tile the lower end.
+func TestTrayImageLogoSizes(t *testing.T) {
+	bird, err := os.ReadFile("tray.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"codex-color", "claude-color", "gemini-color", "zcode", "alma", "kimi", "openai", "deepseek-color", "qwen-color", "minimax-color"} {
+		icon, mono := trayIconFile(name)
+		b, _, _ := trayImagePNG([]trayCell{{Icon: icon, Mono: mono, Rows: []string{"5%", "7%"}}}, bird, 22, 2, false, false)
+		img, err := png.Decode(bytes.NewReader(b))
+		if err != nil {
+			t.Fatal(err)
+		}
+		x0, y0, x1, y1 := 99, 99, -1, -1
+		for y := 0; y < 44; y++ {
+			for x := 46; x < 78; x++ {
+				if _, _, _, a := img.At(x, y).RGBA(); a > 0x4000 {
+					x0, y0, x1, y1 = min(x0, x), min(y0, y), max(x1, x), max(y1, y)
+				}
+			}
+		}
+		if side := max(x1-x0, y1-y0) + 1; side < 24 || side > 29 {
+			t.Errorf("%s spans %d px of a 28 px box", name, side)
+		}
+	}
+}
+
+// The native callback must carry the account ID before the drawing is freed
+// or a refresh changes the order, including the logo-free layout.
+func TestTrayImageClickIdentity(t *testing.T) {
+	prior := onTrayCellClick
+	t.Cleanup(func() { onTrayCellClick = prior })
+	clicked := make(chan string, 1)
+	onTrayCellClick = func(id string) { clicked <- id }
+	cards := trayCards()
+	cards[1].User = "a\"b\\c@例子.test"
+	cells, _, _ := trayUsageView(cards, time.Now(), false)
+	for _, layout := range [][]trayCell{cells, trayPlain(cells)} {
+		if trayImageClickAt(layout, 22, 5, 0) {
+			t.Fatal("bird intercepted")
+		}
+		x := trayImageCellStart(layout, 22, 1) + 1
+		// AppKit's Shift, Control, Option and Command modifier bits.
+		for _, modifiers := range []uint64{1 << 17, 1 << 18, 1 << 19, 1 << 20} {
+			if trayImageClickAt(layout, 22, x, modifiers) {
+				t.Fatal("modified click intercepted")
+			}
+		}
+		if !trayImageClickAt(layout, 22, x, 0) {
+			t.Fatal("cell missed")
+		}
+		select {
+		case id := <-clicked:
+			if id != trayCardID(cards[1]) {
+				t.Fatalf("clicked %q", id)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("native click callback lost")
+		}
+	}
 }

@@ -47,7 +47,7 @@ const words = {
 };
 
 function serve(lang, posts) {
-  const state = () => ({ agents: [{ id: "claude", name: "Claude Code", path: "/test/claude", fields: [{ key: "model", label: "model", value: "magpie/other/m1", options }] }],
+  const state = () => ({ agents: [{ id: "claude", name: "Claude Code", path: "/test/claude", wired: true, fields: [{ key: "model", label: "model", value: "magpie/other/m1", options }] }],
     profiles: [], unlisted, settings: { lang, theme: "light" } });
   const groups = { groups: [], pools: [], deciders: [], models: [{ id: "hunyuan/hy4", name: "hy4", provider: "hunyuan", providerName: "Hunyuan", icon: "generic" }] };
   return async (r) => {
@@ -101,7 +101,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // the window's picker: hy3 is reached through Mine, picked at a click
       let posts = [];
       let page = await open("http://magpie.test/", posts);
-      const field = page.locator(`${row} .field[data-key="model"]`);
+      // connected: its picker is in its row
+      const field = page.locator(`${row} > .field.ag-start[data-key="model"]`);
       await field.waitFor();
       const view = page.locator("#view-agents");
       await filterFor(page, field, "hy3");
@@ -132,6 +133,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       for (let i = 0; i < 40 && !posts.some((p) => p.path === "/api/groups/save"); i++) await page.waitForTimeout(50);
       const saved = posts.find((p) => p.path === "/api/groups/save")?.body;
       assert.deepEqual(saved?.members, ["hunyuan/hy4"], "a group of hy4 saved");
+      assert.deepEqual(saved.fast, [], "a model shortcut starts at standard speed");
       assert.equal(saved.id, "hy4");
 
       // the provider's editor names the model in no group under the tick

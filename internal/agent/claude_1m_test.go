@@ -17,6 +17,7 @@ import (
 func TestClaude1MMarked(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	if err := provider.Save(provider.Provider{ID: "v", Name: "V", Chat: "https://example.test/v1", Key: "k",
@@ -38,7 +39,7 @@ func TestClaude1MMarked(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	names := []string{"model", "env.ANTHROPIC_MODEL", "env.ANTHROPIC_SMALL_FAST_MODEL", "env.CLAUDE_CODE_SUBAGENT_MODEL"}
+	names := []string{"model", "env.ANTHROPIC_SMALL_FAST_MODEL"}
 	for _, tier := range claudeTiers {
 		names = append(names, "env."+tierEnv(tier))
 	}
@@ -53,7 +54,7 @@ func TestClaude1MMarked(t *testing.T) {
 	}
 	// a tier set on its own is marked too; a 200K one is not
 	set("model", "v/small")
-	if got := get("env.ANTHROPIC_MODEL"); got != "v/small" {
+	if got := get("model"); got != "v/small" {
 		t.Fatalf("a 200K model got marked: %q", got)
 	}
 	set("haiku", "v/big")

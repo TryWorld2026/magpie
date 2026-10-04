@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"os/signal"
 	"strconv"
 	"strings"
 	"time"
@@ -16,7 +14,7 @@ import (
 )
 
 const pluginUsage = `usage: magpie plugin [list] [--json]
-       magpie plugin add <npm package | path>      install an OpenCode provider plugin (opencode-gemini-auth, ./my-plugin.js)
+       magpie plugin add <npm | git | path>        install an OpenCode provider plugin or a pi package (opencode-gemini-auth, pi-antigravity, github:owner/repo, ./my-plugin.js)
        magpie plugin rm <name>                     remove one
        magpie plugin update                        install the newest version of each
        magpie plugin on|off <name>                 turn one on or off
@@ -25,15 +23,16 @@ const pluginUsage = `usage: magpie plugin [list] [--json]
        magpie plugin move|migrate <subscription>   run a built-in subscription's accounts on its community plugin
        magpie plugin move-back|unmigrate <subscription>   go back to the built-in, with its accounts`
 
-// pluginCmd: `magpie plugin …` — OpenCode's provider plugins, which sign in
-// to a subscription and carry its requests (internal/plugin).
+// pluginCmd: `magpie plugin …` — OpenCode's provider plugins and pi's
+// packages, which sign in to a subscription and carry its requests
+// (internal/plugin).
 func pluginCmd(args []string) error {
 	sub := "list"
 	if len(args) > 1 {
 		sub = args[1]
 	}
 	rest := args[min(len(args), 2):]
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := interruptContext()
 	defer stop()
 	switch sub {
 	case "list", "ls", "--json":
@@ -50,6 +49,8 @@ func pluginCmd(args []string) error {
 			return err
 		}
 		fmt.Println(green.Render("✓"), "added", e.Spec)
+		// a deprecated built-in it serves, not signed in to, is its now
+		provider.HandOver(ctx, false)
 		return listPlugins(ctx, false)
 	case "rm", "remove", "uninstall":
 		if len(rest) != 1 {
@@ -69,6 +70,7 @@ func pluginCmd(args []string) error {
 			return err
 		}
 		fmt.Println(green.Render("✓"), "plugins updated")
+		provider.HandOver(ctx, false)
 		return listPlugins(ctx, false)
 	case "on", "off":
 		if len(rest) != 1 {
@@ -149,7 +151,7 @@ func listPlugins(ctx context.Context, asJSON bool) error {
 			fmt.Println("[]")
 			return nil
 		}
-		fmt.Println("No plugins. Add one: magpie plugin add <npm package | path>")
+		fmt.Println("No plugins. Add one: magpie plugin add <npm package | git repo | path>")
 		return nil
 	}
 	loaded, lerr := plugin.Plugins(ctx)
@@ -177,7 +179,12 @@ func listPlugins(ctx context.Context, asJSON bool) error {
 		case errs[e.Spec] != "":
 			state = "failed: " + errs[e.Spec]
 		}
-		fmt.Printf("%s  %s\n", bold.Render(e.Spec), state)
+		what := bold.Render(e.Spec)
+		// a git repository's package is named by its own package.json
+		if n := plugin.Name(e.Spec); plugin.IsGit(e.Spec) && n != e.Spec {
+			what += " " + muted.Render("("+strings.TrimSpace(n+" "+plugin.Installed(e.Spec))+")")
+		}
+		fmt.Printf("%s  %s\n", what, state)
 		for _, p := range ps {
 			if p.Spec != e.Spec {
 				continue

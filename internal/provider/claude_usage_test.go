@@ -22,7 +22,7 @@ func fakeClaudeUsage(t *testing.T, out *atomic.Value, fail *atomic.Bool) *atomic
 	UsageClaudeVia(func(context.Context) (string, error) {
 		runs.Add(1)
 		if fail != nil && fail.Load() {
-			return "", errors.New("Claude Code: offline")
+			return "", errors.New("Claude Code: network is unreachable")
 		}
 		return out.Load().(string), nil
 	})
@@ -55,7 +55,7 @@ func fakeClaudeUsage(t *testing.T, out *atomic.Value, fail *atomic.Bool) *atomic
 // once an ask, and only for the account Claude Code is signed in to.
 func TestClaudeWindowsAsked(t *testing.T) {
 	var out atomic.Value
-	out.Store("Current session: 40% used · resets Oct 1 at 3:30pm (UTC)\nCurrent week (all models): 10% used · resets Oct 3 at 2pm (UTC)\n")
+	out.Store("Current session: 40% used · resets " + soon(1) + " at 3:30pm (UTC)\nCurrent week (all models): 10% used · resets " + soon(3) + " at 2pm (UTC)\n")
 	var fail atomic.Bool
 	runs := fakeClaudeUsage(t, &out, &fail)
 	ctx := context.Background()
@@ -100,7 +100,7 @@ func TestClaudeWindowsAsked(t *testing.T) {
 		t.Fatalf("ran before its wait: %v %d", err, runs.Load())
 	}
 	age(time.Minute)
-	out.Store("Current session: 55% used · resets Oct 1 at 3:30pm (UTC)\n")
+	out.Store("Current session: 55% used · resets " + soon(1) + " at 3:30pm (UTC)\n")
 	for range 3 {
 		if ws, err = claudeWindows(ctx, "a@x", true); err != nil || len(ws) != 1 || ws[0].Used != 55 || runs.Load() != 2 {
 			t.Fatalf("every: %v %+v %d", err, ws, runs.Load())
@@ -161,6 +161,18 @@ What's contributing to your limits usage?
 	if r, ok := claudeResetTime("3am (UTC)", now); !ok || !r.Equal(time.Date(2026, 10, 2, 3, 0, 0, 0, time.UTC)) {
 		t.Fatalf("time alone: %v %v", r, ok)
 	}
+	// Claude Code 2.1.285 on puts a comma where "at" was (#631)
+	for in, want := range map[string]time.Time{
+		"Oct 9, 2:59pm (UTC)":        time.Date(2026, 10, 9, 14, 59, 0, 0, time.UTC),
+		"Oct 2, 8pm (UTC)":           time.Date(2026, 10, 2, 20, 0, 0, 0, time.UTC),
+		"Jan 2, 9:05am (UTC)":        time.Date(2027, 1, 2, 9, 5, 0, 0, time.UTC),
+		"Jan 2, 2027, 9am (UTC)":     time.Date(2027, 1, 2, 9, 0, 0, 0, time.UTC),
+		"Oct 3, 2pm (Asia/Shanghai)": time.Date(2026, 10, 3, 14, 0, 0, 0, sh),
+	} {
+		if r, ok := claudeResetTime(in, now); !ok || !r.Equal(want) {
+			t.Errorf("%q: %v %v, want %v", in, r, ok, want)
+		}
+	}
 	if _, err := parseClaudeUsage("Error: not logged in", now); err == nil {
 		t.Fatal("nothing told, no error")
 	}
@@ -189,7 +201,7 @@ func TestClaudeWaitRandom(t *testing.T) {
 // it last was; asked, it is run whether it was or not.
 func TestClaudeUsageIdle(t *testing.T) {
 	var out atomic.Value
-	out.Store("Current session: 40% used · resets Oct 1 at 3:30pm (UTC)\n")
+	out.Store("Current session: 40% used · resets " + soon(1) + " at 3:30pm (UTC)\n")
 	runs := fakeClaudeUsage(t, &out, nil)
 	var used atomic.Bool
 	claudeUsedSince = func(time.Time) bool { return used.Load() }
@@ -253,3 +265,7 @@ func TestClaudeUsedSince(t *testing.T) {
 		t.Fatal("not used, with a session just written to")
 	}
 }
+
+// soon is the day n days from now as /usage writes it ("Oct 3"), so a
+// window the tests read hasn't reset whatever day they run.
+func soon(n int) string { return time.Now().UTC().AddDate(0, 0, n).Format("Jan 2") }
