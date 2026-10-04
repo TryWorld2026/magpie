@@ -122,3 +122,19 @@ func TestReasonixPlanDoesNotResetExecutorEffort(t *testing.T) {
 		t.Fatalf("Plan changed Executor effort: %s", got)
 	}
 }
+
+func TestReasonixRestoreWithInitiallyAbsentEnv(t *testing.T) {
+	a, env := reasonixFixture(t, reasonixNativeConfig)
+	if err := os.Remove(env); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Field("planner").Set("magpie/a/pro"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Field("planner").Set(""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(env); !os.IsNotExist(err) {
+		t.Fatal("adapter-created empty env was not removed")
+	}
+}

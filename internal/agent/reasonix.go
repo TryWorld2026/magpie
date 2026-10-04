@@ -212,6 +212,9 @@ func reasonix(home string) *Agent {
 			path string
 			made bool
 		}{{path, state.NewConfig}, {env, state.NewEnv}} {
+			if _, err := os.Stat(f.path); os.IsNotExist(err) {
+				continue
+			}
 			if b, err := edit.Read(f.path); err != nil {
 				return err
 			} else if f.made && len(strings.TrimSpace(string(b))) == 0 {
