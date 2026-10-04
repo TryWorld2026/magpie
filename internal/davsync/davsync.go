@@ -614,8 +614,21 @@ func orEmpty[V any](m map[string]V) map[string]V {
 // take puts from's part in to. The merged bundle is a sync one (BundleVersion):
 // its per-part markers, not the whole-bundle Keys bit, say which part
 // carries credentials, so a keyed providers upload no longer tells a reader
-// the settings and the library came with keys too.
+// the settings and the library came with keys too. If an older writer drops
+// those markers, readers fall back to Keys even if the version stays 2.
 func take(to *backup.Bundle, from backup.Bundle, part string) {
+	// Preserve every legacy part's scope before a providers upload changes
+	// Keys for older readers. An untouched nil marker would otherwise inherit
+	// that new value and turn a redaction into a credential-bearing update.
+	if to.ProvidersKeys == nil {
+		to.ProvidersKeys = backup.Flag(to.Keys)
+	}
+	if to.SettingsKeys == nil {
+		to.SettingsKeys = backup.Flag(to.Keys)
+	}
+	if to.LibraryKeys == nil {
+		to.LibraryKeys = backup.Flag(to.Keys)
+	}
 	switch part {
 	case "providers":
 		keys := from.Keys || (from.ProvidersKeys != nil && *from.ProvidersKeys)

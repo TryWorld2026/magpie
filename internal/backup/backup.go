@@ -119,7 +119,8 @@ func Flag(keys bool) *bool { return &keys }
 // scopedKeys is whether a part's credentials are in the bundle: the part's
 // own marker when the bundle carries one — a sync writes it for every part
 // it merges — and the whole-bundle bit for a whole collect or an older
-// file, which have no per-part ones.
+// file, which have no per-part ones. An older writer can also drop the markers
+// from a v2 file, so a version number alone never implies a credential scope.
 func (b Bundle) scopedKeys(part string) bool {
 	var own *bool
 	switch part {
@@ -463,14 +464,15 @@ func Restore(b Bundle, parts Parts) (Result, error) {
 		}
 	}
 	if parts.Library && b.Library != nil {
-		lib := b.Library
-		if !b.scopedKeys("library") { // the servers' keys kept here stay
-			have, err := library.Collect()
-			if err != nil {
-				return r, err
-			}
-			lib = lib.WithSecrets(have, Secret)
+		// Even a keyed uploader can carry a redaction it downloaded and never
+		// held a value for. Fill blanks from this computer at apply time: the
+		// remote may never have held its private token. Nonempty replacements
+		// and removed entries still take effect.
+		have, err := library.Collect()
+		if err != nil {
+			return r, err
 		}
+		lib := b.Library.WithSecrets(have, Secret)
 		res, err := library.Put(lib)
 		if err != nil {
 			return r, fmt.Errorf("the library: %w", err)

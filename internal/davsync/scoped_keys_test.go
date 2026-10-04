@@ -133,6 +133,23 @@ func TestProviderKeysPreserveOtherSecretsSync(t *testing.T) {
 			if !got.Keys || !reflect.DeepEqual(got.Library, initial.Library) || !reflect.DeepEqual(got.Settings, initial.Settings) {
 				t.Error("a keyed providers upload left the whole-bundle bit an older reader needs, or changed unselected parts")
 			}
+			// Join immediately after that upload, before any settings upload
+			// has written an explicit settingsKeys marker. A different theme
+			// ensures the redacted settings are actually applied on this peer.
+			use(newComputer(t))
+			private("d")
+			different := settings.Load()
+			different.Theme = "light"
+			if err := settings.Save(different); err != nil {
+				t.Fatal(err)
+			}
+			if err := Configure(cfg); err != nil {
+				t.Fatal(err)
+			}
+			now()
+			if got := settings.Load(); got.Theme != "dark" || got.GitHubToken != "fixture-d-github" {
+				t.Error("joining immediately after a providers-only upload cleared D's private GitHub token")
+			}
 
 			use(a)
 			now()
