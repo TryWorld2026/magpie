@@ -1742,6 +1742,22 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			}
 			continue
 		}
+		if !last && hw.failed() && hw.turnedAway {
+			// another account or model is asked what this one was turned
+			// away from, and this one isn't set aside: Antigravity refused
+			// the request, whatever quota the account has left, so nothing
+			// is wrong with it and no usage is asked again (#666)
+			try.Fail = failRefused
+			s.trace.update(tr, func(t *Route) {
+				t.Tries[len(t.Tries)-1] = try
+				if call.To != "" {
+					t.Usage = append(t.Usage, routeUsage(call.Provider, c.model, call.Usage)...)
+				}
+			})
+			skipped = append(skipped, c.label()+": "+call.Error)
+			matesFirst(cands[i+1:], c)
+			continue
+		}
 		if c.p.Account != nil && !hw.passing && hw.code() >= 400 && hw.code() < 500 && modelTakes(c, sent) {
 			if takes, ok := effortRefused(hw.errBody(), sent); ok {
 				// the account's plan doesn't take the level, which the
@@ -2169,6 +2185,15 @@ func lastUserText(from provider.Protocol, body []byte) string {
 func markOpenRouterSharedPool(w http.ResponseWriter) {
 	if h, ok := w.(*holdWriter); ok {
 		h.sharedPool = true
+	}
+}
+
+// markAntigravityTurnsAway keeps in the held attempt that the account was
+// asked with the system prompt Antigravity turns away, so a failure on it
+// isn't held against the account.
+func markAntigravityTurnsAway(w http.ResponseWriter) {
+	if h, ok := w.(*holdWriter); ok {
+		h.turnedAway = true
 	}
 }
 
@@ -3248,8 +3273,13 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 	if res.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 		msg := p.Explain(p.Name+": "+provider.APIError(b, res.Status), res.StatusCode, b)
-		if res.StatusCode == http.StatusTooManyRequests && accountAgent(p) == "antigravity" && antigravityTurnsAway(request.System) {
-			msg += " — " + antigravityTurnedAwayHint
+		if accountAgent(p) == "antigravity" && antigravityTurnsAway(request.System) {
+			if res.StatusCode == http.StatusTooManyRequests {
+				msg += " — " + antigravityTurnedAwayHint
+			}
+			// not gated on the status: the refusal also arrives as the
+			// reply's own error event, and is as little about the quota
+			markAntigravityTurnsAway(w)
 		}
 		if p.Preset == "openrouter" && openRouterSharedPool(b) {
 			markOpenRouterSharedPool(w)
@@ -3328,6 +3358,10 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 			// an agent told it tries again rather than end its turn
 			failed = p.Name + ": " + emptyReply
 			enc.event(Event{Kind: KError, Text: failed})
+		}
+		if failed != "" && accountAgent(p) == "antigravity" && antigravityTurnsAway(request.System) {
+			// the same refusal as the 429's, said inside the reply
+			markAntigravityTurnsAway(w)
 		}
 		if failed == "" {
 			for _, ev := range kept {

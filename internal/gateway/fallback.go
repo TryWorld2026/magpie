@@ -842,6 +842,11 @@ type holdWriter struct {
 	failMsg    string
 	sharedPool bool // an OpenRouter upstream pool rejected this attempt
 
+	// turnedAway: the account is asked with the system prompt Antigravity
+	// answers with a 429 whatever quota it has left — Claude Code's, its
+	// Agent SDK's — so the account isn't at fault and doesn't rest (#666)
+	turnedAway bool
+
 	// refused: the vendor's safety filter ended the reply before any of it
 	// was said — Anthropic's stop_reason "refusal", OpenAI's content_filter
 	// — which another account or model may answer (#248)
