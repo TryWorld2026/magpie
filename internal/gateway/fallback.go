@@ -820,6 +820,30 @@ func matesFirst(left []candidate, c candidate) {
 	copy(left, append(mates, others...))
 }
 
+// matesLast puts last, of the candidates left, the other keys or accounts
+// of the member c is of: what turns one of them away is in the request, so
+// it turns them all away the same, and the group is better spent on a
+// member that answers (#666). Antigravity refuses Claude Code's and its
+// Agent SDK's system prompt whichever account is asked.
+func matesLast(left []candidate, c candidate) {
+	mate := func(x candidate) bool {
+		if x.p.ID != c.p.ID || x.model != c.model || x.effort != c.effort || x.who() == c.who() {
+			return false
+		}
+		_, resting := restOf(x.restKey())
+		return !resting
+	}
+	var mates, others []candidate
+	for _, x := range left {
+		if mate(x) {
+			mates = append(mates, x)
+		} else {
+			others = append(others, x)
+		}
+	}
+	copy(left, append(others, mates...))
+}
+
 // holdWriter keeps an error reply back while another provider may still
 // answer: headers and body wait until release, or are dropped for the next
 // try. Anything else goes straight through — but for a stream, only once

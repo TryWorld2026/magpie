@@ -1743,10 +1743,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			continue
 		}
 		if !last && hw.failed() && hw.turnedAway {
-			// another account or model is asked what this one was turned
-			// away from, and this one isn't set aside: Antigravity refused
-			// the request, whatever quota the account has left, so nothing
-			// is wrong with it and no usage is asked again (#666)
+			// another member may answer what this account was turned away
+			// from, and this one isn't set aside: Antigravity refused the
+			// request, whatever quota the account has left, so nothing is
+			// wrong with it and no usage is asked again (#666). Its own
+			// mates are asked last, not first: they carry the same system
+			// prompt, so each is turned away just the same before the group
+			// reaches a member that answers
 			try.Fail = failRefused
 			s.trace.update(tr, func(t *Route) {
 				t.Tries[len(t.Tries)-1] = try
@@ -1755,7 +1758,25 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				}
 			})
 			skipped = append(skipped, c.label()+": "+call.Error)
-			matesFirst(cands[i+1:], c)
+			matesLast(cands[i+1:], c)
+			if call.To != "" {
+				rec := usage.Record{RouteID: tr.ID, Time: began, Agent: call.Agent, Via: call.Via, Provider: call.Provider, Host: where, Model: c.model,
+					ProviderKeyID: providerKeyID, ProviderKeyName: providerKeyName, ProviderAccount: providerAccount,
+					Requested: call.Model, Served: call.Usage.Served,
+					Input: call.Usage.Input, Output: call.Usage.Output, CacheRead: call.Usage.CacheRead,
+					CacheWrite: call.Usage.CacheWrite, Reasoning: call.Usage.Reasoning, Effort: sent, Millis: time.Since(began).Milliseconds(), Status: call.Status,
+					TTFT: try.TTFT, FirstText: try.FirstText, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
+					RequestID: call.Usage.RequestID, Endpoint: endpointOf(r, from, call.To), Archive: call.archiveName()}
+				failedWith(&rec, call.Status, call.Error, call.Usage.ErrType)
+				// what this account answered is its refusal, the reply
+				// captured so far being no one's yet
+				refusal := &Call{RequestBody: call.RequestBody, RequestTruncated: call.RequestTruncated, ResponseBody: string(hw.errBody())}
+				if call.otelIn != nil {
+					refusal.otelIn, refusal.otelOut = call.otelIn, hw.errBody()
+				}
+				withBodies(&rec, refusal)
+				appendUsage(r, rec)
+			}
 			continue
 		}
 		if c.p.Account != nil && !hw.passing && hw.code() >= 400 && hw.code() < 500 && modelTakes(c, sent) {
@@ -3273,12 +3294,8 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 	if res.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 		msg := p.Explain(p.Name+": "+provider.APIError(b, res.Status), res.StatusCode, b)
-		if accountAgent(p) == "antigravity" && antigravityTurnsAway(request.System) {
-			if res.StatusCode == http.StatusTooManyRequests {
-				msg += " — " + antigravityTurnedAwayHint
-			}
-			// not gated on the status: the refusal also arrives as the
-			// reply's own error event, and is as little about the quota
+		if res.StatusCode == http.StatusTooManyRequests && accountAgent(p) == "antigravity" && antigravityTurnsAway(request.System) {
+			msg += " — " + antigravityTurnedAwayHint
 			markAntigravityTurnsAway(w)
 		}
 		if p.Preset == "openrouter" && openRouterSharedPool(b) {
@@ -3359,7 +3376,7 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 			failed = p.Name + ": " + emptyReply
 			enc.event(Event{Kind: KError, Text: failed})
 		}
-		if failed != "" && accountAgent(p) == "antigravity" && antigravityTurnsAway(request.System) {
+		if failed != "" && antigravityRefuses(failed) && accountAgent(p) == "antigravity" && antigravityTurnsAway(request.System) {
 			// the same refusal as the 429's, said inside the reply
 			markAntigravityTurnsAway(w)
 		}
