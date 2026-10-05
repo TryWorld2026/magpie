@@ -266,6 +266,42 @@ func TestAntigravityTurnedAwayLeavesItsMatesForLast(t *testing.T) {
 	}
 }
 
+// The refusal also comes said inside the reply: a 200 that opens with the
+// same error event, where the Code Assist decoder keeps only its message.
+// It leaves the account alone as the 429 does, and an error event of any
+// other kind still rests it.
+func TestAntigravityTurnedAwaySaidInsideTheReply(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		rest bool
+	}{
+		{"the refusal", `data: {"error":{"message":"Resource has been exhausted (e.g. check quota)."}}`, false},
+		{"another error", `data: {"error":{"message":"api key not valid"}}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := antigravityTurnedAwayGroup(t, []string{"u@example.com"}, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				io.WriteString(w, sse(tc.body))
+			})
+			if code, out := turnOn(t, s, claudeTurn(claudeCodeSystem)); code != 200 || !strings.Contains(out, "from the other") {
+				t.Fatalf("the turn: %d %s", code, out)
+			}
+			r := lastRoute(s)
+			if len(r.Tries) != 2 || r.Tries[1].Status != 200 {
+				t.Fatalf("the turn: %+v", r.Tries)
+			}
+			_, resting := restOf("antigravity@u@example.com")
+			if resting != tc.rest {
+				t.Fatalf("rests %v, want %v: %+v", resting, tc.rest, r.Tries)
+			}
+			if want := failRefused; !tc.rest && r.Tries[0].Fail != want {
+				t.Fatalf("the refusal said inside the reply: Fail=%q: %+v", r.Tries[0].Fail, r.Tries)
+			}
+		})
+	}
+}
+
 // rests is what rests now, to say it when nothing should.
 func rests() map[string]time.Time {
 	restingUntil.Lock()

@@ -2218,6 +2218,20 @@ func markAntigravityTurnsAway(w http.ResponseWriter) {
 	}
 }
 
+// markAntigravityRefused marks the attempt when what the account said is the
+// refusal Antigravity answers such a system prompt with. said is what the
+// failure said once the status is gone: the 429's body arrives with its 429,
+// and the reply's own error event arrives with 200 from translate and only
+// its message, the Code Assist decoder keeping neither its code nor its
+// status. An error event of any other kind says something else and marks
+// nothing.
+func markAntigravityRefused(w http.ResponseWriter, p provider.Provider, system, said string) {
+	if said == "" || !antigravityRefuses(said) || accountAgent(p) != "antigravity" || !antigravityTurnsAway(system) {
+		return
+	}
+	markAntigravityTurnsAway(w)
+}
+
 // forward sends a request to the provider. On Anthropic's messages, a
 // provider that turns away betas it doesn't know by name (Bedrock's: 400
 // Unexpected value(s) `x` for the `anthropic-beta` header) is asked again
@@ -3376,9 +3390,9 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 			failed = p.Name + ": " + emptyReply
 			enc.event(Event{Kind: KError, Text: failed})
 		}
-		if failed != "" && antigravityRefuses(failed) && accountAgent(p) == "antigravity" && antigravityTurnsAway(request.System) {
+		if failed != "" {
 			// the same refusal as the 429's, said inside the reply
-			markAntigravityTurnsAway(w)
+			markAntigravityRefused(w, p, request.System, failed)
 		}
 		if failed == "" {
 			for _, ev := range kept {
@@ -3403,6 +3417,7 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 		return writeError(w, from, 502, msg), msg
 	}
 	if col.err != "" && !saidAnything(col.res.Parts) {
+		markAntigravityRefused(w, p, request.System, col.err)
 		return writeError(w, from, 502, p.Name+": "+col.err), col.err
 	}
 	if empty && !saidAnything(col.res.Parts) && answersNothing(col.res.Stop) {
