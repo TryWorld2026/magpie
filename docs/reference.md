@@ -117,6 +117,7 @@ line; agents connected to magpie lose it when it quits.
 | Grok Build   | `~/.grok/config.toml` (`$GROK_HOME`) | model, effort |
 | ZCode        | `~/.zcode/v2/config.json`         | provider (magpie's models in ZCode's picker) |
 | WorkBuddy    | `~/.workbuddy/models.json` (`$WORKBUDDY_CONFIG_DIR`) | provider (magpie's models in WorkBuddy's picker) |
+| CodeBuddy Code | `~/.codebuddy/models.json` (`$CODEBUDDY_CONFIG_DIR`), `settings.json` | model (magpie's models in its list; the session model) |
 | T3 Code      | `~/.t3/userdata/settings.json` (`$T3CODE_HOME/userdata`) | provider (a `magpie` provider instance on Claude Code, magpie's models as its custom models) |
 | OpenHanako   | `~/.hanako/provider-catalog.json` + `agents/<id>/config.yaml` (`$HANA_HOME`; its local API while it runs) | model (the primary agent's; magpie's models as a provider) |
 | AtomCode     | `~/.atomcode/config.toml` (`$ATOMCODE_HOME`) | model, effort (a `magpie` provider account, one model table per catalog model as its own sign-in writes) |
@@ -869,10 +870,12 @@ tool leaves that state behind, magpie writes the table back the next time
 it syncs. Signed in to ChatGPT (the sign-in field's default), Codex keeps
 its own provider and sign-in, and magpie's models join its list through
 `openai_base_url`. magpie becomes Codex's provider then only while the
-Codex app holds the account (OpenAI no longer allows it, and it has no
-credits left or is at a spend cap), since the app sends nothing for it, and steps back once the
-account has room again. A window at 100% with credits left doesn't count:
-Codex keeps sending on those. Your ChatGPT sign-in is never touched.
+Codex app holds the account: OpenAI no longer allows it and it has no
+credits left, except a workspace account still within its overage. The
+app sends nothing for a held account, so magpie steps in, and it steps
+back once the account has room again. A window at 100% with credits left
+doesn't count: Codex stays signed in and keeps sending on those. Your
+ChatGPT sign-in is never touched.
 Codex reads its model list at start-up, so restart it after a switch.
 
 **OpenCode, Pi, Crush** get a `magpie` provider entry and `magpie/provider/model`.

@@ -422,7 +422,15 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	go plugin.KeepUpdated(ctx)
 	go plugin.KeepBunUpdated(ctx)
 	// and, when settings say to, keeps the computer awake while agents work
-	go awake.Keep(ctx, func() bool { return settings.Load().KeepAwake }, func() awake.State {
+	go awake.Keep(ctx, func() awake.Level {
+		switch set := settings.Load(); {
+		case !set.KeepAwake:
+			return awake.Off
+		case set.KeepAwakeDisplay:
+			return awake.Display
+		}
+		return awake.System
+	}, func() awake.State {
 		b := s.Busy()
 		return awake.State{Busy: b.Any(), Last: b.Last}
 	})
@@ -3120,7 +3128,9 @@ func (s *Server) markUnfit(providerID, model string, proto provider.Protocol) {
 // the provider says and hasn't turned it away, preferred first: Chat
 // Completions, which every OpenAI-compatible vendor serves alike, except
 // for OpenAI's own models where their makers serve them, whose newest are
-// Responses-first (and some Responses-only).
+// Responses-first (and some Responses-only), and Claude where Anthropic's
+// Messages API is served, which alone keeps its cache_control and
+// thinking (#997).
 func (s *Server) usable(p provider.Provider, model string) []provider.Protocol {
 	apis := p.APIs(model)
 	var out []provider.Protocol
@@ -3131,6 +3141,9 @@ func (s *Server) usable(p provider.Provider, model string) []provider.Protocol {
 	}
 	if p.ResponsesFirst(model) {
 		sort.SliceStable(out, func(i, j int) bool { return out[i] == provider.Responses && out[j] != provider.Responses })
+	}
+	if p.MessagesFirst(model) {
+		sort.SliceStable(out, func(i, j int) bool { return out[i] == provider.Anthropic && out[j] != provider.Anthropic })
 	}
 	return out
 }
