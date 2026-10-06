@@ -13,7 +13,7 @@ import (
 // writes what the wrapper still holds. Nothing masked, nothing wrapped.
 func redacted(w http.ResponseWriter, body []byte) (http.ResponseWriter, []byte, func()) {
 	o := redactionOptions()
-	if !o.Secrets && !o.Personal && len(o.Words) == 0 {
+	if !o.Secrets && !o.Personal && len(o.Words) == 0 && len(o.Rules) == 0 {
 		return w, body, func() {}
 	}
 	masked, n := redact.MaskJSON(body, o)
@@ -35,9 +35,16 @@ func redactedPrompt(w http.ResponseWriter, prompt string) (http.ResponseWriter, 
 	return rw, masked, rw.Finish
 }
 
-func redactionOptions() redact.Options {
-	st := settings.Load()
-	return redact.Options{Secrets: st.Redact, Personal: st.RedactPersonal, Kinds: st.RedactKinds, Words: st.RedactWords, Rules: st.RedactRules}
+func redactionOptions() redact.Options { return settings.Load().Redaction() }
+
+// scrubOptions is what the request archive and the OTLP bodies take out of
+// what they keep: what the user asked masked, and every secret beside it,
+// masking on or not — what they keep is sent nowhere, so a secret goes from
+// it either way, and a masking rule of the user's own goes with it (#195).
+func scrubOptions() redact.Options {
+	o := redactionOptions()
+	o.Secrets = true
+	return o
 }
 
 // unredactedRoute says a request resolved to p, or to the group whose

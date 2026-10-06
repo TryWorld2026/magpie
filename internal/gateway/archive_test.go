@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/yetone/magpie/internal/redact"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -275,4 +276,72 @@ func keys(m map[string][]byte) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// relayKey is a relay's key of a format of the user's own: magpie's rules
+// know nothing of it, so only their masking rule finds it (#195).
+const relayKey = "rz_RelayKey1234567"
+
+// relayVendor answers with the relay key in its reply, as a vendor that
+// names a key back does.
+type relayVendor struct{}
+
+func (relayVendor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	io.ReadAll(r.Body)
+	w.Header().Set("Content-Type", "application/json")
+	io.WriteString(w, `{"id":"c1","object":"chat.completion","model":"m1","choices":[{"index":0,"message":{"role":"assistant","content":"using `+relayKey+`"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`)
+}
+
+// A masking rule of the user's own goes out of the archive as it goes out of
+// what the vendor is sent: the reply that names the relay key keeps
+// [REDACTED:RELAY] and not the key, and the request it was sent with has the
+// key taken out whether masking is on for the vendor or not — what the
+// archive keeps is sent nowhere, so every secret goes from it either way.
+func TestArchiveKeepsTheUsersRules(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		redact bool
+	}{{"masking_on", true}, {"masking_off", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			fresh(t)
+			serveOn(t, "fake", "k", []string{"m1"}, relayVendor{})
+			if err := settings.Save(settings.Settings{RequestArchive: true, Redact: tc.redact,
+				RedactRules: []redact.Rule{{Kind: "RELAY", Prefix: "rz_"}}}); err != nil {
+				t.Fatal(err)
+			}
+			b := &memBucket{objs: map[string][]byte{}}
+			archiveTo(t, b)
+			s := New()
+			body := `{"model":"fake/m1","messages":[{"role":"user","content":"send it to ` + relayKey + `"}]}`
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+			archivePending.Wait()
+			if rec.Code != 200 || !strings.Contains(rec.Body.String(), relayKey) {
+				t.Fatalf("%d %s", rec.Code, rec.Body)
+			}
+			data, ok := b.objs["archive/"+s.Recent()[0].Archive+".json"]
+			if !ok || len(b.objs) != 1 {
+				t.Fatalf("uploaded %v", keys(b.objs))
+			}
+			var a Archived
+			if err := json.Unmarshal(data, &a); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(a.Request.Body, relayKey) {
+				t.Errorf("the relay key in the archived request:\n%s", a.Request.Body)
+			}
+			// masking on, the vendor was sent a placeholder and the archive
+			// keeps that one; masking off, the key goes for good
+			want := "[REDACTED:RELAY]"
+			if tc.redact {
+				want = "{{RELAY_"
+			}
+			if !strings.Contains(a.Request.Body, want) {
+				t.Errorf("want %s in the archived request:\n%s", want, a.Request.Body)
+			}
+			if !strings.Contains(a.Response.Body, "[REDACTED:RELAY]") || strings.Contains(a.Response.Body, relayKey) {
+				t.Errorf("the relay key in the archived reply:\n%s", a.Response.Body)
+			}
+		})
+	}
 }

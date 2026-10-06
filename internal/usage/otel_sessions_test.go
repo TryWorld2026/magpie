@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yetone/magpie/internal/redact"
 	"github.com/yetone/magpie/internal/sessions"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/testenv"
@@ -56,6 +57,31 @@ func TestSessionTraceWirePrivacyAndTokenOwnership(t *testing.T) {
 	cfg.BodiesWhole = true
 	if got := sessionBody(long, cfg); got != long {
 		t.Fatal("whole body truncated")
+	}
+}
+
+// A masking rule of the user's own goes out of an exported session body as
+// it goes out of what the vendor is sent (#195): a relay key of a format
+// magpie's rules don't know, in a conversation the agent kept on disk, is
+// not what the collector receives.
+func TestSessionBodyKeepsTheUsersRules(t *testing.T) {
+	const relay = "rz_RelayKey1234567"
+	body := `{"prompt":"send it to ` + relay + `"}`
+	rules := []redact.Rule{{Kind: "RELAY", Prefix: "rz_"}}
+	cfg := settings.OTel{Bodies: true}
+	if err := settings.Save(settings.Settings{Redact: true, RedactRules: rules}); err != nil {
+		t.Fatal(err)
+	}
+	if got := sessionBody(body, cfg); strings.Contains(got, relay) || !strings.Contains(got, "[REDACTED:RELAY]") {
+		t.Errorf("session body: %s", got)
+	}
+	// masking off for the vendor, what the export keeps is sent nowhere, so
+	// every secret goes from it as the request archive has it
+	if err := settings.Save(settings.Settings{RedactRules: rules}); err != nil {
+		t.Fatal(err)
+	}
+	if got := sessionBody(body, cfg); strings.Contains(got, relay) {
+		t.Errorf("session body with masking off: %s", got)
 	}
 }
 

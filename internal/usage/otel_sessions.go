@@ -69,11 +69,18 @@ func (e *otelExporter) sessionObserved(agent, session string, config settings.OT
 	return e.identities.Visible(agent, session)
 }
 
+// sessionBody is a session's input or output as the export keeps it: what
+// the gateway's masking covers, and every secret beside it, masking on or
+// not — what the export keeps is sent to the collector, so a secret goes
+// from it either way, and a masking rule of the user's own goes with it
+// (#195).
 func sessionBody(body string, config settings.OTel) string {
 	if !config.Bodies {
 		return ""
 	}
-	body = string(redact.ScrubJSON([]byte(body)))
+	o := settings.Load().Redaction()
+	o.Secrets = true
+	body = string(redact.ScrubJSONWith([]byte(body), o))
 	cut := false
 	if !config.BodiesWhole && len(body) > 256<<10 {
 		body = body[:256<<10]
