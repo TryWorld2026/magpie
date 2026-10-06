@@ -240,6 +240,7 @@ function renderAgentsLoading() {
 
 let agentArranging = false, agentRenderPending = false;
 function renderAgents() {
+  renderCodexMemories(); // Settings' row is the same field
   if (agentArranging) { agentRenderPending = true; return; }
   if (unhideCleared()) return; // it renders again with the hiding dropped
   const page = $("#view-agents");
@@ -2697,7 +2698,7 @@ function extraField(a, f) {
   b.append(svg(EXTRA_GLYPH[f.label] || EXTRA_GLYPH.tiers, 13, 1.5));
   const opt = optionFor(f, f.value);
   b.title = f.label === SUB_EFFORT ? subEffortTitle(a, f, opt) : f.menu ? menuTitle(f)
-    : t("{label}: {value}", { label: t(f.label), value: t(opt?.label || f.value || (f.label === MEMORIES ? MEMORIES_DEFAULT : "same as model")) }) + (opt?.note && !FOLLOWS_MODEL.includes(f.label) ? "\n" + t(opt.note) : "");
+    : t("{label}: {value}", { label: f.label === MEMORIES ? t("Codex memories model") : t(f.label), value: t(opt?.label || f.value || (f.label === MEMORIES ? MEMORIES_DEFAULT : "same as model")) }) + (opt?.note && !FOLLOWS_MODEL.includes(f.label) ? "\n" + t(opt.note) : "");
   b.setAttribute("aria-label", b.title);
   b.dataset.key = f.key;
   b.onclick = (ev) => openPicker(a, f, b, ev);
@@ -4386,6 +4387,7 @@ async function loadProviders() {
   } else renderProviders();
   renderArchive();
   providersWhileFetching();
+  if (view === "providers") loadUpstream();
 }
 
 // Accounts' lists still on their way from their vendors (#541: the page no
@@ -4408,6 +4410,73 @@ function providersWhileFetching() {
     }
     else { providers.fetching = next.fetching; providersWhileFetching(); }
   }, 2500);
+}
+
+// What the vendors' own status pages say of the APIs the providers call
+// (#971, emo172): a vendor's API degraded or down is marked on its
+// providers' rows and usage cards, so its outage isn't taken for a sign-in
+// or quota problem. The gateway reads each page at most once in five
+// minutes; it is asked when the Providers or Usage page loads, and again
+// every five minutes while one stays open. A page that couldn't be read
+// marks nothing: unknown is not "all well", and not an outage either.
+let upstream = null, upstreamAsking = null;
+function loadUpstream() {
+  if (upstreamAsking) return upstreamAsking;
+  clearTimeout(loadUpstream.timer);
+  upstreamAsking = api("upstream").then((u) => {
+    if (Array.isArray(u?.vendors)) { upstream = u; markUpstream(); }
+  }, () => {}).finally(() => {
+    upstreamAsking = null;
+    loadUpstream.timer = setTimeout(() => { if (!document.hidden && (view === "providers" || view === "usage")) loadUpstream(); }, 5 * 60e3);
+  });
+  return upstreamAsking;
+}
+
+const UPSTREAM_LEVEL = { degraded: "API degraded", partial: "API outage", major: "API outage", maintenance: "API maintenance" };
+const UPSTREAM_PART = { degraded_performance: "degraded performance", partial_outage: "partial outage", major_outage: "major outage", under_maintenance: "under maintenance" };
+
+// the vendor's reading for a provider, when its page says the API is affected
+function upstreamOf(id) {
+  const v = upstream?.providers?.[id];
+  const s = v && upstream.vendors.find((x) => x.vendor === v);
+  return s && UPSTREAM_LEVEL[s.level] ? s : null;
+}
+
+function upstreamBadge(s) {
+  const b = el("button", "badge upstream " + s.level, t(UPSTREAM_LEVEL[s.level]));
+  b.type = "button";
+  const lines = [t("{vendor}'s status page says its API is affected", { vendor: s.name })];
+  for (const p of s.parts || []) lines.push("· " + p.name + ": " + t(UPSTREAM_PART[p.status] || p.status));
+  for (const i of s.incidents || []) lines.push("· " + i.name);
+  lines.push(t("Click to open the status page"));
+  b.title = lines.join("\n");
+  // the incident's own page when it has one, else the vendor's
+  b.onclick = (e) => { e.stopPropagation(); api("open", { url: s.incidents?.find((i) => i.url)?.url || s.page }).catch(() => {}); };
+  return b;
+}
+
+// marks (or unmarks) what is drawn; the lists call it after each redraw
+function markUpstream() {
+  const put = (box, s, after) => {
+    if (!box) return;
+    box.querySelector(":scope > .badge.upstream")?.remove();
+    if (!s) return;
+    // a row's name as a box of its own, to be the part cut short
+    if (!after && box.firstChild?.nodeType === Node.TEXT_NODE) {
+      const nm = el("span", "nm");
+      nm.append(box.firstChild);
+      box.prepend(nm);
+    }
+    const b = upstreamBadge(s);
+    if (after) after.after(b); else box.append(b);
+  };
+  for (const row of document.querySelectorAll("#providers .row.provider[data-id], #offProviders .row.provider[data-id]")) {
+    put(row.querySelector(".name"), upstreamOf(row.dataset.id));
+  }
+  for (const card of document.querySelectorAll("#subscriptionUsage > .subscription-card[data-provider]")) {
+    const head = card.querySelector(":scope > .subscription-head");
+    put(head, upstreamOf(card.dataset.provider), head?.querySelector(":scope > b"));
+  }
 }
 
 // Rows in the shape of the list while it is first asked for; a reload keeps
@@ -4534,6 +4603,7 @@ function renderProviders() {
   if (importing) dialog = renderImport(importing);
   if (importingApps) dialog = renderImportApps(importingApps);
   keptIcons = null;
+  markUpstream();
   view.scrollTop = top; // first: a closing dialog folds into its row where it is
   if (dialog) openModal(dialog); else closeModal();
 }
@@ -10565,6 +10635,9 @@ function quotaError(err) {
   if (/violation of Terms of Service/i.test(err)) return t("Google has suspended this account — hover for details");
   if (/access token is invalid or expired|didn't take the access token/.test(err)) return t("AiHubMix didn't take the access token — paste a new one in the provider's settings");
   if (/this key has no limit/.test(err)) return t("This key has no limit — add the account's access token in the provider's settings to see its balance");
+  // a remote magpie's card (remote_quotas.go)
+  if (/^nothing read on that magpie yet/.test(err)) return t("Nothing read on that computer yet — refresh this card to have it read");
+  if (/^remote magpie doesn't share its quotas/.test(err)) return t("That computer's magpie doesn't share its quotas yet — update magpie there");
   return balanceError(err) || t("Allowance unavailable");
 }
 
@@ -11812,6 +11885,9 @@ function editorError(msg, kind = "err") {
 }
 
 function slug(s) { return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, ""); }
+// groupSlug: a routing group's id as provider.GroupSlug derives it, the
+// dots kept (gpt-6.1-sol, #968).
+function groupSlug(s) { return s.toLowerCase().replace(/[^a-z0-9.]+/g, "-").replace(/\.{2,}/g, ".").replace(/^[-.]+|[-.]+$/g, ""); }
 function hostOf(u) { try { return new URL(u.includes("://") ? u : "https://" + u).host; } catch { return ""; } }
 
 // the sheet opens below the list: it unrolls on the rows' spring and the
@@ -12006,6 +12082,7 @@ function loadQuotas(asked, again) {
     .finally(() => {
       if (quotasLoading === p) quotasLoading = null;
       if (!same) renderQuotas();
+      if (view === "usage") loadUpstream();
       if (reading && !quotasLater && ++quotasTries <= 20) quotasLater = setTimeout(() => { quotasLater = 0; loadQuotas(false, true); }, 1500);
     });
   p.asked = !!asked;
@@ -12215,6 +12292,9 @@ function renderQuotas() {
       // the account's standing say on its resets, held or not (#719)
       const policy = !brief && autoResetRow(sub, "quota-autoreset");
       if (policy) card.append(policy);
+      // and on its credits, when its windows run out
+      const credits = !brief && creditsRow(sub, "quota-credits");
+      if (credits) card.append(credits);
     }
     // in the card's head, beside its name: no line of its own
     // (of the keys in sight: the ones folded away are the foot's button's)
@@ -12223,6 +12303,7 @@ function renderQuotas() {
     if (accts && (folded.size || usageAcctsAll.has(first.provider))) card.append(acctsMore(first.provider, folded.size));
     subscriptions.append(card);
   }
+  markUpstream();
   restoreFlash();
   requestAnimationFrame(focusQuotaCard);
 }
@@ -13337,6 +13418,8 @@ function panelQuotaCard(q) {
   }
   const policy = autoResetRow(q, "pq-autoreset");
   if (policy) card.append(policy);
+  const credits = creditsRow(q, "pq-credits");
+  if (credits) card.append(credits);
   return card;
 }
 
@@ -13473,6 +13556,64 @@ function autoResetButton(q) {
   return b;
 }
 
+// Whether a Codex account spends its credits once one of its windows is
+// used up, a standing say of the account's kept by its name (settings'
+// codexNoCredits, the CLI's quota credits): on unless the user turns it
+// off. Off, routing holds the account as used up till the window renews,
+// as a usage cap does at its share. creditsKept: the accounts that can
+// have it.
+function creditsKept(q) {
+  return !!(q.user && q.provider === "codex");
+}
+function creditsOn(q) {
+  return creditsKept(q) && !(state.settings?.codexNoCredits || []).includes(q.user.toLowerCase());
+}
+
+// creditsRow is that say on an account's card, credits held or not, so it
+// can be set ahead: what it does, in words, and the switch.
+function creditsRow(q, cls) {
+  if (!creditsKept(q)) return null;
+  const on = creditsOn(q);
+  const row = el("div", cls + (on ? " on" : ""));
+  const say = el("span", "ar-say");
+  say.append(el("b", "", t("Use credits:")), document.createTextNode(" " + t(on ? "when its windows run out, so a task goes on" : "no — held when a window runs out")));
+  say.title = creditsTitle(on);
+  row.dataset.user = q.user;
+  row.append(say, creditsButton(q));
+  return row;
+}
+function creditsTitle(on) {
+  return t(on ? "On: once one of this account's windows is used up, ChatGPT answers on the account's credits, if it holds any, so a task goes on. Click to turn it off."
+    : "Off: once one of this account's windows is used up, magpie holds it till the window renews, and requests go to your other accounts, groups and fallbacks, so its credits aren't spent. With none of them left, a request is refused with why, unless Auto-use resets is on and its week is used up: then a reset is used first.");
+}
+
+// creditsButton turns that on or off: a switch, its words beside it.
+function creditsButton(q) {
+  const on = creditsOn(q);
+  const b = el("button", "lib-switch use-credits" + (on ? " on" : ""));
+  b.type = "button";
+  b.setAttribute("role", "switch");
+  b.setAttribute("aria-checked", String(on));
+  b.setAttribute("aria-label", t("Use credits"));
+  b.title = creditsTitle(on);
+  b.append(el("i"));
+  b.onclick = async (e) => {
+    e.stopPropagation();
+    if (b.disabled) return;
+    b.disabled = true;
+    try {
+      prefs = await writingPrefs(api("settings/codex-credits", { user: q.user, on: !on }));
+      state.settings = prefs;
+      status(t(on ? "{who} no longer spends its credits: held when a window runs out" : "{who} spends its credits when its windows run out", { who: q.user }), "ok");
+      renderQuotas();
+    } catch (err) {
+      b.disabled = false;
+      status(err.message, "err");
+    }
+  };
+  return b;
+}
+
 // checkinRow is a WorkBuddy (China), Trae CN or MiniMax Code account's daily check-in
 // on its Usage card: today's (a Beijing day) done, with the credits and
 // the streak, or why not, or the last day it was; the vendor's first such
@@ -13498,6 +13639,12 @@ const CHECKINS = {
     say: "MiniMax Code's daily check-in, as pressing 签到 in MiniMax Code does",
     on: "On: magpie checks each MiniMax Code account in once a day, as Settings' Daily check-in does. Click to turn it off.",
     off: "Check each MiniMax Code account in once a day, as Settings' Daily check-in does",
+  },
+  qoder: {
+    pref: "qoderCheckin", api: "qoder-checkin",
+    say: "Qoder's daily credits, as claiming them in Qoder does",
+    on: "On: magpie claims each Qoder account's daily credits once a day, as Settings' Daily check-in does. Click to turn it off.",
+    off: "Claim each Qoder account's daily credits once a day, as Settings' Daily check-in does",
   },
 };
 function checkinRow(q, first, subs) {
@@ -15890,7 +16037,13 @@ const SESS_WEEK = 20, SESS_WEEK_MAX = 24;
 // wide card and left the rest empty. The weeks before the range come in as
 // empty cells, GitHub's way, up to a year in all, and the cells grow a little
 // to take what is left; a narrow card gets none and its cells shrink.
-const sessCalWidth = new ResizeObserver((es) => { for (const e of es) e.target.fitCal?.(); });
+// It fits on the next frame: a calendar put again changes the card's height,
+// which this would be told of in the same call, a ResizeObserver loop.
+const sessCalWidth = new ResizeObserver((es) => {
+  for (const { target: chart } of es) {
+    if (!chart.fitFrame) chart.fitFrame = requestAnimationFrame(() => { chart.fitFrame = 0; chart.fitCal?.(); });
+  }
+});
 function sessCalFit(chart, days, value, tip) {
   const wrap = chart.querySelector(".sess-cal-wrap"), cal = wrap?.querySelector(".sess-cal");
   if (!cal || !wrap.clientWidth) return;
@@ -16561,7 +16714,7 @@ const DISCORD_SVG = '<svg viewBox="0 0 24 24" width="13" height="13" fill="curre
 // Codex's when it is not. A click on a tab leaves the page where it is, as
 // every click does (see "where the reader is"): a shorter card under it at
 // the page's end gets room kept at the view's foot.
-const WARM_TABS = { codex: "codexWarmList", claude: "claudeWarmList", wb: "wbList", trae: "traeList", minimax: "minimaxList" };
+const WARM_TABS = { codex: "codexWarmList", claude: "claudeWarmList", wb: "wbList", trae: "traeList", minimax: "minimaxList", qoder: "qoderList" };
 let warmTab = "codex";
 try { const k = localStorage.getItem("magpie.warmTab"); if (k in WARM_TABS) warmTab = k; } catch {}
 function setWarmTab(tab, remember) {
@@ -16837,6 +16990,7 @@ function renderSettings() {
     (v) => savePrefs({ ...keep, codexWarmAt: v }));
   renderWarmAt($("#claudeWarmAtSegs"), $("#claudeWarmAtSub"), s.claudeWarmAt, s.claudeWarmup, t("Sent through Claude Code."),
     (v) => savePrefs({ ...keep, claudeWarmAt: v }));
+  renderWarmAtOwn(s);
   // WorkBuddy's daily check-in pressed for each account, its tab shown
   // while one is signed in
   $("#warmTab-wb").hidden = !s.workbuddy && !s.workbuddyCheckin;
@@ -16863,6 +17017,14 @@ function renderSettings() {
   $("#minimaxCheckinSub").textContent = [t("Claims each signed-in MiniMax Code account's check-in credits once a day"),
     ...(s.minimaxCheckins || []).map(wbCheckinLine)].filter(Boolean).join(" · ");
   $("#minimaxCheckinSub").title = t("As pressing 签到 in MiniMax Code does");
+  // and Qoder's daily credits, its tab shown while a Qoder account is signed in
+  $("#warmTab-qoder").hidden = !s.qoder && !s.qoderCheckin;
+  setWarmTab(warmTab);
+  $("#qoderCheckinSegs").replaceChildren(segs([["off", t("Off")], ["on", t("On")]], s.qoderCheckin ? "on" : "off",
+    (v) => savePrefs({ ...keep, qoderCheckin: v === "on" })));
+  $("#qoderCheckinSub").textContent = [t("Claims each signed-in Qoder account's daily credits once a day"),
+    ...(s.qoderCheckins || []).map(wbCheckinLine)].filter(Boolean).join(" · ");
+  $("#qoderCheckinSub").title = t("As claiming the daily credits in Qoder does");
   renderTrayUsage(s, keep);
   renderProxy(s, keep);
   renderGitHubToken(s);
@@ -17410,6 +17572,7 @@ function renderTrayUsage(s, keep) {
   $("#fullContextSegs").replaceChildren(compactRow);
   renderCodexTitles(s);
   renderCodexAutoReview(s);
+  renderCodexMemories();
   const rate = s.fx?.rate;
   const currencySub = $("#currencySub");
   currencySub.textContent = t("What a cost — the Usage page's, the tray panel's, the TUI's and the CLI's — is shown as; a vendor's own balance, already in its own currency, is never converted");
@@ -17572,6 +17735,58 @@ function renderWarmAt(box, sub, at, onReset, via, save) {
   box.append(segs([["off", t("Off")], ["on", t("On")]], at ? "on" : "off", (v) => save(v === "on" ? at || "06:00" : "")));
 }
 
+// renderWarmAtOwn gives each ChatGPT account its own row under Daily
+// warm-up (#957, Evan26Ma): two accounts started at one time run out
+// together, one at 06:00 and one at 09:00 take over from one another. An
+// account follows the time above, has its own, or none (settings'
+// codexWarmAtOf, set on its own); the rows show with two accounts or more,
+// or while one has a time of its own.
+function renderWarmAtOwn(s) {
+  const list = $("#codexWarmList");
+  list.querySelectorAll(".warm-own").forEach((r) => r.remove());
+  const own = s.codexWarmAtOf || {};
+  const users = [...(s.codexUsers || [])];
+  for (const u of Object.keys(own)) if (!users.some((x) => x.toLowerCase() === u)) users.push(u);
+  if (users.length < 2 && !Object.keys(own).length) return;
+  const save = async (user, at) => {
+    try {
+      prefs = await writingPrefs(api("settings/codex-warm-at", { user, at }));
+      if (state) state.settings = prefs;
+      renderSettings();
+    } catch (e) {
+      status(t(e.message), "err");
+      renderSettings();
+    }
+  };
+  for (const user of users) {
+    const at = own[user.toLowerCase()];
+    const mode = at === undefined ? "same" : at === "off" ? "off" : "own";
+    const r = el("div", "row pref warm-own");
+    r.dataset.user = user;
+    const who = el("div", "who");
+    const name = el("div", "name", user);
+    name.title = user;
+    const sub = el("div", "sub", mode === "own" ? t("Its own time each day")
+      : mode === "off" ? t("Not started at a time of day")
+      : s.codexWarmAt ? t("Same as above, {at}", { at: s.codexWarmAt }) : t("Same as above, off"));
+    sub.title = t("Give accounts different times and one window starts as another runs out.");
+    who.append(name, sub);
+    const box = el("div", "warm-at");
+    if (mode === "own") {
+      const i = input(at, "06:00", "time");
+      i.className = "at";
+      i.setAttribute("aria-label", t("{who}'s time of day", { who: user }));
+      i.onkeydown = (e) => { e.stopPropagation(); if (e.key === "Enter") i.blur(); };
+      i.onchange = () => { if (i.value && i.value !== at) save(user, i.value); };
+      box.append(i);
+    }
+    box.append(segs([["same", t("Same")], ["own", t("Own")], ["off", t("Off")]], mode, (v) =>
+      save(user, v === "same" ? "" : v === "off" ? "off" : s.codexWarmAt || "06:00")));
+    r.append(who, box);
+    list.append(r);
+  }
+}
+
 // renderAlerts draws the usage alerts (#368): a notification when a window
 // that routing counts reaches the share set, or a balance falls to the
 // amount set, each once; Off, or the number in a field beside On.
@@ -17677,6 +17892,31 @@ function renderCodexAutoReview(s) {
     writingPrefs(api("settings/codex-auto-review", { model: id })).then((ns) => { prefs = ns; renderSettings(); }).catch((e) => { status(t(e.message), "err"); renderSettings(); });
   } }, b, ev);
   $("#codexAutoReviewPick").replaceChildren(b);
+}
+
+// renderCodexMemories: the model Codex writes its memories with (#985,
+// Hu9956: the notebook square on Codex's card was all there was, beside the
+// subagent squares, and wasn't found). It is the card's own field, picked
+// in the same picker and written the same way, so the row and the square
+// show one setting; renderAgents draws the row again after every pick.
+// No Codex with a memories field to pick: no row.
+function renderCodexMemories() {
+  const row = $("#codexMemoriesRow");
+  if (!row) return;
+  const a = state.agents.find((x) => x.id === "codex");
+  const f = a?.fields?.find((x) => x.label === MEMORIES);
+  row.hidden = gatewayMode || !f || (!f.options.length && !f.value);
+  if (row.hidden) return;
+  const opt = optionFor(f, f.value);
+  $("#codexMemoriesSub").textContent = f.value ? t("Codex sums threads up and folds them into its memories with this model, whatever model the conversation is on")
+    : t("Codex sums threads up and folds them into its memories with its own models, gpt-5.6-luna and gpt-5.6-terra, whatever model the conversation is on");
+  const b = el("button", "rt-cond on");
+  b.type = "button";
+  b.setAttribute("aria-label", t("Codex memories model"));
+  if (f.value) b.append(icon(opt?.icon || "generic"), el("span", "", opt?.label || f.value));
+  else b.append(icon("openai"), el("span", "", t("Codex’s own pick")));
+  b.onclick = (ev) => openPicker(a, f, b, ev);
+  $("#codexMemoriesPick").replaceChildren(b);
 }
 
 // renderImages: the model that describes images to a model that can't see
@@ -18436,7 +18676,7 @@ function prefsKeep(s) {
     otel: s.otel || {},
     trayUsages: s.trayUsages || [],
     redact: !!s.redact, redactPersonal: !!s.redactPersonal, redactWords: s.redactWords || [], codexWarmup: s.codexWarmup || "",
-    claudeWarmup: s.claudeWarmup || "", codexWarmAt: s.codexWarmAt || "", claudeWarmAt: s.claudeWarmAt || "", workbuddyCheckin: !!s.workbuddyCheckin, traeCheckin: !!s.traeCheckin, minimaxCheckin: !!s.minimaxCheckin, noStats: !!s.noStats,
+    claudeWarmup: s.claudeWarmup || "", codexWarmAt: s.codexWarmAt || "", claudeWarmAt: s.claudeWarmAt || "", workbuddyCheckin: !!s.workbuddyCheckin, traeCheckin: !!s.traeCheckin, minimaxCheckin: !!s.minimaxCheckin, qoderCheckin: !!s.qoderCheckin, noStats: !!s.noStats,
     memberModel: !!s.memberModel,
     noUpdatePill: !!s.noUpdatePill, noAutoUpdate: !!s.noAutoUpdate, updateEvery: s.updateEvery || 360,
     trayUsage: s.trayUsage || "", trayUsageEvery: s.trayUsageEvery || 3, trayNoLogos: !!s.trayNoLogos, trayNoBird: !!s.trayNoBird, vision: s.vision || "", imageGen: s.imageGen || "", searcher: s.searcher || "", searchFirst: s.searchFirst || "", currency: s.currency || "usd",
@@ -18698,14 +18938,17 @@ function keepHeld() {
 }
 addEventListener("click", (e) => {
   purposeUntil = flingUntil = 0; // what came before the click (Space pressed on a button, a tremble, the lift of a tap) is no scroll
-  const v = e.target.closest?.(".view");
+  // a pick in a menu (in body, outside any view) is a click on the pill that
+  // opened it: what it changes comes in around that pill, which stays put (#961)
+  const at = protoMenu?.box.contains(e.target) ? protoMenu.anchor : e.target;
+  const v = at.closest?.(".view");
   if (!v || v.hidden) { held = null; return; }
   // a click before a frame has held the one before it (a tab list's keys
   // pressed in quick turn) holds that one first: the page it shrank is put
   // back, so this one is taken where the reader left it, not at the top
   if (held?.v === v) hold(held);
   const chain = [];
-  const from = e.target.closest?.("[data-unrolls]")?.parentElement || e.target;
+  const from = at.closest?.("[data-unrolls]")?.parentElement || at;
   for (let n = from; n && n !== v; n = n.parentElement) {
     for (const m of [n, n.previousElementSibling, n.nextElementSibling]) if (m instanceof HTMLElement && m.offsetParent) chain.push([m, onScreen(m, v), pathIn(v, m)]);
   }

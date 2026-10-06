@@ -112,6 +112,11 @@ type Settings struct {
 	// with CodexWarmup or without it. ClaudeWarmAt is the Claude accounts'.
 	CodexWarmAt  string `json:"codexWarmAt,omitempty"`
 	ClaudeWarmAt string `json:"claudeWarmAt,omitempty"`
+	// CodexWarmAtOf is a ChatGPT account's own time of day for that, by
+	// its name in lower case, "off" for none: two accounts started hours
+	// apart take over from one another, where at one time they run out
+	// together (#957). An account not in it has CodexWarmAt.
+	CodexWarmAtOf map[string]string `json:"codexWarmAtOf,omitempty"`
 	// CodexAutoReset are the ChatGPT accounts (lower-case) that spend one
 	// of their rate-limit resets by themselves once their weekly window is
 	// used up and no other account can take the request: at most one a
@@ -119,6 +124,12 @@ type Settings struct {
 	// unused half an hour before it does, or at once when the account is
 	// held up past then (provider.SpendExpiringCodexResets).
 	CodexAutoReset []string `json:"codexAutoReset,omitempty"`
+	// CodexNoCredits are the ChatGPT accounts (lower-case) that don't
+	// spend their credits: once a usage window is used up, routing holds
+	// the account as used up and goes on to the user's other accounts,
+	// groups and fallbacks, where by default the vendor answers on its
+	// credits (see provider.CodexCredits).
+	CodexNoCredits []string `json:"codexNoCredits,omitempty"`
 	// WorkBuddyCheckin presses WorkBuddy's daily check-in (签到) for each
 	// signed-in WorkBuddy (China) account once a Beijing day, claiming the
 	// credits it gives while its event runs.
@@ -131,6 +142,10 @@ type Settings struct {
 	// signed-in MiniMax Code (China) account (its plugin's) once a Beijing
 	// day, claiming the credits it gives (#811).
 	MiniMaxCheckin bool `json:"minimaxCheckin,omitempty"`
+	// QoderCheckin claims Qoder's daily credits for each signed-in Qoder
+	// and Qoder CN account (its plugin's) once a Beijing day (ARNO on
+	// Discord).
+	QoderCheckin bool `json:"qoderCheckin,omitempty"`
 	// MemberModel has a reply's model name the routing group's member
 	// that answered, as magpie's provider/model id (workbuddy/glm-5.3-flash),
 	// rather than the vendor's own name for it, for agents that count
@@ -816,6 +831,11 @@ func Save(s Settings) error {
 			return fmt.Errorf("a warm-up's time of day must look like 06:00, not %q", at)
 		}
 	}
+	for user, at := range s.CodexWarmAtOf {
+		if _, _, ok := Clock(at); at != "off" && !ok {
+			return fmt.Errorf("%s's warm-up time of day must look like 06:00 or be off, not %q", user, at)
+		}
+	}
 	if !slices.Contains(TrayEvery, s.TrayUsageEvery) {
 		return fmt.Errorf("the menu bar's usage is refreshed every %v minutes, not %d", TrayEvery, s.TrayUsageEvery)
 	}
@@ -885,6 +905,10 @@ func Save(s Settings) error {
 		s.CodexAutoReset[i] = strings.ToLower(u)
 	}
 	s.CodexAutoReset = ids(s.CodexAutoReset)
+	for i, u := range s.CodexNoCredits {
+		s.CodexNoCredits[i] = strings.ToLower(u)
+	}
+	s.CodexNoCredits = ids(s.CodexNoCredits)
 	s.TrayUsage = ""
 	if len(s.TrayUsages) > 0 {
 		s.TrayUsage = s.TrayUsages[0]
@@ -972,6 +996,24 @@ func (s Settings) normal() Settings {
 		*at = strings.TrimSpace(*at)
 		if h, m, ok := Clock(*at); ok {
 			*at = fmt.Sprintf("%02d:%02d", h, m)
+		}
+	}
+	// an account's own, by its name in lower case; one with none follows
+	// CodexWarmAt and isn't kept
+	if s.CodexWarmAtOf != nil {
+		of := map[string]string{}
+		for user, at := range s.CodexWarmAtOf {
+			user, at = strings.ToLower(strings.TrimSpace(user)), strings.ToLower(strings.TrimSpace(at))
+			if h, m, ok := Clock(at); ok {
+				at = fmt.Sprintf("%02d:%02d", h, m)
+			}
+			if user != "" && at != "" {
+				of[user] = at
+			}
+		}
+		s.CodexWarmAtOf = of
+		if len(of) == 0 {
+			s.CodexWarmAtOf = nil
 		}
 	}
 	return s

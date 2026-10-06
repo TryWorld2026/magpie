@@ -277,6 +277,10 @@
         <div class="who"><div class="name" data-t>Codex auto-review model</div><div class="sub" id="codexAutoReviewSub"></div></div>
         <div class="val" id="codexAutoReviewPick"></div>
       </div>
+      <div class="row pref" id="codexMemoriesRow" hidden>
+        <div class="who"><div class="name" data-t>Codex memories model</div><div class="sub" id="codexMemoriesSub"></div></div>
+        <div class="val" id="codexMemoriesPick"></div>
+      </div>
       <div class="row pref">
         <div class="who"><div class="name" data-t>Open at login</div><div class="sub" data-t>Start magpie in the tray when you log in, so agents find the gateway from the start</div></div>
         <div id="loginSegs"></div>
@@ -348,6 +352,7 @@
       <button type="button" role="tab" id="warmTab-wb" data-warm="wb" aria-controls="wbList" hidden>WorkBuddy</button>
       <button type="button" role="tab" id="warmTab-trae" data-warm="trae" aria-controls="traeList" hidden>Trae CN</button>
       <button type="button" role="tab" id="warmTab-minimax" data-warm="minimax" aria-controls="minimaxList" hidden>MiniMax Code</button>
+      <button type="button" role="tab" id="warmTab-qoder" data-warm="qoder" aria-controls="qoderList" hidden>Qoder</button>
     </div></div>
     <div class="warm-panes">
     <div class="list prefs" id="codexWarmList" role="tabpanel" aria-labelledby="warmTab-codex">
@@ -386,6 +391,12 @@
       <div class="row pref" id="minimaxCheckinRow">
         <div class="who"><div class="name" data-t>Daily check-in</div><div class="sub" id="minimaxCheckinSub"></div></div>
         <div id="minimaxCheckinSegs"></div>
+      </div>
+    </div>
+    <div class="list prefs" id="qoderList" role="tabpanel" aria-labelledby="warmTab-qoder">
+      <div class="row pref" id="qoderCheckinRow">
+        <div class="who"><div class="name" data-t>Daily check-in</div><div class="sub" id="qoderCheckinSub"></div></div>
+        <div id="qoderCheckinSegs"></div>
       </div>
     </div>
     </div>

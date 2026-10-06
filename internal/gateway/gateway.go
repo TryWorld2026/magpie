@@ -414,6 +414,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	// and the Trae CN accounts (#694), and the MiniMax Code ones (#811)
 	go provider.KeepTraeCheckedIn(ctx)
 	go provider.KeepMiniMaxCheckedIn(ctx)
+	// and the Qoder ones' daily credits
+	go provider.KeepQoderCheckedIn(ctx)
 	// and moves the built-in subscriptions being retired onto their plugins
 	go provider.KeepRetiringMoved(ctx)
 	// and keeps the community's plugins up to date, noting others' updates, and the Bun they run on
@@ -476,6 +478,8 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("GET /v1/magpie/quotas", s.quotas)
 	mux.HandleFunc("GET /v1/magpie/quotas/history", s.quotasHistory)
+	mux.HandleFunc("GET "+provider.RemoteCardsPath, s.quotaCards)
+	mux.HandleFunc("POST "+provider.RemoteRefreshPath, s.quotaCardsRefresh)
 	mux.HandleFunc("GET /v1/magpie/route", s.sessionRoute)
 	mux.HandleFunc("GET /v1/magpie/concurrency", s.concurrency)
 	mux.HandleFunc("GET /v1/magpie/limit", s.keyLimit)
@@ -545,6 +549,60 @@ func (s *Server) quotasHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	writeJSON(w, 200, map[string]any{"object": "list", "data": provider.QuotaHistories(provider.QuotaHistorySince(q.Get("days"), time.Now()), q.Get("provider"), q.Get("user"))})
+}
+
+// quotaCards is the Usage page's cards as this magpie last read them, for
+// another magpie that has this one as its provider (remote-magpie) to
+// show: its own cache, however old, and no vendor asked for it.
+func (s *Server) quotaCards(w http.ResponseWriter, r *http.Request) {
+	if !local(r) && !sharedWith(r) {
+		writeError(w, provider.Chat, http.StatusForbidden, "magpie's quotas are told to another machine only when magpie is shared on the local network (Settings → Share on local network) and the request carries its API key (Authorization: Bearer <key> or x-api-key: <key>)")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"object": "list", "data": provider.CachedCards(time.Now())})
+}
+
+// remoteRefreshes is when another magpie last had each card read again
+// here: one refreshed by hand is read at most once in remoteRefreshGap,
+// however often it is asked, so the vendor sees no more than this
+// computer's own refresh button would make it.
+var remoteRefreshes = struct {
+	sync.Mutex
+	at map[string]time.Time
+}{at: map[string]time.Time{}}
+
+const remoteRefreshGap = 30 * time.Second
+
+// quotaCardsRefresh is a card's refresh pressed on another magpie: the
+// card (?provider=, &user=) is read again here, or every card when none
+// is named, then the cards are answered as quotaCards answers them.
+func (s *Server) quotaCardsRefresh(w http.ResponseWriter, r *http.Request) {
+	if !local(r) && !sharedWith(r) {
+		writeError(w, provider.Chat, http.StatusForbidden, "magpie's quotas are told to another machine only when magpie is shared on the local network (Settings → Share on local network) and the request carries its API key (Authorization: Bearer <key> or x-api-key: <key>)")
+		return
+	}
+	id, user := r.URL.Query().Get("provider"), r.URL.Query().Get("user")
+	if strings.Contains(id, "/") || provider.IsRemoteCard(id) { // a card this magpie has from another: not passed on
+		writeError(w, provider.Chat, http.StatusBadRequest, "this magpie reads only its own cards again")
+		return
+	}
+	key := id + "|" + strings.ToLower(user)
+	remoteRefreshes.Lock()
+	due := time.Since(remoteRefreshes.at[key]) >= remoteRefreshGap
+	if due {
+		remoteRefreshes.at[key] = time.Now()
+	}
+	remoteRefreshes.Unlock()
+	if due {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		if id == "" {
+			provider.ReadAllCards(ctx)
+		} else {
+			provider.RefreshUsage(ctx, id, user)
+		}
+		cancel()
+	}
+	writeJSON(w, 200, map[string]any{"object": "list", "data": provider.CachedCards(time.Now())})
 }
 
 func modelObject(e provider.Entry) map[string]any {
@@ -1364,6 +1422,21 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 		cands, pl, accountHeld = allowedCandidates(who, cands, pl, members)
 	}
+	// a Codex reset spent before any try, on an account held as it won't
+	// spend its credits
+	var resetFirst *AutoReset
+	if len(cands) == 0 && len(pl.held) > 0 && strings.TrimSpace(r.Header.Get(AccountHeader)) == "" &&
+		!slices.ContainsFunc(pl.left, func(w Weighed) bool { return !w.Barred && !w.Held && w.Capped == 0 }) {
+		// every account there is is held, and one held only as it won't
+		// spend its credits is out of its allowance at the vendor's own
+		// 100%: one that spends its resets by itself, its week used up,
+		// spends one and is tried, as one the vendor refused would be
+		if pick, out, ok := s.autoReset(r.Context(), nil, pl.held[0], pl.held); ok {
+			cands = []candidate{pick}
+			pl.order, pl.left = unhold(pl.order, pl.left, pick)
+			resetFirst = &AutoReset{Who: pick.p.Account.User, Text: out.Text(), Agent: pick.p.Account.Agent}
+		}
+	}
 	if len(cands) == 0 && slices.ContainsFunc(pl.left, func(w Weighed) bool { return w.Capped > 0 }) &&
 		!slices.ContainsFunc(pl.left, func(w Weighed) bool { return !w.Barred && !w.Held && w.Capped == 0 }) {
 		// every account there is is held at its usage cap: used up, as far
@@ -1519,8 +1592,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	plainFor := ""   // the account and model asked again without effort updates (#617)
 	// the key or subscription account the last try went to (#557)
 	providerKeyID, providerKeyName, providerAccount := "", "", ""
-	var other *Try     // the first failure that wasn't an allowance run out
-	autoReset := false // a Codex or Claude reset looked at, once a request
+	var other *Try                 // the first failure that wasn't an allowance run out
+	autoReset := resetFirst != nil // a Codex or Claude reset looked at, once a request
 	// what the tries' held streams sent the agent ahead of a reply (#751)
 	kept := &keptAlive{proto: from}
 	var sentMs int64 // ms from the request to its answering try going to the vendor
@@ -1770,6 +1843,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 		try := Try{ID: c.rest, Model: c.model, Effort: sent, Picked: picked, Fixed: fixed, Fast: fast, Start: began, Done: true, Status: call.Status, Millis: time.Since(began).Milliseconds(), Error: call.Error, Queued: queued,
 			Served: call.Usage.Served, Upstream: call.Usage.Upstream, Auto: autoPicked()}
+		if resetFirst != nil {
+			// the reset spent for it before it was asked
+			try.Reset, resetFirst = resetFirst, nil
+		}
 		asName := provider.SentNameOnIn(wiresOf(r.Context()), c.p.ID, accountAgent(c.p), c.model, sent)
 		try.Swapped, try.Routed = swapped(asName, call.Usage.Served), usage.GroupRouted(asName, call.Usage.Served)
 		try.TTFT, try.FirstText = hw.first.ms()
@@ -2087,10 +2164,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// the user lets spend its resets by itself, its week used up,
 			// spends one and is asked again
 			autoReset = true
-			if pick, out, ok := s.autoReset(r.Context(), cands, c); ok {
+			if pick, out, ok := s.autoReset(r.Context(), cands, c, pl.held); ok {
 				try.Fail = failQuota
 				try.Reset = &AutoReset{Who: pick.p.Account.User, Text: out.Text(), Agent: pick.p.Account.Agent}
-				s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
+				s.trace.update(tr, func(t *Route) {
+					t.Tries[len(t.Tries)-1] = try
+					t.Order, t.Left = unhold(t.Order, t.Left, pick)
+				})
 				skipped = append(skipped, c.label()+": "+call.Error, pick.label()+": used one of its resets by itself ("+out.Text()+")")
 				cands = append(cands[:len(cands):len(cands)], pick)
 				continue

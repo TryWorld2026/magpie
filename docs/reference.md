@@ -59,7 +59,10 @@ line; agents connected to magpie lose it when it quits.
 - **Real model lists, nothing compiled in.** With a key in hand magpie asks
   the vendor which models it serves and offers exactly those; the
   [models.dev](https://models.dev) catalog fills in names, reasoning efforts
-  and the list for vendors that have none, and refreshes itself in the
+  and the list for vendors that have none (a model the vendor's own entry
+  doesn't list is named as the other providers serving it name it, so
+  glm-5-turbo reads GLM-5-Turbo under Zhipu as under ZCode; an Azure
+  deployment keeps its own name), and refreshes itself in the
   background once it goes stale. Choose which models each provider exposes,
   or expose them all — a model released this morning is in the picker on
   the next refresh.
@@ -95,7 +98,7 @@ line; agents connected to magpie lose it when it quits.
 | JetBrains Air | `acp.json` in `~/Library/Application Support/JetBrains/Air` (`~/.config/JetBrains/Air` on Linux, `%APPDATA%\JetBrains\Air` on Windows) + `magpie-opencode.json` beside it | model (a `Magpie` ACP agent: OpenCode's `opencode acp` on magpie's provider alone, its models and routing groups in Air's model menu; needs OpenCode installed) |
 | Copilot CLI  | `~/.copilot/settings.json`        | model           |
 | Crush        | `~/.config/crush/crush.json`      | large, small    |
-| DeepSeek Harness (dsh) | `~/.dsh/profiles/*/cordis.patch.yml` (`$DSH_HOME`; a custom provider, Magpie, its key `MAGPIE_GATEWAY_KEY` in `~/.dsh/.env`; on one of magpie's models its `web-search-deepseek` row also goes to the gateway, which searches with the model or Settings › Web search, unless dsh has a `DEEPSEEK_API_KEY` or a row of your own), or `~/.dsh/config.yaml` before dsh 0.1.5 | model, effort |
+| DeepSeek Harness (dsh) | `~/.dsh/profiles/*/cordis.patch.yml` (`$DSH_HOME`; a custom provider, Magpie, its key `MAGPIE_GATEWAY_KEY` in `~/.dsh/.env` and dsh's own key store `~/.dsh/.credentials.yaml`, which the desktop app reads; on one of magpie's models its `web-search-deepseek` row also goes to the gateway, which searches with the model or Settings › Web search, unless dsh has a `DEEPSEEK_API_KEY` or a row of your own), or `~/.dsh/config.yaml` before dsh 0.1.5 | model, effort |
 | Reasonix Studio (2.x, or a native Go `reasonix` 2.x / 1.39.x CLI) | `~/.reasonix/config.toml` + `.env` (`%APPDATA%/reasonix` on Windows; `$REASONIX_HOME`) | model (Executor), planner (Plan), effort (a dedicated `magpie` provider, shared by Studio and the native CLI) |
 | Command Code | `~/.commandcode/settings.json` (+ `providers.json`) | model |
 | fx           | `~/.fx/settings.json`             | model (a keyless `magpie` provider) |
@@ -202,6 +205,14 @@ Its list is the models the shared magpie's agents are shown, each named with
 its provider there (`Claude Sonnet 5 · Relay A · office`) — the ids stay ids
 (`office/relay-a/claude-sonnet-5`), only these labels carry the names — and its image
 models are listed under Settings → Images and draw through it.
+Its quotas show too: the Usage page, the menu bar and `magpie quota` list the
+shared magpie's cards named with it (`Codex · office`, id `office/codex`), as
+that magpie last read them — only the computer holding the sign-ins asks the
+vendors, and it answers from what it has kept (`GET /v1/magpie/quotas/cards`).
+A card's refresh here has it read that card once more
+(`POST /v1/magpie/quotas/refresh`, at most once in 30 seconds a card); until it
+has read anything, the remote's one card says so. Their history is shown with
+its own. A Codex reset or a check-in is pressed on that computer, not here.
 
 Codex's native image tool first asks the provider that served its conversation
 turn for the requested image model. If that provider does not list the model,
@@ -826,6 +837,19 @@ login, or as `<provider>/<account>` when two subscriptions share it.
 `--timeout 6h` exits 1 if it passes first, `--quiet` says nothing; an
 unknown name exits 2 and Ctrl+C 130.
 
+A ChatGPT account that holds credits keeps answering once a usage window is
+used up: the vendor spends the credits, so a task goes on. That is the
+default. `magpie quota credits <account> off` (or *Use credits* on the
+account's Usage card) turns it off for that account: the gateway then holds
+it as used up till the window renews, and requests go to the other
+accounts, groups and fallbacks; with none left, the request gets a 429
+saying why, unless the account spends its resets by itself and its week is
+used up, when a reset is spent first. `magpie quota credits` lists the
+accounts set not to spend them, `magpie quota credits <account>` says one's.
+It changes the gateway's routing only, never the account Codex is signed in
+to. The credits an account holds show beside its windows in `magpie quota`,
+`magpie accounts`, the Usage page and the menu bar panel.
+
 The *Gateway* tab in the app has this as copy buttons and ready-made
 snippets (shell, curl, Python, Node) for each API, the list of model ids,
 and the recent calls; `MAGPIE_DEBUG=1` logs every call to the terminal.
@@ -842,7 +866,13 @@ native model or disconnecting removes `model_provider` and the catalog. The
 still be opened. Codex won't load its config at all when `model_provider =
 "magpie"` has no table ("Model provider `magpie` not found"). If another
 tool leaves that state behind, magpie writes the table back the next time
-it syncs. Your ChatGPT sign-in is never touched.
+it syncs. Signed in to ChatGPT (the sign-in field's default), Codex keeps
+its own provider and sign-in, and magpie's models join its list through
+`openai_base_url`. magpie becomes Codex's provider then only while the
+Codex app holds the account (OpenAI no longer allows it, and it has no
+credits left or is at a spend cap), since the app sends nothing for it, and steps back once the
+account has room again. A window at 100% with credits left doesn't count:
+Codex keeps sending on those. Your ChatGPT sign-in is never touched.
 Codex reads its model list at start-up, so restart it after a switch.
 
 **OpenCode, Pi, Crush** get a `magpie` provider entry and `magpie/provider/model`.
@@ -1111,6 +1141,7 @@ magpie sync                     # refresh the models.dev catalog and every live 
 
 magpie quota                    # what is left of every subscription, plan and key balance
 magpie quota wait codex         # block until a Codex account has allowance again
+magpie quota credits me@example.com off   # hold a ChatGPT account at its limit, not spending credits
 ```
 
 In the app, click any value to open a filtered list; type to search or to

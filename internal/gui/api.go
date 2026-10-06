@@ -367,6 +367,9 @@ type settingsJSON struct {
 	CodexWarmed *time.Time `json:"codexWarmed,omitempty"`
 	// and the Claude warm-up
 	ClaudeWarmed *time.Time `json:"claudeWarmed,omitempty"`
+	// the ChatGPT accounts signed in, each of which can have a daily
+	// warm-up time of its own (#957)
+	CodexUsers []string `json:"codexUsers,omitempty"`
 	// whether a WorkBuddy (China) account is signed in, and each one's
 	// last daily check-in
 	WorkBuddy         bool                        `json:"workbuddy"`
@@ -377,6 +380,9 @@ type settingsJSON struct {
 	// and a MiniMax Code (China) account (its plugin's), and theirs (#811)
 	MiniMax         bool                        `json:"minimax"`
 	MiniMaxCheckins []provider.WorkBuddyCheckin `json:"minimaxCheckins,omitempty"`
+	// and a Qoder or Qoder CN account (its plugin's), and theirs
+	Qoder         bool                        `json:"qoder"`
+	QoderCheckins []provider.WorkBuddyCheckin `json:"qoderCheckins,omitempty"`
 	// FX is the dollar-to-yuan rate the cny currency choice shows costs at
 	FX fxJSON `json:"fx"`
 	// NotifyProblem is why a usage alert set wouldn't be seen: "denied"
@@ -487,9 +493,11 @@ func settingsState() settingsJSON {
 		s.LANURLs, s.LANContainer = gateway.LANURLs(), gateway.ContainerAddrs()
 	}
 	s.CodexWarmed, s.ClaudeWarmed = latest(provider.CodexWarmed()), latest(provider.ClaudeWarmed())
+	s.CodexUsers = codexUsers()
 	s.WorkBuddy, s.WorkBuddyCheckins = provider.HasWorkBuddy(), provider.WorkBuddyCheckins()
 	s.Trae, s.TraeCheckins = provider.HasTrae(), provider.TraeCheckins()
 	s.MiniMax, s.MiniMaxCheckins = provider.HasMiniMax(), provider.MiniMaxCheckins()
+	s.Qoder, s.QoderCheckins = provider.HasQoder(), provider.QoderCheckins()
 	s.VisionAuto, s.VisionModels = gateway.AutoVision(), []modelRef{}
 	for _, e := range provider.Served() {
 		if e.Images && (e.ImageInput == nil || *e.ImageInput) && (e.Group != "" || e.Provider.Ready()) {
@@ -978,6 +986,10 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		in.ChinaMirror = cur.ChinaMirror // the Plugins page's, set on its own
 		// which Codex accounts spend a reset by themselves, set on the Usage card
 		in.CodexAutoReset = cur.CodexAutoReset
+		// and which of them spend their credits, set there too
+		in.CodexNoCredits = cur.CodexNoCredits
+		// and each Codex account's own daily warm-up (codex-warm-at below)
+		in.CodexWarmAtOf = cur.CodexWarmAtOf
 		// and the text size, which the keyboard changes too (text-size below)
 		in.TextSize = cur.TextSize
 		// the version the Update pill was hidden for, set from the pill
@@ -1188,6 +1200,20 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 	})
 	// whether a Codex account spends one of its resets by itself once its
 	// week is used up, the Usage card's toggle, set on its own
+	// a Codex account's own daily warm-up time: "06:00", "off", or "" to
+	// follow the one for all (#957)
+	mux.HandleFunc("POST /api/settings/codex-warm-at", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ User, At string }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		if err := provider.SetCodexWarmAt(in.User, in.At); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
+	})
 	mux.HandleFunc("POST /api/settings/codex-auto-reset", func(rw http.ResponseWriter, r *http.Request) {
 		var in struct {
 			User string
@@ -1202,6 +1228,27 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 			return
 		}
 		if err := provider.SetCodexAutoReset(in.User, in.On); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
+	})
+	// whether a Codex account spends its credits once its allowance is
+	// used up, the Usage card's toggle, set on its own
+	mux.HandleFunc("POST /api/settings/codex-credits", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct {
+			User string
+			On   bool
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		if strings.TrimSpace(in.User) == "" {
+			fail(rw, fmt.Errorf("which Codex account?"))
+			return
+		}
+		if err := provider.SetCodexCredits(in.User, in.On); err != nil {
 			fail(rw, err)
 			return
 		}
@@ -1247,6 +1294,21 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		}
 		s := settings.Load()
 		s.MiniMaxCheckin = in.On
+		if err := settings.Save(s); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
+	})
+	// and Qoder's daily credits
+	mux.HandleFunc("POST /api/settings/qoder-checkin", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ On bool }
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		s := settings.Load()
+		s.QoderCheckin = in.On
 		if err := settings.Save(s); err != nil {
 			fail(rw, err)
 			return
@@ -1600,4 +1662,15 @@ func tilde(p string) string {
 		return "~" + p[len(home):]
 	}
 	return p
+}
+
+// codexUsers is the ChatGPT accounts signed in, by name, each once.
+func codexUsers() []string {
+	var out []string
+	for _, l := range provider.Logins("codex") {
+		if l.User != "" && !slices.ContainsFunc(out, func(u string) bool { return strings.EqualFold(u, l.User) }) {
+			out = append(out, l.User)
+		}
+	}
+	return out
 }

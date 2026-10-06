@@ -92,6 +92,44 @@
   const reqs = el("div", "list rt-reqs");
   // the days the history keeps on disk, to look back at one: see listed
   const dayBar = el("div", "rt-days");
+  // the days past the bar's width go under one more pill, whose menu lists
+  // them (#961): the bar scrolled with its scrollbar hidden, so they were cut
+  // off and out of reach of a mouse wheel. The day looked at stays in
+  // sight: when it is one of them, the pill is named by it
+  const moreDays = el("button", "rt-day rt-day-more");
+  moreDays.type = "button";
+  moreDays.setAttribute("aria-haspopup", "menu");
+  moreDays.setAttribute("aria-expanded", "false");
+  let unseenDays = [];
+  moreDays.onclick = (e) => {
+    e.stopPropagation();
+    if (moreDays.classList.contains("open")) return closeProtoMenu();
+    openProtoMenu(moreDays, unseenDays.map((d) => ({ v: d.day, name: dayName(d.day), literalName: true, note: String(d.requests) })),
+      day, (v) => { if (v !== day) lookAt(v); }, "Earlier days", "rt-days-menu");
+  };
+  function nameMoreDays() {
+    const picked = unseenDays.find((d) => d.day === day);
+    moreDays.classList.toggle("on", !!picked);
+    moreDays.setAttribute("aria-pressed", String(!!picked));
+    moreDays.replaceChildren(el("span", "", picked ? dayName(picked.day) : t("Earlier days")),
+      ...(picked ? [el("small", "", String(picked.requests))] : []), svg(CHEV, 10, 1.6));
+  }
+  function fitDays() {
+    if (!dayBar.clientWidth) return; // out of sight: fitted when it shows
+    const pills = [...dayBar.children].filter((x) => x !== moreDays);
+    for (const x of pills) x.hidden = false;
+    unseenDays = [];
+    if (dayBar.scrollWidth <= dayBar.clientWidth + 1) { moreDays.remove(); return; }
+    dayBar.append(moreDays);
+    // pills[0] is Live, pills[i] days[i - 1], newest first: the oldest go
+    for (let i = pills.length - 1; i >= 1; i--) {
+      pills[i].hidden = true;
+      unseenDays.unshift(days[i - 1]);
+      nameMoreDays();
+      if (dayBar.scrollWidth <= dayBar.clientWidth + 1) break;
+    }
+  }
+  new ResizeObserver(() => fitDays()).observe(dayBar);
   const groupBar = el("div", "rt-group-by");
   let bySession = false;
   try { bySession = localStorage.getItem("magpie.routingBySession") === "1"; } catch {}
@@ -298,7 +336,7 @@
   // from its vendor does — relays list each key its own group's models
   // or the user set the account or key to serve other models only (#474)
   // or it is held at the usage cap the user set on the account
-  const unlistedWord = (w) => w.held ? t("not an account the gateway key may use") : w.capped ? t("held at its {cap}% usage cap", { cap: w.capped }) : w.barred ? t("set to serve other models, not {model}", { model: w.model }) : w.kind === "key" ? t("{name}'s list for this key has no {model}", { name: w.name, model: w.model }) : t("its plan doesn't list {model}", { model: w.model });
+  const unlistedWord = (w) => w.held ? t("not an account the gateway key may use") : w.noCredits ? t("held: its allowance used up, set not to spend credits") : w.capped ? t("held at its {cap}% usage cap", { cap: w.capped }) : w.barred ? t("set to serve other models, not {model}", { model: w.model }) : w.kind === "key" ? t("{name}'s list for this key has no {model}", { name: w.name, model: w.model }) : t("its plan doesn't list {model}", { model: w.model });
   const group = (w) => w.used >= 98 ? "spent" : w.used >= 90 ? "low" : "fine";
   const renews = (w) => (w.renews || []).map((s) => known0(s) ? at(s) : 0);
   // renewsBy is renews as Smart ranks them: an auto-used Codex reset that
@@ -437,6 +475,8 @@
     for (const x of r.order.filter((x) => x.aside)) out.push(t("{who} is made for {api}, not {other} as the keys routed over are, so it isn't one of them: it's tried after them.", { who: who(x), api: API[x.speaks] || x.speaks || t("any API"), other: API[pooled?.speaks] || pooled?.speaks || t("any API") }));
     for (const x of r.left || []) out.push(x.held
       ? t("{who} is left out: the gateway key asking may not use its account.", { who: who(x) })
+      : x.noCredits
+      ? t("{who} is left out: a usage window is used up, and the account is set not to spend its credits, so it counts as used up until that window renews.", { who: who(x) })
       : x.capped
       ? t("{who} is left out: a usage window is at {n}, past the {cap}% cap set on the account, so it counts as used up until that window renews.", { who: who(x), n: pct(x.used), cap: x.capped })
       : x.barred
@@ -1486,6 +1526,7 @@
     dayBar.dataset.key = key;
     dayBar.replaceChildren(b("", t("Live")), ...days.map((d) => b(d.day, dayName(d.day), d.requests)));
     dayBar.hidden = !days.length && !day;
+    fitDays();
   }
   // the list's head, made once: a trace update redraws the list, and a
   // button made again each time is one WebKit may drop a click on
@@ -3001,8 +3042,8 @@
     }
     const idIn = g ? keys(input(d.id, g.id)) : null;
     const idOf = () => {
-      if (g) return slug(d.id) || g.id;
-      let id = slug(d.name) || "group", n = 1;
+      if (g) return groupSlug(d.id) || g.id;
+      let id = groupSlug(d.name) || "group", n = 1;
       const base = id;
       while (groups.groups.some((x) => x.id === id)) id = `${base}-${++n}`;
       return id;
