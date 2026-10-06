@@ -10,6 +10,8 @@ import (
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/jsonc"
+
+	"github.com/yetone/magpie/internal/appdir"
 )
 
 // Factory's Droid keeps a session under its sessions folder
@@ -31,7 +33,7 @@ import (
 // FactoryDir is Droid's folder: $FACTORY_HOME_OVERRIDE/.factory, else
 // ~/.factory.
 func FactoryDir() string {
-	home := strings.TrimSpace(os.Getenv("FACTORY_HOME_OVERRIDE"))
+	home := strings.TrimSpace(appdir.Getenv("FACTORY_HOME_OVERRIDE"))
 	if home == "" {
 		home, _ = os.UserHomeDir()
 	} else {
@@ -167,6 +169,9 @@ func parseDroid(f file) *state {
 			var st droidStart
 			if l.Type == "session_start" && json.Unmarshal(b, &st) == nil {
 				s.ID, s.Cwd, s.Named = st.ID, st.Cwd, title(st.Title)
+				if s.Named == "New Session" {
+					s.Named = "" // Droid's until it names one
+				}
 				if st.LastCwd != "" {
 					s.Cwd = st.LastCwd
 				}

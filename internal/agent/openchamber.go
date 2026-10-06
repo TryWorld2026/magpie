@@ -29,13 +29,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
 )
 
 // openChamberDir is where OpenChamber keeps its settings.
 func openChamberDir(home string) string {
-	if d := os.Getenv("OPENCHAMBER_DATA_DIR"); d != "" {
+	if d := appdir.Getenv("OPENCHAMBER_DATA_DIR"); d != "" {
 		if abs, err := filepath.Abs(d); err == nil {
 			return abs
 		}
@@ -181,7 +182,7 @@ func openChamber(home, cfg string) *Agent {
 		return edit.DelJSON(ocPath, "provider."+magpieID)
 	}
 	return &Agent{
-		ID: "openchamber", Name: "OpenChamber", Icon: "openchamber", Aliases: []string{"chamber"},
+		ID: "openchamber", Name: "OpenChamber", Icon: "openchamber", Aliases: []string{"chamber"}, Spelled: openCodeSpelled(ocPath, gatewayV1),
 		// its model requests are its OpenCode's, and counted as OpenCode's
 		Bin: "openchamber", Dir: s.dir, Path: s.prefs(),
 		Notice: func() string {

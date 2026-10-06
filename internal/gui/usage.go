@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/yetone/magpie/internal/access"
@@ -124,7 +125,7 @@ func csvStamp(p usage.Period, day string) string {
 
 func ledgerFilter(q url.Values) usage.Filter {
 	id, _ := strconv.ParseInt(q.Get("route"), 10, 64)
-	return usage.Filter{Day: q.Get("day"), RouteID: id, Model: q.Get("model"), Agent: q.Get("agent"), Provider: q.Get("provider"), Account: q.Get("account"), CallerKey: q.Get("callerKey"), Failed: q.Get("failed") == "1", Query: q.Get("q"), Computer: q.Get("computer")}
+	return usage.Filter{Day: q.Get("day"), RouteID: id, Model: q.Get("model"), Agent: q.Get("agent"), Provider: q.Get("provider"), Purpose: q.Get("purpose"), Account: q.Get("account"), CallerKey: q.Get("callerKey"), Failed: q.Get("failed") == "1", Query: q.Get("q"), Computer: q.Get("computer")}
 }
 
 // ledgerRow is a usage.Row with the names the page shows it by.
@@ -149,16 +150,18 @@ type ledgerJSON struct {
 	// Series: the period by hour, day or week (Bucket), before the day filter
 	Bucket string              `json:"bucket"`
 	Series []usage.SeriesPoint `json:"series"`
-	// By: the rows told apart by provider, agent and model, the most tokens
+	// By: the rows told apart by provider, agent, model and model at each
+	// provider ("modelAt", named "model · provider"), the most tokens
 	// first. The one by a dimension the filter has picked is of the rows
 	// without that pick, so the others are still there to switch to.
 	By      map[string][]ledgerShare `json:"by"`
 	ChartBy map[string][]ledgerShare `json:"chartBy,omitempty"`
 	Day     string                   `json:"day,omitempty"`
 	usage.Totals
-	// Agents and Providers: those with calls in the period, for the filters
+	// Agents, Providers and Purposes: those with calls in the period, for the filters
 	Agents    []ledgerAgent `json:"agents"`
 	Providers []ledgerAgent `json:"providers"`
+	Purposes  []string      `json:"purposes"`
 	// Accounts: the subscription accounts that answered calls in the
 	// period, for the Account filter (#557)
 	Accounts []ledgerAccount `json:"accounts"`
@@ -227,6 +230,7 @@ func ledgerPage(p usage.Period, f usage.Filter, offset, limit int) ledgerJSON {
 	}
 	out := ledgerJSON{Period: p, Rows: make([]ledgerRow, 0, len(page)), Offset: offset, Total: l.Total, Totals: l.Sum, Agents: []ledgerAgent{}, Providers: []ledgerAgent{}, Accounts: []ledgerAccount{}}
 	out.Bucket, out.Series = l.Bucket, l.Series
+	out.Purposes = l.Purposes
 	out.Day = f.Day
 	out.CallerKeys = callerUsageGroups(usage.Summary{CallerKeys: l.CallerKeys})
 	callerLabels := map[string]string{}
@@ -291,6 +295,11 @@ func ledgerPage(p usage.Period, f usage.Filter, offset, limit int) ledgerJSON {
 				case "agent":
 					a := who(s.ID)
 					ls.Name, ls.Icon = a.Name, a.Icon
+				case "modelAt":
+					// the model, and the provider it went to
+					prov, model, _ := strings.Cut(s.ID, "/")
+					a := which(prov)
+					ls.Name, ls.Icon = model+" · "+a.Name, a.Icon
 				}
 				shares = append(shares, ls)
 			}
@@ -432,6 +441,26 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 		defer cancel()
 		// a WorkBuddy (China) account's card says how its daily check-in
 		// went (#694)
+		qs := provider.WithCheckins(provider.Quotas(ctx))
+		// an account's card may be the stale copy a read under way will
+		// replace: the page asks again until it has landed (#959)
+		if provider.SubscriptionUsageReading() {
+			rw.Header().Set("X-Magpie-Reading", "1")
+		}
+		writeJSON(rw, qs)
+	})
+	// One card read again, from its refresh button (#840): ?provider= and,
+	// of a card with several accounts, &user=; the others are left as they
+	// were read. The answer is every card, as GET's.
+	mux.HandleFunc("POST /api/usage/quotas/refresh", func(rw http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("provider")
+		if id == "" {
+			http.Error(rw, "provider is required", http.StatusBadRequest)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		provider.RefreshUsage(ctx, id, r.URL.Query().Get("user"))
 		writeJSON(rw, provider.WithCheckins(provider.Quotas(ctx)))
 	})
 	// WorkBuddy's daily check-in pressed now, from the Usage card, for
@@ -451,6 +480,16 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 		ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
 		defer cancel()
 		rs := provider.CheckInTrae(ctx)
+		if rs == nil {
+			rs = []provider.WorkBuddyCheckin{}
+		}
+		writeJSON(rw, rs)
+	})
+	// and MiniMax Code's, for each MiniMax Code (China) account (#811)
+	mux.HandleFunc("POST /api/usage/minimax-checkin", func(rw http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
+		defer cancel()
+		rs := provider.CheckInMiniMax(ctx)
 		if rs == nil {
 			rs = []provider.WorkBuddyCheckin{}
 		}

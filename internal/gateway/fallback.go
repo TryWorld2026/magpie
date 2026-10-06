@@ -15,8 +15,11 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"slices"
@@ -91,13 +94,24 @@ func (c candidate) isOpenRouterFree() bool {
 	return c.p.Preset == "openrouter" && strings.HasSuffix(c.model, ":free")
 }
 
-// restID is a free OpenRouter model's own rest key. A rate limit on that
-// model is its free-tier limit, while an account-level rest stays on restKey.
+// restID is the candidate's model's own rest key: a free OpenRouter
+// model's, whose rate limit is its free-tier limit, and a subscription's,
+// out of a pool of its allowance that counts some models only (pooled).
+// An account-level rest stays on restKey.
 func (c candidate) restID() string {
-	if c.isOpenRouterFree() {
+	if c.isOpenRouterFree() || c.p.Account != nil {
 		return c.restKey() + "/" + c.model
 	}
 	return c.restKey()
+}
+
+// pooled says whether the candidate's subscription, refused for its
+// allowance, is out for its model alone (provider.Allowance.Pooled).
+func (c candidate) pooled(now time.Time) bool {
+	if c.p.Account == nil {
+		return false
+	}
+	return allowances(c.p.Account.UsageAgent())[c.p.Account.User].Pooled(c.model, provider.SpentShareOf(c.p.Routing), now)
 }
 
 // who is the key or account itself, however many the provider has on: a
@@ -299,7 +313,7 @@ func (s *Server) plan(p provider.Provider, model string, from provider.Protocol)
 		cs, wg := weigh(q, cs, m, from)
 		for i, c := range cs {
 			w := weighed(c, q, wg, fallback, from)
-			w.Turn = i == 0 && q.Routing == provider.Rotate && len(cs) > 1
+			w.Turn = i == 0 && (q.Routing == provider.Rotate || q.Routing == provider.Weighted) && len(cs) > 1
 			pl.order = append(pl.order, w)
 		}
 		pl.order = append(pl.order, asideOf(aside, q, fallback, from)...)
@@ -461,7 +475,7 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 		cs, wg := weigh(m.Provider, keys(m), m.Model, from)
 		for k, c := range cs {
 			w := weighed(c, m.Provider, wg, false, from)
-			w.Turn = k == 0 && m.Provider.Routing == provider.Rotate && len(cs) > 1
+			w.Turn = k == 0 && (m.Provider.Routing == provider.Rotate || m.Provider.Routing == provider.Weighted) && len(cs) > 1
 			w.Via = m.Groups()
 			pl.order = append(pl.order, w)
 		}
@@ -635,6 +649,12 @@ var unservedWords = regexp.MustCompile(`(?i)model.{0,80}(not (supported|accessib
 // channel" to a chat opening with another agent's own system prompt — a
 // refusal of the provider, not of the request, another member may serve.
 var refusedWords = regexp.MustCompile(`(?i)unapproved channel|illegal api invocation`)
+
+// promptRefused says a vendor answered with that refusal: the agent's
+// prompt, not the account, is at fault.
+func promptRefused(status int, body []byte) bool {
+	return status >= 400 && refusedWords.Match(body)
+}
 
 // shapeWords are how a vendor says it can't read the request's shape — an
 // item, field or parameter it doesn't know, which another vendor's API may
@@ -817,6 +837,30 @@ func matesFirst(left []candidate, c candidate) {
 	copy(left, append(mates, others...))
 }
 
+// matesLast puts last, of the candidates left, the other keys or accounts
+// of the member c is of: what turns one of them away is in the request, so
+// it turns them all away the same, and the group is better spent on a
+// member that answers (#666). Antigravity refuses Claude Code's and its
+// Agent SDK's system prompt whichever account is asked.
+func matesLast(left []candidate, c candidate) {
+	mate := func(x candidate) bool {
+		if x.p.ID != c.p.ID || x.model != c.model || x.effort != c.effort || x.who() == c.who() {
+			return false
+		}
+		_, resting := restOf(x.restKey())
+		return !resting
+	}
+	var mates, others []candidate
+	for _, x := range left {
+		if mate(x) {
+			mates = append(mates, x)
+		} else {
+			others = append(others, x)
+		}
+	}
+	copy(left, append(others, mates...))
+}
+
 // holdWriter keeps an error reply back while another provider may still
 // answer: headers and body wait until release, or are dropped for the next
 // try. Anything else goes straight through — but for a stream, only once
@@ -839,6 +883,11 @@ type holdWriter struct {
 	failMsg    string
 	sharedPool bool // an OpenRouter upstream pool rejected this attempt
 
+	// turnedAway: the account is asked with the system prompt Antigravity
+	// answers with a 429 whatever quota it has left — Claude Code's, its
+	// Agent SDK's — so the account isn't at fault and doesn't rest (#666)
+	turnedAway bool
+
 	// refused: the vendor's safety filter ended the reply before any of it
 	// was said — Anthropic's stop_reason "refusal", OpenAI's content_filter
 	// — which another account or model may answer (#248)
@@ -857,6 +906,14 @@ type holdWriter struct {
 
 	ended bool   // the stream's last event was written: the reply is whole
 	tail  []byte // the end of the last write, for a marker split across two
+	// ctx is the agent's request: a stream's last event written once it
+	// has gone reached nobody, and doesn't make the reply whole (#751)
+	ctx context.Context
+
+	// alive is the request's, shared by its tries: a stream held for its
+	// reasoning keeps the agent from its idle timeout with SSE comments
+	// meanwhile (#751)
+	alive *keptAlive
 
 	first firstToken // when its first content and text came (#196)
 
@@ -865,7 +922,30 @@ type holdWriter struct {
 	// connection open after it — a 429 said as an event — kept the agent
 	// waiting with nothing sent, the next account never asked
 	stop func()
+
+	// streams: the agent asked for a stream, which watch keeps alive
+	// while the vendor says nothing (#947)
+	streams bool
+	// heard is when the vendor last gave the try something to write, and
+	// wrote when the agent was last written to; atLine says that was a
+	// whole line, after which an SSE comment may go
+	heard, wrote time.Time
+	atLine       bool
+
+	// mu keeps a try's writes apart from watch, which ends a try that is
+	// slow to start and keeps a quiet one's agent alive from its own
+	// goroutine
+	mu sync.Mutex
+	// firstWait is how long a try may take to its first content before
+	// the next member is asked (Group.FirstToken), 0 for as long as it
+	// takes; slow says it took longer, and was let go with nothing sent
+	firstWait time.Duration
+	slow      bool
 }
+
+// errSlowStart is what a try's writes get once it was let go for taking
+// longer than its group waits for a first token.
+var errSlowStart = errors.New("let go: no first token in time")
 
 func newHoldWriter(w http.ResponseWriter, hold bool) *holdWriter {
 	return &holdWriter{w: w, hold: hold, header: http.Header{}, first: firstToken{start: time.Now()}}
@@ -874,7 +954,13 @@ func newHoldWriter(w http.ResponseWriter, hold bool) *holdWriter {
 func (h *holdWriter) Header() http.Header { return h.header }
 
 func (h *holdWriter) WriteHeader(code int) {
-	if h.status != 0 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.writeHeader(code)
+}
+
+func (h *holdWriter) writeHeader(code int) {
+	if h.status != 0 || h.slow {
 		return
 	}
 	h.status = code
@@ -894,6 +980,11 @@ func (h *holdWriter) WriteHeader(code int) {
 }
 
 func (h *holdWriter) pass() {
+	if h.alive != nil && h.alive.sent {
+		// the agent has the stream's headers already, from keepAlive
+		h.passing = true
+		return
+	}
 	dst := h.w.Header()
 	for k, v := range h.header {
 		if k != resetsHeader && k != refusedHeader { // magpie's own notes, for restAfter and settle
@@ -901,16 +992,23 @@ func (h *holdWriter) pass() {
 		}
 	}
 	h.w.WriteHeader(h.status)
-	h.passing = true
+	h.passing, h.wrote, h.atLine = true, time.Now(), true
 }
 
 func (h *holdWriter) Write(b []byte) (int, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.slow {
+		return 0, errSlowStart
+	}
 	if h.status == 0 {
-		h.WriteHeader(http.StatusOK)
+		h.writeHeader(http.StatusOK)
 	}
 	h.see(b)
 	h.first.see(b)
+	h.heard = time.Now()
 	if h.passing {
+		h.sent(b)
 		return h.w.Write(b)
 	}
 	n, err := h.held.Write(b)
@@ -931,7 +1029,7 @@ var streamEnds = [][]byte{
 // see notes a stream's last event going by. An agent may hang up as soon as
 // it has that — Codex does — and a reply it had whole is not canceled.
 func (h *holdWriter) see(b []byte) {
-	if h.ended {
+	if h.ended || h.ctx != nil && h.ctx.Err() != nil {
 		return
 	}
 	buf := append(h.tail, b...)
@@ -1027,20 +1125,91 @@ func (h *holdWriter) scan() {
 	if h.thinking {
 		longest = max(longest, holdThinking)
 	}
+	// a group that asks the next member when one is slow to start holds
+	// the stream until then, for nothing of it to have reached the agent
+	waiting := h.firstWait > 0 && h.first.first == 0
+	if waiting {
+		longest = max(longest, h.firstWait+time.Second)
+	}
 	if h.held.Len() > holdMost || time.Since(h.since) > longest {
 		h.flow()
+		return
+	}
+	if (h.thinking || h.buffered || waiting) && time.Since(h.since) >= keepHeldAfter {
+		h.keepAlive()
+	}
+}
+
+// keepHeldAfter is how long a stream held for its reasoning waits before
+// its agent is first kept alive, as long as a stream with nothing in it
+// is held (holdLongest); a refusal after it still goes to another account,
+// whose stream follows the comments in the same response.
+var keepHeldAfter = holdLongest
+
+// keptAlive is what a request's held streams have sent its agent ahead of
+// a reply: the stream's headers and SSE comments, nothing of the reply.
+type keptAlive struct {
+	proto provider.Protocol
+	sent  bool      // the stream's 200 and headers went out
+	at    time.Time // the last comment
+}
+
+// keepAlive tells the agent of a stream held past keepHeldAfter for its
+// reasoning that it goes on, every keepaliveEvery: held for up to
+// holdThinking (4 minutes), the agent heard nothing at all, and Alma's
+// idle timeout for a reasoning model, 240s, ended the turn first (#751). A
+// comment is no event in any protocol, so another account may still answer
+// after it, its stream going on in the same response (pass).
+func (h *holdWriter) keepAlive() {
+	a := h.alive
+	// a Gemini stream has none, as geminiEncoder.keepalive: agy fails on
+	// the comment ("invalid stream chunk: : keepalive", #934)
+	if a == nil || a.proto == provider.Gemini || time.Since(a.at) < keepaliveEvery {
+		return
+	}
+	if !a.sent {
+		dst := h.w.Header()
+		for k, v := range h.header {
+			if k != resetsHeader && k != refusedHeader && k != "Content-Length" {
+				dst[k] = v
+			}
+		}
+		dst.Set("Content-Type", "text/event-stream; charset=utf-8")
+		h.w.WriteHeader(http.StatusOK)
+		a.sent = true
+	}
+	// no blank line after it, as sseWriter.comment
+	_, _ = io.WriteString(h.w, ": keepalive\n")
+	a.at = time.Now()
+	h.wrote, h.atLine = a.at, true
+	if f, ok := h.w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// sent notes b going to the agent.
+func (h *holdWriter) sent(b []byte) {
+	if len(b) > 0 {
+		h.wrote, h.atLine = time.Now(), b[len(b)-1] == '\n'
 	}
 }
 
 // flow lets a held stream through, and what follows it.
 func (h *holdWriter) flow() {
 	h.pass()
+	h.sent(h.held.Bytes())
 	h.w.Write(h.held.Bytes())
 	h.held.Reset()
-	h.Flush()
+	h.flush()
 }
 
 func (h *holdWriter) Flush() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.flush()
+}
+
+func (h *holdWriter) flush() {
 	if f, ok := h.w.(http.Flusher); ok && h.passing {
 		f.Flush()
 	}
@@ -1096,14 +1265,142 @@ func (h *holdWriter) failed() bool {
 	return !h.passing && h.code() >= 400 && retryable(h.code(), h.errBody())
 }
 
+// mayAskAgain tells whether a failure now is still held, for the request
+// to ask again or of another: nothing of the try has reached the agent.
+func (h *holdWriter) mayAskAgain() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.hold && !h.passing
+}
+
 // release sends a held reply after all: nobody else is left to try.
 func (h *holdWriter) release() {
 	if h.passing || h.status == 0 {
 		return
 	}
+	if h.alive != nil && h.alive.sent && !h.stream {
+		// an error status, once the agent has a stream: told as its error
+		h.passing = true
+		streamError(h.w, h.alive.proto, h.status, provider.APIError(h.held.Bytes(), http.StatusText(h.status)))
+		return
+	}
 	h.pass()
 	h.w.Write(h.held.Bytes())
-	h.Flush()
+	h.flush()
+}
+
+// watchEvery is how often watch looks at a try.
+var watchEvery = time.Second
+
+// watch lets the try go — stop, with slow said — once firstWait passes
+// with no first content and nothing of it sent to the agent: the stream
+// held, or no reply begun at all. And it keeps the agent of a stream alive
+// while the vendor says nothing (keepQuiet), a vendor that says nothing
+// running no scan. The returned func ends the watch, and returns once it
+// has.
+func (h *holdWriter) watch() func() {
+	first := h.firstWait > 0 && h.stop != nil
+	if !first && !h.streams {
+		return func() {}
+	}
+	done, over := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(over)
+		var deadline <-chan time.Time
+		if first {
+			t := time.NewTimer(h.firstWait)
+			defer t.Stop()
+			deadline = t.C
+		}
+		tick := time.NewTicker(watchEvery)
+		defer tick.Stop()
+		h.mu.Lock()
+		began := time.Now()
+		if h.heard.IsZero() {
+			h.heard = began // the request to the vendor, nothing heard yet
+		}
+		h.mu.Unlock()
+		for {
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+				h.mu.Lock()
+				if first && h.started() {
+					first = false
+				}
+				if !first && !h.streams {
+					h.mu.Unlock()
+					return
+				}
+				if time.Since(began) >= keepHeldAfter {
+					h.keepQuiet()
+				}
+				h.mu.Unlock()
+			case <-deadline:
+				deadline = nil
+				if !first {
+					continue
+				}
+				h.mu.Lock()
+				if !h.started() {
+					h.slow = true
+				}
+				h.mu.Unlock()
+				if h.slow {
+					h.stop()
+					return
+				}
+				first = false
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-over
+	}
+}
+
+// keepQuiet keeps the agent of a stream alive with SSE comments while the
+// vendor says nothing, every keepaliveEvery for up to keepaliveLongest
+// since it last did: a vendor that sent its 200 and response.created, then
+// nothing while it reasoned, had the stream held with none of it sent,
+// and Cloudflare in front of a remote magpie ended the request at 125s
+// (524) with the agent sent nothing at all; one quiet mid-reply was reset
+// by it as well (#947). Held, the agent is sent the stream's headers and
+// comments only (keepAlive), none of the try, which another account may
+// still answer instead; passed, a comment goes between two lines of it.
+func (h *holdWriter) keepQuiet() {
+	if h.slow || h.ended || h.alive == nil || h.alive.proto == provider.Gemini || h.ctx != nil && h.ctx.Err() != nil {
+		return
+	}
+	if !h.heard.IsZero() && time.Since(h.heard) >= keepaliveLongest {
+		return // a stream stuck this long is left for a timeout to end
+	}
+	if !h.passing {
+		// only a stream, or no reply yet to an agent that asked for one;
+		// an error held is told as the stream's own once the 200 is out
+		if h.hold && h.failure == 0 && !h.whole && h.status < 400 && (h.stream || h.status == 0) {
+			h.keepAlive()
+		}
+		return
+	}
+	if !h.atLine || time.Since(h.wrote) < keepaliveEvery || !strings.HasPrefix(h.w.Header().Get("Content-Type"), "text/event-stream") {
+		return
+	}
+	// no blank line after it, as sseWriter.comment
+	_, _ = io.WriteString(h.w, ": keepalive\n")
+	h.wrote = time.Now()
+	if f, ok := h.w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// started says whether the try has begun its reply, or ended, as far as
+// watch need know: its first content, anything sent on to the agent,
+// a failure, or a reply that isn't streamed.
+func (h *holdWriter) started() bool {
+	return h.first.first != 0 || h.passing || h.ended || h.failure != 0 || h.whole || h.status >= 400
 }
 
 // eventEnd is where the first whole event in b ends, or -1.
@@ -1671,6 +1968,9 @@ func pinTo(want string, cands []candidate, pl planned) ([]candidate, planned, in
 		return nil, pl, http.StatusTooManyRequests, AccountHeader + ": " + strings.Join(rests, "; ") + "; no other account is tried in its place"
 	}
 	for _, w := range pl.left {
+		if match(w) && w.Held {
+			return nil, pl, http.StatusForbidden, fmt.Sprintf("%s: the gateway key may not use %s's account", AccountHeader, w.Who)
+		}
 		if match(w) && w.Capped > 0 {
 			msg, _ := cappedError(w.Model, []Weighed{w}, time.Now())
 			return nil, pl, http.StatusTooManyRequests, AccountHeader + ": " + msg + "; no other account is tried in its place"

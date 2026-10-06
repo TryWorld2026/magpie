@@ -43,11 +43,15 @@ func notShown(plans, subs []SubscriptionQuota) []SubscriptionQuota {
 	})
 }
 
-// sameAccount reports whether two cards are one account read twice: every
-// window of the same length both say when they start again starts again
-// at the same moment, and there is one such at least — a window's reset
-// is when that account first used it.
+// sameAccount matches a GLM key's plan to ZCode (built-in or plugin) by
+// their account-relative resets. A plan's User is a key label, not the
+// subscription's login, so it cannot identify the shared account. Every
+// comparable window must agree, with at least one match. This heuristic
+// must not compare unrelated vendors whose reset schedules can coincide.
 func sameAccount(a, b SubscriptionQuota) bool {
+	if !a.glmPlan || (b.Provider != "zcode" && b.Provider != "zcode-plugin") {
+		return false
+	}
 	if a.Error != "" || b.Error != "" {
 		return false
 	}
@@ -81,6 +85,9 @@ type Quota struct {
 	Balance  string      `json:"balance,omitempty"`
 	Error    string      `json:"error,omitempty"`
 	AsOf     *time.Time  `json:"asOf,omitempty"` // the cached reading's time, nil for a new one
+	// ReadAt is when the windows or balance shown were read, nil when not
+	// known; a Claude account's can be well before now (claudeReadAt).
+	ReadAt *time.Time `json:"readAt,omitempty"`
 	// Until is when the plan's paid time ends, renewed then when Renew is
 	// "auto", over when "off", either when "".
 	Until *time.Time `json:"until,omitempty"`
@@ -125,7 +132,7 @@ func quotaReport(subs, plans, balances []SubscriptionQuota, now time.Time) []Quo
 		qs   []SubscriptionQuota
 	}{{"subscription", subs}, {"plan", plans}, {"balance", balances}} {
 		for _, q := range g.qs {
-			r := Quota{Provider: q.Provider, Name: q.Name, Kind: g.kind, Plan: q.Plan, User: q.User, AsOf: q.AsOf,
+			r := Quota{Provider: q.Provider, Name: q.Name, Kind: g.kind, Plan: q.Plan, User: q.User, AsOf: q.AsOf, ReadAt: q.ReadAt,
 				Windows: []QuotaSpan{}, Balance: q.Balance, Error: q.Error, Until: q.Until, Renew: q.Renew, Resets: q.Resets}
 			// a pool's own windows stand in for the models' drawing on it,
 			// as the usage page shows them

@@ -27,7 +27,10 @@ import (
 // and the app wasn't started with, so that magpie writes an agent's config
 // into the folder the agent reads, not its default one in the home (atie on
 // Discord: Pi's models.json went to ~/.pi/agent with PI_CODING_AGENT_DIR set
-// in the shell). One already in magpie's environment is kept. Those are read
+// in the shell). One already in magpie's environment is kept. One holding a
+// relative path is lent to the programs magpie starts all the same, but
+// magpie itself reads them through appdir.LookupEnv, which passes such a
+// value over, as it does the ones magpie started with. Those are read
 // as magpie starts (the library is synced into the agents at once), so the
 // answer is waited for, but no more than shellWait: a slow profile mustn't
 // hold the window up, and what it says later is still taken.
@@ -164,6 +167,11 @@ func shellEnv() (string, map[string]string) {
 			sh = "/bin/sh"
 		}
 	}
+	return askShell(sh)
+}
+
+// askShell runs sh as a terminal opens it and reads what shellEnv says.
+func askShell(sh string) (string, map[string]string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	// interactive too, since many put PATH in .zshrc/.bashrc
@@ -171,6 +179,17 @@ func shellEnv() (string, map[string]string) {
 	cmd.Stdin = nil
 	out, _ := cmd.Output()
 	return parseShellEnv(string(out), shellMark)
+}
+
+// ShellPath is the PATH the shell sh (zsh, bash, fish) has in a terminal
+// opened now, whether or not it is the login shell; nil when it doesn't
+// say within a few seconds.
+func ShellPath(sh string) []string {
+	p, _ := askShell(sh)
+	if p == "" {
+		return nil
+	}
+	return filepath.SplitList(p)
 }
 
 // shellMark tells shellEnv's answer apart from whatever the profile prints.

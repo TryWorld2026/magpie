@@ -440,12 +440,14 @@ var planQuotaCache struct {
 // than a minute ago is not asked again.
 func PlanQuotas(ctx context.Context) []SubscriptionQuota {
 	c := &planQuotaCache
+	_, again := refreshing(ctx) // one card read again (RefreshUsage)
 	c.Lock()
-	if c.data != nil && time.Since(c.at) < time.Minute {
+	if !again && c.data != nil && time.Since(c.at) < time.Minute {
 		defer c.Unlock()
 		return c.data
 	}
 	c.Unlock()
+	ctx, seq := quotaReading(ctx)
 	type job struct {
 		p    Provider
 		src  planQuotaSource
@@ -475,7 +477,9 @@ func PlanQuotas(ctx context.Context) []SubscriptionQuota {
 					user = Mask(k)
 				}
 			}
-			jobs = append(jobs, job{p, src, k, user})
+			if wantsCard(ctx, p.ID, user) {
+				jobs = append(jobs, job{p, src, k, user})
+			}
 		}
 	}
 	got := make([]*SubscriptionQuota, len(jobs))
@@ -504,7 +508,7 @@ func PlanQuotas(ctx context.Context) []SubscriptionQuota {
 			case err != nil && !j.src.sure:
 				// no plan, unless one was read before
 				q.Error = err.Error()
-				if q = keepLast(q, tag); q.AsOf != nil {
+				if q = keepReading(ctx, q, tag); q.AsOf != nil {
 					got[i] = &q
 				}
 				return
@@ -516,7 +520,7 @@ func PlanQuotas(ctx context.Context) []SubscriptionQuota {
 					q.Until, q.Renew = zhipuTerm(ctx, zcodeRoot(j.src.url), j.key)
 				}
 			}
-			q = keepLast(q, tag)
+			q = keepReading(ctx, q, tag)
 			got[i] = &q
 		}()
 	}
@@ -524,8 +528,10 @@ func PlanQuotas(ctx context.Context) []SubscriptionQuota {
 	go func() { stepfun <- stepPlanQuotas(ctx) }()
 	wg.Wait()
 	out := []SubscriptionQuota{}
-	for _, q := range got {
+	for i, q := range got {
 		if q != nil {
+			// Set this after keepReading, which can restore a card from disk.
+			q.glmPlan = strings.HasSuffix(jobs[i].src.url, "/api/monitor/usage/quota/limit")
 			out = append(out, *q)
 		}
 	}
@@ -533,7 +539,10 @@ func PlanQuotas(ctx context.Context) []SubscriptionQuota {
 	if ctx.Err() == nil {
 		noteQuotaHistory(out, time.Now())
 		c.Lock()
-		c.at, c.data = time.Now(), out
+		c.data = cacheCards(c.data, out, seq, again)
+		if !again {
+			c.at, out = time.Now(), c.data
+		}
 		c.Unlock()
 	}
 	return out

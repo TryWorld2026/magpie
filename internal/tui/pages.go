@@ -498,6 +498,9 @@ func endpointAsk(pr provider.PresetDef, crumbs []string, now string, then func(s
 		}}
 }
 
+// listError is provider.Provider.ListError; tests stand in for it.
+var listError = provider.Provider.ListError
+
 func (m model) viewProviders() string {
 	var b strings.Builder
 	b.WriteString(m.header())
@@ -511,7 +514,7 @@ func (m model) viewProviders() string {
 		}
 		return b.String()
 	}
-	type row struct{ name, id, key, models, note string }
+	type row struct{ name, id, key, models, note, warn string }
 	var rows []row
 	var w [4]int
 	for _, p := range m.provs {
@@ -540,6 +543,12 @@ func (m model) viewProviders() string {
 			notes = append(notes, "groups only")
 		}
 		r.note = strings.Join(notes, " · ")
+		// a plugin's account showing its defaults alone says why, as the
+		// app's editor does (gnayiab on X: Cursor in WSL's TUI had Auto
+		// alone and nothing said)
+		if e := listError(p); e != "" {
+			r.warn = "couldn't list its models: " + e
+		}
 		for i, s := range []string{r.name, r.id, r.key, r.models} {
 			w[i] = max(w[i], lipgloss.Width(s))
 		}
@@ -560,7 +569,14 @@ func (m model) viewProviders() string {
 		if strings.HasPrefix(r.key, "○") {
 			key = sBad.Render(padRight(r.key, w[2]))
 		}
-		b.WriteString(pad + marker + name + "  " + sFaint.Render(padRight(r.id, w[1])) + "  " + key + "  " + sText.Render(padRight(r.models, w[3])) + "  " + sMuted.Render(r.note) + "\n")
+		line := pad + marker + name + "  " + sFaint.Render(padRight(r.id, w[1])) + "  " + key + "  " + sText.Render(padRight(r.models, w[3])) + "  " + sMuted.Render(r.note)
+		if r.warn != "" {
+			if r.note != "" {
+				line += sMuted.Render(" · ")
+			}
+			line += sBad.Render(r.warn)
+		}
+		b.WriteString(line + "\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
@@ -596,13 +612,16 @@ var (
 	hasWorkBuddy = provider.HasWorkBuddy
 	checkinTrae  = provider.CheckInTrae
 	hasTrae      = provider.HasTrae
+	checkinMM    = provider.CheckInMiniMax
+	hasMiniMax   = provider.HasMiniMax
 )
 
 // checkinCmd presses WorkBuddy's daily check-in (签到) now for every
 // WorkBuddy (China) account signed in here not in yet today, all at once,
 // as the app's Usage card's "Check in now" and magpie accounts checkin do:
 // the built-in's or the plugin's (akic404 on Discord: the TUI had no way
-// to); and Trae CN's (每日签到) for each Trae CN account (#694). It says
+// to); and Trae CN's (每日签到) for each Trae CN account (#694), and
+// MiniMax Code's for each MiniMax Code (China) account (#811). It says
 // how each account stands: the credits and streak, in
 // already today, or why not. A shared magpie's accounts are checked in
 // on that magpie, from its own app, TUI or CLI.
@@ -627,8 +646,16 @@ func checkinCmd() tea.Msg {
 			parts = append(parts, checkinWords(r))
 		}
 	}
+	if hasMiniMax() {
+		for _, r := range checkinMM(ctx) {
+			if r.Outcome == provider.CheckinFailed {
+				failed++
+			}
+			parts = append(parts, checkinWords(r))
+		}
+	}
 	if len(parts) == 0 {
-		return checkinMsg{text: "no WorkBuddy (China) or Trae CN account is signed in · only they have the daily check-in"}
+		return checkinMsg{text: "no WorkBuddy (China), Trae CN or MiniMax Code account is signed in · only they have the daily check-in"}
 	}
 	return checkinMsg{text: strings.Join(parts, "; "), ok: failed == 0}
 }
@@ -641,6 +668,10 @@ func checkinWords(r provider.WorkBuddyCheckin) string {
 		who = "Trae CN"
 	case r.By == "trae":
 		who = "Trae CN " + who
+	case r.By == "minimax" && who == "":
+		who = "MiniMax Code"
+	case r.By == "minimax":
+		who = "MiniMax Code " + who
 	case who == "":
 		who = "WorkBuddy"
 	}
@@ -723,7 +754,7 @@ func (m model) updateUsage(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	default:
 		return m, nil
 	}
-	m.sum = usage.Summarize(m.period)
+	m.sum, m.direct = usage.Summarize(m.period), usage.Direct(m.period)
 	return m, nil
 }
 
@@ -806,10 +837,36 @@ func (m model) viewUsage() string {
 	if len(ql) > 0 {
 		b.WriteString("\n")
 	}
-	if s.Calls == 0 {
+	d := m.direct
+	if s.Calls == 0 && d.Calls == 0 {
 		b.WriteString(pad + "  " + sMuted.Render("no calls in this time · route an agent through magpie and its usage shows up here"))
 		return b.String()
 	}
+	names := map[string]string{}
+	for _, a := range agent.All() {
+		names[a.ID] = a.Name
+	}
+	room := max(2, (m.h-16-len(ql))/2)
+	if s.Calls > 0 && d.Calls > 0 {
+		room = max(2, room/2)
+	}
+	if s.Calls == 0 {
+		b.WriteString(pad + "  " + sMuted.Render("no calls through magpie in this time") + "\n\n")
+	} else {
+		m.usageBlock(&b, s, room, names)
+	}
+	// the calls the agents made on their own, as the app's Requests tab
+	// counts them beside the gateway's (Kumo31 on Discord)
+	if d.Calls > 0 {
+		b.WriteString(pad + "  " + sFaint.Render("not through magpie · the agents' own requests, read from their session files") + "\n")
+		m.usageBlock(&b, d, room, names)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// usageBlock is one summary's totals, timeline and agents' and models'
+// tables, the gateway's or the agents' own calls.
+func (m model) usageBlock(b *strings.Builder, s usage.Summary, room int, names map[string]string) {
 	line := sName.Render(fmtTokens(s.Tokens())+" tokens") + sMuted.Render(fmt.Sprintf(" · %d call%s · ", s.Calls, plural(s.Calls))) + sOK.Render(fmtCost(s.Totals))
 	if s.Errors > 0 {
 		line += sMuted.Render(" · ") + sBad.Render(fmt.Sprintf("%d error%s", s.Errors, plural(s.Errors)))
@@ -835,11 +892,6 @@ func (m model) viewUsage() string {
 		b.WriteString(pad + "  " + sCursor.Render(sb.String()) + "  " + sFaint.Render(first+" – "+last) + "\n\n")
 	}
 
-	names := map[string]string{}
-	for _, a := range agent.All() {
-		names[a.ID] = a.Name
-	}
-	room := max(2, (m.h-16-len(ql))/2)
 	table := func(head string, gs []usage.Group, name func(usage.Group) string) {
 		b.WriteString(pad + "  " + sFaint.Render(head) + "\n")
 		w := 0
@@ -862,8 +914,12 @@ func (m model) viewUsage() string {
 		}
 		return g.ID
 	})
-	table("models", s.Models, func(g usage.Group) string { return g.ID })
-	return strings.TrimRight(b.String(), "\n")
+	table("models", s.Models, func(g usage.Group) string {
+		if g.Provider == usage.UnknownProvider {
+			return g.Model // a session file's call whose provider isn't known
+		}
+		return g.ID
+	})
 }
 
 // quotaLines is the accounts' allowances, a line each as the app's cards

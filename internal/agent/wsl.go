@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf16"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
@@ -47,6 +48,9 @@ type place struct {
 	// cold: a stopped distro's, whose files can't be looked at without
 	// starting it — an agent built there takes its files at their defaults
 	cold bool
+	// version is the agent's CLI's there, as the probe found it; "" when
+	// not known (one on this machine is asked itself)
+	version string
 }
 
 func here(home string) place { return place{home: home} }
@@ -57,7 +61,7 @@ func (p place) getenv(k string) string {
 	if p.spell != nil {
 		return ""
 	}
-	return os.Getenv(k)
+	return appdir.Getenv(k)
 }
 
 // exists is whether there is a file or folder at path, as an agent looks
@@ -125,9 +129,12 @@ type distro struct {
 	// Net is WSL's networking mode as the distro's wslinfo said at the
 	// last probe ("mirrored", "nat", "virtioproxy", "none"); "" when it
 	// couldn't say (a WSL without wslinfo), and .wslconfig is read instead
-	Net      string `json:"net,omitempty"`
-	Mirrored bool   `json:"-"`
-	Running  bool   `json:"-"`
+	Net string `json:"net,omitempty"`
+	// Versions is what the CLIs of wslKinds that ask (version) said their
+	// versions are at the last probe, by the kind's id
+	Versions map[string]string `json:"versions,omitempty"`
+	Mirrored bool              `json:"-"`
+	Running  bool              `json:"-"`
 }
 
 // local is a path inside the distro as magpie opens it.
@@ -174,7 +181,8 @@ func (d distro) base() string {
 }
 
 func (d distro) place(id string) place {
-	return place{home: d.local(d.Home), id: id, spell: d.native, sys: d.local, base: d.base, cold: !d.Running}
+	kind, _, _ := strings.Cut(id, "@")
+	return place{home: d.local(d.Home), id: id, spell: d.native, sys: d.local, base: d.base, cold: !d.Running, version: d.Versions[kind]}
 }
 
 // wslKind is an agent magpie looks for in a distro: what the probe finds
@@ -184,6 +192,9 @@ type wslKind struct {
 	dir, bin string             // under $HOME, and on its PATH: either says it is there
 	in       func(place) *Agent // the agent at a place, as on this machine
 	restart  string             // advice after a change, when mirrored; "" none
+	// version: the probe asks the distro's own bin its version (--version),
+	// for an agent whose config depends on it
+	version bool
 	// asleep, when set, is a stopped distro's options for a field, which
 	// must read nothing of its files; nil keeps the live agent's
 	asleep func(key string) func(map[string]string) []Option
@@ -272,7 +283,7 @@ var wslKinds = []wslKind{
 				return append(kimiOwnOptions("", cur["model"]), viaMagpie("kimi", magpieID+"/")...)
 			}
 		}},
-	{id: "omp", name: "omp", dir: ".omp", bin: "omp", in: ompIn,
+	{id: "omp", name: "omp", dir: ".omp", bin: "omp", in: ompIn, version: true,
 		restart: "reads its settings at start-up — restart open omp sessions to use this.",
 		asleep: func(key string) func(map[string]string) []Option {
 			if key == "effort" {
@@ -385,6 +396,16 @@ func wslFound(d distro) bool {
 	return false
 }
 
+// ListsFor is whose model lists an agent's are (provider.CatalogFor): its
+// own id's, or, for one in a WSL distro, its Windows twin's (claude for
+// claude@wsl:Ubuntu). A distro's agent is written magpie's models under
+// that id and sends the gateway that id's key, so the models picked for
+// its row are the ones it is shown only when kept under that id too (#927).
+func (a *Agent) ListsFor() string {
+	id, _, _ := strings.Cut(a.ID, "@wsl:")
+	return id
+}
+
 func wslKindOf(id string) wslKind {
 	for _, k := range wslKinds {
 		if k.id == id {
@@ -466,7 +487,7 @@ func wslAgent(k wslKind, d distro) *Agent {
 // files, which starts the distro.
 func asleep(live *Agent, k wslKind, d distro) *Agent {
 	started := false
-	a := &Agent{ID: live.ID, Name: live.Name, Icon: live.Icon, WSL: d.Name, detect: live.detect,
+	a := &Agent{ID: live.ID, Name: live.Name, Icon: live.Icon, WSL: d.Name, detect: live.detect, Spelled: live.Spelled,
 		Notice: func() string {
 			if started {
 				return live.Notice()
@@ -766,13 +787,26 @@ const wslProbeVersion = 2
 // wslProbeScript prints the distro's home, what of each of wslKinds it
 // has (each command with where it is), where Windows' drives are mounted,
 // its default route (the Windows host under NAT), and WSL's networking
-// mode as wslinfo (WSL 2.0 on) says it.
+// mode as wslinfo (WSL 2.0 on) says it; and the version of each that asks
+// for it (omp, whose models.yml takes max only from 16.4.0).
+//
+// A command is also looked for in the folders its installers put it in
+// (wslbin): sh -l reads ~/.profile but not ~/.bashrc, where bun's and
+// nvm's installers add theirs to PATH (whqtian on Discord: a WSL omp from
+// bun was never asked its version, so its models still offered xhigh).
+// It is asked with its own folder on PATH, where bun's script finds bun.
 var wslProbeScript = func() string {
-	s := `echo "home:$HOME"; `
+	s := `wslbin() { for d in "$HOME/.bun/bin" "$HOME/.local/bin" "$HOME/.npm-global/bin" "$HOME/.volta/bin" "$HOME/.local/share/pnpm" "$HOME"/.nvm/versions/node/*/bin "$HOME/.local/share/mise/shims" "$HOME/.asdf/shims"; do [ -x "$d/$1" ] && { echo "$d/$1"; return 0; }; done; return 1; }; `
+	s += `echo "home:$HOME"; `
 	for _, k := range wslKinds {
 		s += `[ -d "$HOME/` + k.dir + `" ] && echo dir:` + k.dir + `; `
 		if k.bin != "" {
-			s += `p=$(command -v ` + k.bin + ` 2>/dev/null) && echo "bin:` + k.bin + ` $p"; `
+			s += `p=$(command -v ` + k.bin + ` 2>/dev/null || wslbin ` + k.bin + `) && echo "bin:` + k.bin + ` $p"`
+			if k.version {
+				// not one on Windows' drives (WSL's /mnt/c), which isn't the distro's
+				s += ` && case "$p" in /mnt/*) ;; *) echo "ver:` + k.id + ` $(PATH="${p%/*}:$PATH" timeout 10 "$p" --version </dev/null 2>&1 | head -n1)";; esac`
+			}
+			s += `; `
 		}
 	}
 	// a drive's source in /proc/mounts is C:\ (written C:\134), under any automount root
@@ -814,6 +848,14 @@ func parseProbe(name, out string) *distro {
 			d.Home = strings.TrimRight(v, "/")
 		case "dir":
 			d.Has[l] = true
+		case "ver":
+			id, said, _ := strings.Cut(v, " ")
+			if ver := parseVersion(said); ver != "" {
+				if d.Versions == nil {
+					d.Versions = map[string]string{}
+				}
+				d.Versions[id] = ver
+			}
 		case "bin":
 			bin, path, _ := strings.Cut(v, " ")
 			bins[bin] = strings.TrimSpace(path)

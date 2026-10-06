@@ -113,6 +113,7 @@ type model struct {
 	gsel      int    // its member or rule picked: the members, then the rules
 	period    usage.Period
 	sum       usage.Summary
+	direct    usage.Summary                // the agents' own calls, read from their session files
 	quotas    []provider.SubscriptionQuota // nil while the vendors are asked
 	qasked    bool                         // quotas were asked for
 	qleft     bool                         // windows read as what is left, not what is used
@@ -150,7 +151,15 @@ func Run(ready func()) error {
 	if len(m.agents) == 0 {
 		return fmt.Errorf("no supported agents found on this machine")
 	}
+	ctx, stop := context.WithCancel(context.Background())
+	wait := serveGateway(ctx)
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
+	served := gw.here.Load()
+	stop()
+	wait()
+	if served {
+		fmt.Fprintln(os.Stderr, gatewayGoneNote())
+	}
 	return err
 }
 
@@ -166,6 +175,9 @@ func newModel() model {
 	}
 	shown, hidden := settings.Arrange(settings.Load(), set, func(a *agent.Agent) string { return a.ID })
 	m := model{agents: append(shown, hidden...), hidden: len(shown), period: usage.Week, srange: 1}
+	// no model catalog yet: Init syncs it. Set here, as Init's receiver is
+	// a copy the program never sees.
+	m.syncing = catalog.Source() == ""
 	m.reload()
 	return m
 }
@@ -187,7 +199,7 @@ func (m *model) reload() {
 			m.gsel = clamp(m.gsel, len(g.Members)+len(g.Rules))
 		}
 	case pageUsage:
-		m.sum = usage.Summarize(m.period)
+		m.sum, m.direct = usage.Summarize(m.period), usage.Direct(m.period)
 	case pageSessions:
 		m.reloadSessions()
 	case pageLibrary:
@@ -211,8 +223,7 @@ func (m *model) goTo(p page) tea.Cmd {
 }
 
 func (m model) Init() tea.Cmd {
-	if catalog.Source() == "" {
-		m.syncing = true
+	if m.syncing {
 		return syncCmd
 	}
 	return nil
@@ -729,6 +740,8 @@ func (m model) View() string {
 		status = sBad.Render("✗ ") + sText.Render(m.flash)
 	case m.syncing:
 		status = sMuted.Render("… syncing model catalog")
+	default:
+		status = gatewayStatus()
 	}
 
 	lines := strings.Count(body, "\n") + 1

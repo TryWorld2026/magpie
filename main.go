@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/yetone/magpie/internal/agent"
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/claudebridge"
 	"github.com/yetone/magpie/internal/davsync"
@@ -35,15 +37,17 @@ const usage = `magpie — one place to pick every agent's model
   magpie tray                     start in the menu bar only
   magpie panel                    open the menu bar icon's quick panel, or close it
   magpie autostart [on|off]       open magpie (in the menu bar) when you log in, or say whether it does
-  magpie tui                      the same thing, in the terminal
-  magpie web [--addr host:port] [--lan] [--no-open]
+  magpie tui                      the same thing, in the terminal (serves the gateway while open when no magpie does)
+  magpie web [--addr host:port] [--lan] [--no-open] [--gateway]
                                   the app's window in a browser, with the gateway (no desktop needed: WSL, a server over SSH)
                                   a new key each run; MAGPIE_WEB_KEY (16+ letters, digits, - . _ ~) keeps one, signed in for 400 days
+                                  --gateway: gateway mode, no Agents, Sessions or Library (on by itself with no agents here; Settings › General turns it off)
   magpie ls                       list detected agents and their settings
   magpie <agent>                  show one agent
   magpie <agent> <model>          set an agent's model   e.g. magpie claude deepseek/deepseek-chat
   magpie <agent> <field> <value>  set another field   e.g. magpie codex effort high
-  magpie <agent> [field] default  back to the agent's own default, magpie's wiring removed
+  magpie <agent> default          take magpie out: the agent back on what it had before
+  magpie <agent> <field> default  that field back to the agent's own default
 
   magpie save <name>              snapshot every agent's settings as a profile
   magpie use <name>               apply a profile
@@ -89,6 +93,7 @@ const usage = `magpie — one place to pick every agent's model
   magpie healthcheck              exit 0 when the gateway answers (a container's HEALTHCHECK)
   magpie gateway-key list|add <name>|rotate <id>|remove <id>   manage the keys clients use to call a shared gateway
   magpie gateway-key limit <id> [off|day|week|month --tokens N --cost USD --cache-reads]   a key's own limit, and what it used
+  magpie gateway-key models <id> [all|<provider>/<model>|<provider>/* ...]   the models a key may use, every one unless it names some
   magpie mcp image                the image and video generation MCP server an agent is given from the library (stdio)
   magpie usage [today|7d|30d|all] tokens and cost per agent, model and subscription account (30d)
   magpie usage --csv [--account <name>] [today|7d|30d|all]   every request as CSV (or one account's): the model asked for, sent and served, tokens, cost, time, status, account
@@ -98,6 +103,8 @@ const usage = `magpie — one place to pick every agent's model
   magpie quota [<provider>] [--json]  what is left of every subscription, plan and key balance
   magpie quota wait <provider|account> [--timeout <d>] [--quiet]
                                   block until that subscription (any of its accounts) or account has allowance again
+  magpie quota history [<provider|account>] [--days N] [--json]
+                                  each window's readings over time, kept 45 days
   magpie sync                     refresh the model catalog and vendor model lists
   magpie agents                   list every supported agent
   magpie update [check] [--proxy <url>] [--mirror <prefix>]
@@ -107,7 +114,7 @@ const usage = `magpie — one place to pick every agent's model
   magpie update mirror [<prefix>|off]  the mirror every update, the app's own too, is downloaded through
   magpie update auto [on|off] [30m|1h|6h|24h]  whether the app looks for updates by itself, and how often (6h)
 
-agents: claude (cc), codex, gemini, opencode (oc), mimocode, pi, goose, cursor, zed, copilot, crush
+agents: claude (cc), codex, gemini, opencode (oc), mimocode, pi, goose, cursor, zed, copilot, crush, aside
 `
 
 var (
@@ -118,6 +125,29 @@ var (
 )
 
 func main() {
+	// before anything reads or writes a file: no home, or a relative one,
+	// would put the agents' configs and magpie's keys under the working
+	// folder. What needs no file still answers (magpie version in a
+	// container or a script without HOME): run makes magpie's folders first.
+	ignored, err := appdir.CheckEnv()
+	if err != nil {
+		if len(os.Args) > 1 {
+			switch os.Args[1] {
+			case "-v", "--version", "version":
+				fmt.Println("magpie", version)
+				return
+			case "-h", "--help", "help":
+				fmt.Print(usage)
+				return
+			}
+		}
+		fmt.Fprintln(os.Stderr, "magpie:", err)
+		os.Exit(1)
+	}
+	slices.Sort(ignored)
+	for _, v := range ignored {
+		fmt.Fprintf(os.Stderr, "magpie: ignoring %s: not an absolute path (the programs magpie starts still get it)\n", v)
+	}
 	if provider.TookOpenedURL(os.Args[1:]) {
 		// Claude Code, signing in for magpie, handed over the page to open
 		return
@@ -126,7 +156,7 @@ func main() {
 	gateway.Version = version
 	netproxy.Install()
 	update.GUI = hasGUI
-	err := run(os.Args[1:])
+	err = run(os.Args[1:])
 	proc.EndProbes() // a CLI still being asked something isn't left to init
 	sessions.Saved() // the session index kept, for the next run
 	if err != nil {
@@ -162,12 +192,19 @@ func run(args []string) error {
 		// (agent.DisconnectPreview)
 		return agent.DryRun(args[1])
 	}
+	// started by an update, the magpie it replaces goes first: the moves
+	// below write the files it may still be writing
+	update.AwaitPredecessor()
 	makeDirs()
 	settings.Migrate()
+	// the providers and settings read once for every agent's fields, which
+	// the moves below look at (a write among them reads them again)
+	release := provider.Hold()
 	agent.RenameLegacy()
 	agent.MoveCursorEfforts()
 	agent.MoveAntigravityEfforts()
 	agent.MoveOffAccountIDs()
+	release()
 	// a provider added, edited or removed, or a list fetched anew, reaches
 	// the model lists agents keep in files of their own
 	catalog.Changed = agent.SyncCatalog
@@ -180,6 +217,9 @@ func run(args []string) error {
 	// something else writing the file fails every session there until
 	// magpie writes its own list again
 	gateway.WhileServing = append(gateway.WhileServing, agent.KeepDshWired)
+	// and Cursor Private Inference's variables, which the Mac's launchd
+	// forgets at a restart, for the gateway's address now
+	gateway.WhileServing = append(gateway.WhileServing, agent.KeepCursorLocalEnv)
 	// and the request archive, when it is on, goes to the bucket sync is to
 	gateway.ArchiveBucket = func() (gateway.Putter, bool) {
 		if b, ok := davsync.S3Bucket(); ok {
@@ -318,6 +358,9 @@ func run(args []string) error {
 		return list([]*agent.Agent{a}, true, -1)
 	case 2:
 		if args[1] == "default" {
+			if a.Wired() {
+				return disconnect(a)
+			}
 			return set(a, a.Fields[0].Key, "")
 		}
 		// `magpie codex xhigh`: a bare value that belongs to a non-model field
@@ -364,6 +407,36 @@ func set(a *agent.Agent, key, value string) error {
 		shown += " " + muted.Render("(unchanged)")
 	}
 	fmt.Println(green.Render("✓"), bold.Render(a.Name), muted.Render(f.Label), shown)
+	if a.Notice != nil {
+		if n := a.Notice(); n != "" {
+			fmt.Println(muted.Render("  ↻ " + n))
+		}
+	}
+	return nil
+}
+
+// disconnect is `magpie <agent> default` on an agent magpie is wired into:
+// the Agents page's Disconnect, which puts back what the user had before
+// magpie — Claude Code's own model, its endpoint — where a field's default
+// leaves the agent as installed (__jingling on X: magpie claude default
+// took the model they had set away with magpie's)
+func disconnect(a *agent.Agent) error {
+	before := a.Values()
+	if err := a.Disconnect(); err != nil {
+		return err
+	}
+	now := a.Values()
+	for _, f := range a.Fields {
+		if before[f.Key] == now[f.Key] {
+			continue
+		}
+		shown := now[f.Key]
+		if shown == "" {
+			shown = muted.Render("default")
+		}
+		fmt.Println(green.Render("✓"), bold.Render(a.Name), muted.Render(f.Label), shown)
+	}
+	fmt.Println(muted.Render("  disconnected from magpie, back to what it had before"))
 	if a.Notice != nil {
 		if n := a.Notice(); n != "" {
 			fmt.Println(muted.Render("  ↻ " + n))

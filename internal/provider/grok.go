@@ -35,6 +35,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
@@ -44,7 +45,7 @@ import (
 var GrokExecutable = func() string {
 	home, _ := os.UserHomeDir()
 	path := append(filepath.SplitList(os.Getenv("PATH")), registryPath()...)
-	for _, c := range grokCandidates(runtime.GOOS, home, GrokHome(), os.Getenv("GROK_BIN_DIR"), path) {
+	for _, c := range grokCandidates(runtime.GOOS, home, GrokHome(), appdir.Getenv("GROK_BIN_DIR"), path) {
 		if isFile(c.path) && (c.own || isGrokBuild(c.path)) {
 			return c.path
 		}
@@ -120,7 +121,7 @@ func isGrokBuild(path string) bool {
 
 // GrokHome is where the CLI keeps its sign-in and settings.
 func GrokHome() string {
-	if h := os.Getenv("GROK_HOME"); h != "" {
+	if h := appdir.Getenv("GROK_HOME"); h != "" {
 		return h
 	}
 	home, _ := os.UserHomeDir()
@@ -703,6 +704,15 @@ func runCLISignIn(s *signInFlow, what string, env []string, using bool, failed f
 	var partial struct {
 		sync.Mutex
 		link string
+		last string // the last line it printed, which says why there's no link
+	}
+	noLink := func() error {
+		partial.Lock()
+		defer partial.Unlock()
+		if partial.last != "" {
+			return fmt.Errorf("%s gave no link to open: %s", what, partial.last)
+		}
+		return fmt.Errorf("%s gave no link to open", what)
 	}
 	go func() {
 		rd := bufio.NewReader(out)
@@ -721,7 +731,9 @@ func runCLISignIn(s *signInFlow, what string, env []string, using bool, failed f
 			switch {
 			case sent:
 			case link == "":
-				link = cursorLoginURL.FindString(line)
+				if !failedLine.MatchString(line) {
+					link = cursorLoginURL.FindString(line)
+				}
 			case linkRest.MatchString(strings.TrimSpace(line)) && (!whole(link) || queryRest.MatchString(strings.TrimSpace(line))):
 				// a whole link takes only more of its query, not "Waiting..." printed after it
 				link += strings.TrimSpace(line)
@@ -740,6 +752,9 @@ func runCLISignIn(s *signInFlow, what string, env []string, using bool, failed f
 			}
 			if strings.TrimSpace(line) != "" {
 				tail = append(tail, strings.TrimSpace(line))
+				partial.Lock()
+				partial.last = strings.TrimSpace(line)
+				partial.Unlock()
 			}
 			if rerr != nil {
 				break
@@ -771,7 +786,7 @@ func runCLISignIn(s *signInFlow, what string, env []string, using bool, failed f
 	select {
 	case l, ok := <-got:
 		if !ok {
-			return fmt.Errorf("%s gave no link to open", what)
+			return noLink()
 		}
 		u = l
 	case <-time.After(linkWait):
@@ -781,7 +796,7 @@ func runCLISignIn(s *signInFlow, what string, env []string, using bool, failed f
 		partial.Unlock()
 		if u == "" {
 			cancel()
-			return fmt.Errorf("%s gave no link to open", what)
+			return noLink()
 		}
 	}
 	s.mu.Lock()
@@ -789,6 +804,12 @@ func runCLISignIn(s *signInFlow, what string, env []string, using bool, failed f
 	s.mu.Unlock()
 	return nil
 }
+
+// failedLine is a line saying the login failed, whose URL is the endpoint
+// it couldn't reach, not a page to open: grok 1.0.46 behind a proxy it
+// can't get through prints "Error: error sending request for url
+// (https://auth.x.ai/oauth2/device/code): …" (𝕏 on Discord).
+var failedLine = regexp.MustCompile(`(?i)\berror\b`)
 
 // linkWait is how long a login command has to print its link.
 var linkWait = 30 * time.Second

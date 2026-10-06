@@ -24,6 +24,9 @@ const (
 	Rotate    = "rotate"
 	LeastUsed = "usage"
 	Pace      = "pace"
+	// Weighted spreads a provider's requests over its keys by each key's
+	// weight (KeyAccount.Weight, #841), smoothly: 3 and 1 go a, a, b, a…
+	Weighted = "weight"
 )
 
 // SetRouting changes how a provider's requests spread over its keys or
@@ -262,6 +265,33 @@ func (a Allowance) Full(model string, share float64, now time.Time) time.Time {
 	return t
 }
 
+// Pooled says whether a refusal of model for its allowance leaves the
+// account's other models alone: the windows that count model and are full
+// at share are each of some models only (Opus's own week, Cursor's Other
+// Models pool) — or, none known full, no window of the whole account
+// counts it, only pools. Then it is that model which is out, not the
+// account: Cursor's Other Models used up leaves Auto and Composer in
+// theirs (Xiaopodev on X).
+func (a Allowance) Pooled(model string, share float64, now time.Time) bool {
+	model = strings.ToLower(model)
+	full, pooled, whole := false, false, false
+	for _, l := range a {
+		if !l.applies(model) {
+			continue
+		}
+		scoped := l.Model != "" || l.matches != nil
+		if l.Used >= share && (l.Resets.IsZero() || l.Resets.After(now)) {
+			if !scoped {
+				return false
+			}
+			full = true
+		}
+		pooled = pooled || scoped
+		whole = whole || !scoped
+	}
+	return full || pooled && !whole
+}
+
 // budgetSpan is the shortest window that is a budget rather than a rate
 // cap: the week (Kiro's month too), not the five hours in it — what the
 // five hours leave at their reset is nothing lost.
@@ -429,8 +459,10 @@ func renewedNow(agent, user string) {
 // allowance rather than trust what it last said: the account just
 // answered that it has run out.
 func StaleAllowance(agent, user string) {
+	key := agent + "/" + strings.ToLower(user)
 	loginUsageCache.Lock()
-	delete(loginUsageCache.m, agent+"/"+strings.ToLower(user))
+	delete(loginUsageCache.m, key)
+	delete(loginUsageCache.pending, key) // nor a reading asked for before
 	loginUsageCache.Unlock()
 	// the built-in keeps Grok's usage by home; a Grok moved to its plugin
 	// keeps it as "plugin:grok"'s, the line above

@@ -70,7 +70,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.goto("http://magpie.test/" + (mode === "panel" ? "?mode=panel" : ""));
         await open();
         if (mode === "window") {
-          assert.equal((await row.locator(".ag-start").textContent()).trim(), lang === "zh" ? "选模型" : "Pick a model");
+          // Not connected, the row says what the agent is on, its Default or
+          // its own model, and lists its own models with magpie's as when
+          // connected; it does not read "Pick a model" (EZN7L2C3, #834).
+          // The Executor is the model field here and is named "executor".
+          const def = lang === "zh" ? "默认" : "default";
+          assert.equal((await row.locator(".ag-start").textContent()).trim(), `executor${def}`);
         } else for (const f of fields) {
           assert.equal(await row.locator(`.field[data-key="${f.key}"] > .k`).count(), 1, "a default role must be labelled once");
         }

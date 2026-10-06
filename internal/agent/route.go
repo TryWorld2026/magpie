@@ -1,11 +1,13 @@
 package agent
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // Every agent's model picker has two halves: the models the agent reaches
@@ -45,6 +47,7 @@ func viaMagpie(agent, prefix string) []Option {
 			own[e.Provider.ID] = a.User == provider.AgentUser(agent)
 		}
 	}
+	fast := provider.FastPicks(agent)
 	for _, e := range shown {
 		if e.Group != "" {
 			groups = append(groups, Option{Value: prefix + e.ID, Label: e.Name, Note: "routing group · via magpie",
@@ -55,9 +58,14 @@ func viaMagpie(agent, prefix string) []Option {
 		if a := e.Provider.Account; a != nil {
 			note = a.User + " · via magpie"
 		}
-		out = append(out, Option{Value: prefix + e.ID, Label: e.Name, Note: note,
+		o := Option{Value: prefix + e.ID, Label: e.Name, Note: note,
 			Icon: e.Provider.Icon, Group: e.Provider.Name, Ref: e.ID, Free: e.Free, Rate: e.Rate, RateWas: e.RateWas, Context: e.Context, own: own[e.Provider.ID],
-			sub: e.Provider.Account != nil && (e.Provider.Account.Agent != "claude" || agent == "claude")})
+			sub: e.Provider.Account != nil && (e.Provider.Account.Agent != "claude" || agent == "claude")}
+		// a model with a fast mode is switched fast in the picker (#954)
+		if provider.CanFast(e.Provider, e.Model) {
+			o.FastFor, o.Fast = agent, slices.Contains(fast, e.ID)
+		}
+		out = append(out, o)
 	}
 	return append(groups, out...)
 }
@@ -93,13 +101,25 @@ func firstOf(xs []string) string {
 // magpieModels is the catalog as agent is shown it, as catalog.Models, for
 // agents that keep their own model files.
 func magpieModels(agent string) []catalog.Model {
+	// the providers built once for all the models' prices, not for each:
+	// dsh's round at every start built them for each of hundreds
+	defer provider.Hold()()
 	var out []catalog.Model
 	shown, _ := provider.CatalogFor(agent)
 	labels := provider.Labels(shown)
 	// a model magpie describes images to takes them (provider.Described)
 	seen := provider.Described != nil && provider.Described()
+	st, find := settings.Load(), provider.GroupFinder()
 	for i, e := range shown {
 		m := catalog.Model{ID: e.ID, Name: labels[i], Provider: firstOf(e.Provider.Catalogs()), Efforts: e.Efforts, Images: e.Images || seen, ImageInput: e.ImageInput, Context: e.Context, Output: e.Output, AgentsV2: e.AgentsV2, Reasoning: e.Reasoning}
+		// where Codex and Claude Code compact it (#876): a threshold the
+		// user set on the model or on its provider, else the one for every
+		// model, which codexcat answers from the settings it is given
+		m.Compact = provider.CompactSetIn(st, e.ID, find)
+		// what a call costs the user (Pi's cost, #781)
+		if pr, ok := entryPrice(st, find, e); ok {
+			m.Price = &pr
+		}
 		if seen && !e.Images {
 			yes := true
 			m.ImageInput = &yes
@@ -114,6 +134,28 @@ func magpieModels(agent string) []catalog.Model {
 		out = append(out, m)
 	}
 	return out
+}
+
+// entryPrice is what a call to e costs the user, as the usage pages count
+// it: a group's when every member costs the same, none in a fast mode,
+// since which of them answers isn't known beforehand.
+func entryPrice(st settings.Settings, find func(string) (provider.Group, []provider.Member, bool), e provider.Entry) (catalog.Price, bool) {
+	if e.Group == "" {
+		return provider.EffectivePriceIn(st, e.Provider.ID, e.Model)
+	}
+	_, ms, ok := find(e.ID)
+	if !ok || len(ms) == 0 {
+		return catalog.Price{}, false
+	}
+	var first catalog.Price
+	for i, m := range ms {
+		pr, ok := provider.EffectivePriceIn(st, m.Provider.ID, m.Model)
+		if !ok || m.Fast || i > 0 && !pr.Same(first) {
+			return catalog.Price{}, false
+		}
+		first = pr
+	}
+	return first, true
 }
 
 // maxTokens is the output limit an agent is handed for m, kept within the

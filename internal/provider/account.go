@@ -17,10 +17,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"regexp"
@@ -31,6 +31,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/proc"
@@ -123,7 +124,8 @@ func (p Provider) ListedAPIs(model string) []Protocol {
 	if p.IsPlugin() {
 		return p.pluginAPIs(model)
 	}
-	ms, _, _ := catalog.Live(p.ID)
+	// asked for every model of every agent: read once while a request holds
+	ms := heldOf("live:"+p.ID, func() []catalog.Model { ms, _, _ := catalog.Live(p.ID); return ms })
 	for _, m := range ms {
 		if m.ID == model && len(m.APIs) > 0 {
 			out := make([]Protocol, len(m.APIs))
@@ -183,10 +185,45 @@ func (p Provider) Sign(ctx context.Context, req *http.Request, proto Protocol, b
 	// they can override a default when a gateway insists on a private scheme.
 	// Written to the map directly, not via Set, so the name keeps the exact
 	// case the user typed — some gateways match header names case-sensitively.
+	// A list the request has its own of (anthropic-beta) is added to, not
+	// replaced: the user's betas go after those the agent asked.
 	for k, v := range p.Headers {
+		if ListHeader(k) {
+			MergeList(req.Header, k, v)
+			continue
+		}
 		req.Header[k] = []string{v}
 	}
 	return nil
+}
+
+// ListHeader is a header whose value is a comma-separated list the request
+// has its own of, which a provider's header of the same name adds to:
+// anthropic-beta, the betas an agent asks on each request.
+func ListHeader(name string) bool { return strings.EqualFold(name, "anthropic-beta") }
+
+// MergeList writes name in h as the items h has under it, in any case,
+// followed by those of add: comma-separated, each once, empty ones left
+// out, under name as written.
+func MergeList(h http.Header, name, add string) {
+	var vals []string
+	for _, k := range slices.Sorted(maps.Keys(h)) {
+		if strings.EqualFold(k, name) {
+			vals = append(vals, h[k]...)
+			delete(h, k)
+		}
+	}
+	var out []string
+	for _, v := range append(vals, add) {
+		for _, it := range strings.Split(v, ",") {
+			if it = strings.TrimSpace(it); it != "" && !slices.Contains(out, it) {
+				out = append(out, it)
+			}
+		}
+	}
+	if len(out) > 0 {
+		h[name] = []string{strings.Join(out, ",")}
+	}
 }
 
 // Retries is whether the account can mend a refusal (Retry), so the
@@ -359,7 +396,7 @@ type claudeCredentialLocation struct {
 // claudeCredentialsPath is Claude Code's credentials file, where it keeps
 // its sign-in off the Mac's keychain.
 func claudeCredentialsPath() string {
-	dir := os.Getenv("CLAUDE_CONFIG_DIR")
+	dir := appdir.Getenv("CLAUDE_CONFIG_DIR")
 	if dir == "" {
 		home, _ := os.UserHomeDir()
 		dir = filepath.Join(home, ".claude")
@@ -495,19 +532,9 @@ func saveClaudeCredential(loc claudeCredentialLocation, c claudeCredentials) err
 	return nil
 }
 
-// claudeExecutable finds the claude CLI; a var so tests can fake it.
-var claudeExecutable = func() string {
-	if p, err := exec.LookPath("claude"); err == nil {
-		return p
-	}
-	home, _ := os.UserHomeDir()
-	for _, p := range []string{filepath.Join(home, ".local", "bin", "claude"), "/usr/local/bin/claude", "/opt/homebrew/bin/claude"} {
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p
-		}
-	}
-	return ""
-}
+// claudeExecutable finds the claude CLI (proc.FindTool: claude.exe in
+// ~/.local/bin on Windows too, #839); a var so tests can fake it.
+var claudeExecutable = func() string { return proc.FindTool("claude") }
 
 // claudeIdentity asks Claude Code itself which account is active. Its credential
 // blob intentionally contains tokens and plan metadata but no display identity;
@@ -659,7 +686,7 @@ func refreshFailed(status int, agent, msg string) error {
 func Accounts() []Provider {
 	rememberLogins(false)
 	home, _ := os.UserHomeDir()
-	cfg := os.Getenv("XDG_CONFIG_HOME")
+	cfg := appdir.Getenv("XDG_CONFIG_HOME")
 	if cfg == "" {
 		cfg = filepath.Join(home, ".config")
 	}
@@ -710,6 +737,9 @@ func Accounts() []Provider {
 	if p, ok := mimoAccount(); ok {
 		out = append(out, p)
 	}
+	if p, ok := siwcAccount(); ok {
+		out = append(out, p)
+	}
 	for _, agent := range []string{"gemini", "antigravity"} {
 		if p, ok := googleAccountOf(agent); ok {
 			out = append(out, p)
@@ -722,7 +752,7 @@ func Accounts() []Provider {
 
 // builtinOrder is the built-ins' ids in the order Accounts lists them.
 var builtinOrder = slices.Concat([]string{"claude", "codex", "copilot", "cursor", "grok", "devin", "kiro", "zcode",
-	"workbuddy", WorkBuddyAIID, CommandCodePlanID}, qoderAgents, []string{"zed", "factory", MiMoID, "gemini", "antigravity"})
+	"workbuddy", WorkBuddyAIID, CommandCodePlanID}, qoderAgents, []string{"zed", "factory", MiMoID, ChatGPTAPIID, "gemini", "antigravity"})
 
 // placeMoved adds the plugins' accounts to the built-ins': one a built-in
 // was moved onto stands where the built-in stood, the others go last.
@@ -923,11 +953,24 @@ var CopilotTokenURL = "https://api.github.com/copilot_internal/v2/token"
 const copilotBase = "https://api.githubcopilot.com"
 
 var copilotHeaders = map[string]string{
-	"Editor-Version":         "vscode/1.104.0",
-	"Editor-Plugin-Version":  "copilot-chat/0.31.0",
+	"Editor-Version":         "vscode/1.140.0",
+	"Editor-Plugin-Version":  "copilot-chat/0.68.0",
 	"Copilot-Integration-Id": "vscode-chat",
-	"User-Agent":             "GitHubCopilotChat/0.31.0",
+	"User-Agent":             "GitHubCopilotChat/0.68.0",
 }
+
+// copilotAPIHeaders are what the editors' sign-in sends Copilot's API
+// (api.githubcopilot.com, not GitHub's): Copilot Chat's API version, which
+// it sends on every chat request (networking.ts). Without one Copilot
+// leaves Auto's Copilot-Session-Token unread and takes the request as a
+// model picked by hand, which a Student plan is refused for Auto's pick
+// (#256: gpt-5.6-luna, "The requested model is not supported.", served to
+// VS Code on the same account); with it the session is held to its pick.
+var copilotAPIHeaders = func() map[string]string {
+	h := maps.Clone(copilotHeaders)
+	h["X-GitHub-Api-Version"] = "2026-01-09"
+	return h
+}()
 
 type copilotSession struct {
 	Token     string `json:"token"`
@@ -943,7 +986,7 @@ func (s copilotSession) headers() map[string]string {
 	if s.direct {
 		return copilotCLIHeaders
 	}
-	return copilotHeaders
+	return copilotAPIHeaders
 }
 
 var (
@@ -1233,6 +1276,10 @@ func copilotAccept(ctx context.Context, app copilotApp, s copilotSession, model 
 }
 
 // copilotModels asks Copilot which chat models this account may use.
+// copilotBaseModel is Copilot's base model, billed to no allowance on any
+// plan.
+const copilotBaseModel = "gpt-4.1"
+
 func copilotModels(ctx context.Context, app copilotApp) ([]catalog.Model, error) {
 	s, err := app.session(ctx)
 	if err != nil {
@@ -1304,18 +1351,23 @@ func copilotModels(ctx context.Context, app copilotApp) ([]catalog.Model, error)
 		case m.Policy != nil && m.Policy.State == "enabled", m.Policy == nil && m.Picker:
 			picks = append(picks, m.ID)
 			// Copilot's base model (VS Code's copilot-base: the list's
-			// is_chat_fallback), then its default, then one billed to no
-			// premium allowance: what a plan that may pick little (a
-			// Student's) is likeliest to be served
+			// is_chat_fallback), then its default, then gpt-4.1, which
+			// the list no longer flags as either but is the one a
+			// Student plan is served picked by hand (#256: it was last
+			// of seven picks, the six before it refused), then one billed
+			// to no premium allowance: what a plan that may pick little
+			// is likeliest to be served
 			switch {
 			case m.Fallback:
 				rank[m.ID] = 0
 			case m.Default:
 				rank[m.ID] = 1
-			case m.Billing != nil && !m.Billing.Premium:
+			case m.ID == copilotBaseModel:
 				rank[m.ID] = 2
-			default:
+			case m.Billing != nil && !m.Billing.Premium:
 				rank[m.ID] = 3
+			default:
+				rank[m.ID] = 4
 			}
 		case m.Policy != nil && m.Policy.Terms != "":
 			waiting[m.ID] = true

@@ -24,12 +24,17 @@ const traceKeep = 60
 
 // Route is one request's way through routing.
 type Route struct {
+	imageTurn     string
+	imageCaller   string
+	imageProvider string
 	Seq           int64        `json:"seq"` // the trace's count when it last changed
 	ID            int64        `json:"id"`
 	Time          time.Time    `json:"time"`
 	Agent         string       `json:"agent"`
 	ParentSession string       `json:"parentSession,omitempty"` // title helper's explicit originating chat; does not affect routing
 	Session       string       `json:"session,omitempty"`       // the client's session id, never inferred from its model or account
+	TitleLink     *TitleLink   `json:"titleLink,omitempty"`     // digests only; display evidence, never account affinity
+	ParentMatched bool         `json:"parentMatched,omitempty"` // parent inferred for this view, not supplied by Codex
 	Usage         []RouteUsage `json:"usage,omitempty"`         // token tiers of billable tries; priced when read
 	Kind          string       `json:"kind,omitempty"`          // what the call is for, as Call's
 	For           *CallFor     `json:"for,omitempty"`           // the request it was made for, as Call's
@@ -65,6 +70,8 @@ type Route struct {
 	Served  string `json:"served,omitempty"`
 	Swapped bool   `json:"swapped,omitempty"`
 	Routed  bool   `json:"routed,omitempty"`
+	// Upstream: the provider an aggregator said answered behind it
+	Upstream string `json:"upstream,omitempty"`
 }
 
 // RouteUsage is one billable attempt's pricing inputs, kept in routing history.
@@ -187,6 +194,9 @@ type Weighed struct {
 	// Barred: left out as the user set it not to serve the model, its
 	// own list of models leaving it out (#474)
 	Barred bool `json:"barred,omitempty"`
+	// Held: left out as the gateway key asking may not use its account or
+	// key (#905)
+	Held bool `json:"held,omitempty"`
 	// Capped: left out as held at the usage cap the user set on the
 	// account, this cap in percent; Used is then its fullest window's
 	// share, CapBack when the last window at or past it renews
@@ -233,10 +243,13 @@ type Try struct {
 	Served  string `json:"served,omitempty"`
 	Swapped bool   `json:"swapped,omitempty"`
 	Routed  bool   `json:"routed,omitempty"`
-	Fail    string `json:"fail,omitempty"` // why it failed, as rest tells it
-	Error   string `json:"error,omitempty"`
-	Rest    *Rest  `json:"rest,omitempty"`  // how long it now sits out; none when it was the last to try
-	Again   int64  `json:"again,omitempty"` // ms waited before it was tried again, the last one left
+	// Upstream: the provider an aggregator said answered behind it
+	// (OpenRouter's DeepInfra, Novita …)
+	Upstream string `json:"upstream,omitempty"`
+	Fail     string `json:"fail,omitempty"` // why it failed, as rest tells it
+	Error    string `json:"error,omitempty"`
+	Rest     *Rest  `json:"rest,omitempty"`  // how long it now sits out; none when it was the last to try
+	Again    int64  `json:"again,omitempty"` // ms waited before it was tried again, the last one left
 	// Queued: ms it waited for one of its key's or account's slots, the
 	// provider's MaxConcurrency out already (concurrency.go)
 	Queued int64 `json:"queued,omitempty"`
@@ -244,6 +257,9 @@ type Try struct {
 	// Codex resets was spent by itself (the user's setting) — on Who, and
 	// what spending it did — and the request asked again
 	Reset *AutoReset `json:"reset,omitempty"`
+	// Auto: the models Copilot's Auto picked for it, in turn — where each
+	// pick came from and Copilot's refusal of it — Model being "auto"
+	Auto []provider.AutoPick `json:"auto,omitempty"`
 }
 
 // AutoReset is a Codex or Claude reset spent by itself, on Who's account.

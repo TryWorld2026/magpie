@@ -60,6 +60,23 @@ func drawer() (string, bool) {
 	return m, m != ""
 }
 
+func resolveDrawing(id string) (provider.Provider, string, bool) {
+	if strings.Contains(id, "/") {
+		return provider.Resolve(id)
+	}
+	for _, p := range provider.All() {
+		if !p.On() || p.DecideOnly() {
+			continue
+		}
+		for _, m := range Drawers(p) {
+			if m.ID == id {
+				return p, m.ID, true
+			}
+		}
+	}
+	return provider.Resolve(id)
+}
+
 // codexDrawers are the image models a ChatGPT account draws with, at
 // its Codex backend's images API, as Codex CLI does (gpt-image-2 is the one
 // it asks for).
@@ -111,9 +128,23 @@ func Drawers(p provider.Provider) []catalog.Model {
 		}
 		return out
 	}
+	if googleAccount(p) {
+		// the image models a Google sign-in lists (Antigravity's
+		// gemini-3.1-flash-image), which draw on Code Assist (#757)
+		var out []catalog.Model
+		for _, m := range p.Available() {
+			if catalog.DrawsID(m.ID) {
+				m.Provider = p.ID
+				out = append(out, m)
+			}
+		}
+		return out
+	}
 	// any other subscription is asked through its agent's own API, which
-	// draws nothing magpie can ask for yet
-	if p.Account != nil || p.Base(provider.Chat) == "" {
+	// draws nothing magpie can ask for yet. A Responses-only relay (a Codex
+	// backend such as sub2api) has no chat base but serves the images API
+	// under the same root as its Responses endpoint, so it draws all the same.
+	if p.Account != nil || (p.Base(provider.Chat) == "" && p.Base(provider.Responses) == "") {
 		return nil
 	}
 	var out []catalog.Model
@@ -236,6 +267,7 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 			writeError(w, provider.Chat, code, msg)
 			s.record(call)
 		}
+		named := d.Model != "" // a gateway key's models hold one the caller names (#882)
 		if d.Model == "" {
 			m, ok := drawer()
 			if !ok {
@@ -244,13 +276,21 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 			}
 			d.Model, call.Model = m, m
 		}
-		p, model, ok := provider.Resolve(d.Model)
+		p, model, ok := s.drawingModel(r, d.Model)
 		if !ok {
+			if agentOf(r) == "codex" && !strings.Contains(d.Model, "/") {
+				fail(400, "no model to draw with: Codex's provider has no matching image model and magpie's Settings → Images → Image generation has none enabled")
+				return
+			}
 			if off, isOff := provider.SwitchedOff(d.Model); isOff {
 				fail(404, switchedOff(off, d.Model))
 				return
 			}
 			fail(404, fmt.Sprintf("magpie knows no model %q to draw with", d.Model))
+			return
+		}
+		if keyWho, held := keyHolds(r); held && named && !modelAllowed(keyWho, p, model) {
+			fail(403, keyModelError(keyWho, d.Model))
 			return
 		}
 		var unmask func()
@@ -260,7 +300,7 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), drawTimeout)
 		defer cancel()
 		// the account that drew, or refused last, is the one recorded
-		drew, out, code, err := s.drawOnAccounts(ctx, p, model, d)
+		drew, out, code, capBack, err := s.drawOnAccounts(ctx, r, p, model, d)
 		p = drew
 		call.Millis = time.Since(start).Milliseconds()
 		call.Status, call.Usage.Input, call.Usage.Output = code, out.Input, out.Output
@@ -277,6 +317,9 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 		if err != nil {
 			call.Error = err.Error()
 			s.record(call)
+			if d := time.Until(capBack); d > 0 {
+				w.Header().Set("Retry-After", strconv.Itoa(int(d.Seconds())+1))
+			}
 			writeError(w, provider.Chat, code, err.Error())
 			return
 		}
@@ -511,10 +554,20 @@ func viaFor(p provider.Provider, model string) drawVia {
 // what the pinned one may not (#545). The refusal is of images alone, so
 // no account rests for text over it. It answers with the account that
 // drew, or the last one's error when every one refused.
-func (s *Server) drawOnAccounts(ctx context.Context, p provider.Provider, model string, d drawing) (provider.Provider, drawn, int, error) {
+func (s *Server) drawOnAccounts(ctx context.Context, r *http.Request, p provider.Provider, model string, d drawing) (provider.Provider, drawn, int, time.Time, error) {
 	if p.Account == nil {
+		// a key of its own: the calling key's accounts hold it as one,
+		// drawn with a key it may use — of those in use, not the
+		// provider's first alone, which a key held to a later one was
+		// refused by — or none, refused
+		if keyWho, held := accountHolds(r); held {
+			var ok bool
+			if p, ok = allowedKey(keyWho, p, model); !ok {
+				return p, drawn{}, http.StatusForbidden, time.Time{}, errors.New(keyAccountsError(keyWho, d.Model))
+			}
+		}
 		out, code, err := s.draw(ctx, p, model, d)
-		return p, out, code, err
+		return p, out, code, time.Time{}, err
 	}
 	q := p
 	q.Fallback = nil
@@ -527,10 +580,19 @@ func (s *Server) drawOnAccounts(ctx context.Context, p provider.Provider, model 
 			cs = append(cs, c)
 		}
 	}
+	// the accounts the calling key may not use are left out of the whole
+	// fan-out (#905): the next one a refusal hands the request to no less
+	// than the first, so none it may not use draws
+	if keyWho, held := accountHolds(r); held {
+		cs = slices.DeleteFunc(cs, func(c candidate) bool { return !accountAllowed(keyWho, c) })
+		if len(cs) == 0 {
+			return p, drawn{}, http.StatusForbidden, time.Time{}, errors.New(keyAccountsError(keyWho, d.Model))
+		}
+	}
 	if len(cs) == 0 && slices.ContainsFunc(barred, func(c candidate) bool { return c.capped != nil }) {
 		// every account is held at its usage cap
-		msg, _ := cappedError(model, barredOf(barred, q, false, provider.Chat, nil), time.Now())
-		return p, drawn{}, http.StatusTooManyRequests, errors.New(msg)
+		msg, back := cappedError(model, barredOf(barred, q, false, provider.Chat, nil), time.Now())
+		return p, drawn{}, http.StatusTooManyRequests, back, errors.New(msg)
 	}
 	if len(cs) == 0 {
 		cs = []candidate{{p: p, model: model, rest: p.ID}}
@@ -545,7 +607,7 @@ func (s *Server) drawOnAccounts(ctx context.Context, p provider.Provider, model 
 			break
 		}
 	}
-	return p, out, code, err
+	return p, out, code, time.Time{}, err
 }
 
 // accountRefusedDrawing says a failure to draw was the account's — its
@@ -568,7 +630,10 @@ func (s *Server) draw(ctx context.Context, p provider.Provider, model string, d 
 	if drawsCodex(p) || drawsGrok(p) {
 		return s.drawImages(ctx, p, model, d)
 	}
-	if p.Base(provider.Chat) == "" {
+	if googleAccount(p) {
+		return s.drawCodeAssist(ctx, p, model, d)
+	}
+	if p.Base(provider.Chat) == "" && p.Base(provider.Responses) == "" {
 		return drawn{}, 400, fmt.Errorf("%s can't draw: magpie draws only through an OpenAI-compatible API, and %s has none", p.Name, p.Name)
 	}
 	via := viaFor(p, model)
@@ -702,6 +767,11 @@ func (s *Server) drawImages(ctx context.Context, p provider.Provider, model stri
 		return s.drawModelScope(ctx, p, model, d)
 	}
 	base := strings.TrimRight(p.Base(provider.Chat), "/")
+	if base == "" {
+		// a Responses-only relay serves the images API under the same root
+		// as its Responses endpoint
+		base = strings.TrimRight(p.Base(provider.Responses), "/")
+	}
 	if drawsCodex(p) || drawsGrok(p) {
 		base = strings.TrimRight(p.Base(provider.Responses), "/")
 	}
@@ -1047,6 +1117,58 @@ func (s *Server) drawGemini(ctx context.Context, p provider.Provider, model stri
 		}
 		out.Text = strings.TrimSpace(out.Text)
 		return out, code, nil
+	})
+}
+
+// drawCodeAssist asks an image model on a Google sign-in to draw, as it is
+// asked to chat: on Code Assist, in the account's envelope, which asks for
+// images beside text for an image model (buildCodeAssistSent); what it
+// draws comes back as the pictures of its reply.
+func (s *Server) drawCodeAssist(ctx context.Context, p provider.Provider, model string, d drawing) (drawn, int, error) {
+	parts := []Part{{Kind: Text, Text: drawPrompt(d)}}
+	for _, pic := range d.Images {
+		if pic.URL != "" {
+			b, mt, err := s.fetchPicture(ctx, pic.URL)
+			if err != nil {
+				return drawn{}, 400, err
+			}
+			pic = picture{Mime: mt, Data: b}
+		}
+		parts = append(parts, Part{Kind: Image, MediaType: pic.Mime, Data: base64.StdEncoding.EncodeToString(pic.Data)})
+	}
+	req := &Request{Messages: []Message{{Role: "user", Parts: parts}}}
+	return s.eachDrawing(d.N, func() (drawn, int, error) {
+		// one each: the drawings are asked for at once
+		ask := s.askTranslated(p, provider.CodeAssist, model, http.Header{}, http.Header{})
+		events, code, msg := ask(ctx, req)
+		if events == nil {
+			return drawn{}, code, errors.New(msg)
+		}
+		var out drawn
+		var failed string
+		for ev := range events {
+			switch ev.Kind {
+			case KImage:
+				data, err := base64.StdEncoding.DecodeString(ev.Text)
+				if err != nil {
+					failed = fmt.Sprintf("%s's image isn't base64: %v", p.Name, err)
+					continue
+				}
+				out.Images = append(out.Images, picture{Mime: cmp.Or(ev.Name, "image/png"), Data: data})
+			case KText:
+				out.Text += ev.Text
+			case KUsage:
+				out.Input += ev.Usage.Input + ev.Usage.CacheRead
+				out.Output += ev.Usage.Output
+			case KError:
+				failed = p.Name + ": " + ev.Text
+			}
+		}
+		out.Text = strings.TrimSpace(out.Text)
+		if failed != "" && len(out.Images) == 0 {
+			return out, 502, errors.New(failed)
+		}
+		return out, 200, nil
 	})
 }
 
