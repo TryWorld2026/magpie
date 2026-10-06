@@ -17,8 +17,12 @@ const (
 // record is where the system keeps it, as a file: none, it's the registry's
 func record() string { return "" }
 
+// openRunKey is how the Run key is reached. A test hands back a key the user's
+// ACL refuses, which no key this machine's own user has.
+var openRunKey = registry.OpenKey
+
 func enabled() bool {
-	k, err := registry.OpenKey(registry.CURRENT_USER, runKey, registry.QUERY_VALUE)
+	k, err := openRunKey(registry.CURRENT_USER, runKey, registry.QUERY_VALUE)
 	if err != nil {
 		return false
 	}
@@ -60,7 +64,7 @@ func enable(exe string) error {
 }
 
 func disable() error {
-	k, err := registry.OpenKey(registry.CURRENT_USER, runKey, registry.SET_VALUE)
+	k, err := openRunKey(registry.CURRENT_USER, runKey, registry.SET_VALUE)
 	if err != nil {
 		return nil
 	}
