@@ -21,27 +21,59 @@ func record() string { return "" }
 // ACL refuses, which no key this machine's own user has.
 var openRunKey = registry.OpenKey
 
+// openApprovedKey is how Task Manager's Startup apps marker is reached, for the
+// same reason: read to answer switchedOff, opened for writing to clear it.
+var openApprovedKey = registry.OpenKey
+
 func enabled() bool {
 	k, err := openRunKey(registry.CURRENT_USER, runKey, registry.QUERY_VALUE)
 	if err != nil {
-		return false
+		// No Run key at all is off. A Run key that can't be read is not a
+		// no: Windows may still be starting magpie, and Set is what says so
+		// when it can't reach the key to turn that off.
+		return !errors.Is(err, registry.ErrNotExist)
 	}
 	defer k.Close()
 	if _, _, err = k.GetStringValue(name); err != nil {
-		return false
+		return !errors.Is(err, registry.ErrNotExist)
 	}
 	return !switchedOff()
 }
 
-// switchedOff: turned off in Task Manager, which leaves the Run value be
+// switchedOff: turned off in Task Manager, which leaves the Run value be. A
+// marker that can't be read says nothing about it either way — the Run value
+// is what starts magpie, so an unreadable one is not taken for switched off.
 func switchedOff() bool {
-	k, err := registry.OpenKey(registry.CURRENT_USER, approvedKey, registry.QUERY_VALUE)
+	k, err := openApprovedKey(registry.CURRENT_USER, approvedKey, registry.QUERY_VALUE)
 	if err != nil {
-		return false
+		// No marker at all is not switched off. One that can't be read is
+		// not taken for switched off either, and telling the two apart here
+		// is what keeps that from being a guess: the Run value is what
+		// starts magpie, so reporting switched off would hide it.
+		return errors.Is(err, registry.ErrNotExist)
 	}
 	defer k.Close()
 	b, _, err := k.GetBinaryValue(name)
 	return err == nil && len(b) > 0 && b[0]&1 == 1
+}
+
+// clearApprovedMarker takes Task Manager's Startup apps marker off the Run
+// value, so Windows starts magpie again at sign-in. A marker that can't be
+// reached or deleted leaves the Run value switched off, so saying nothing
+// about it would let Set(true) report on while Windows starts nothing.
+func clearApprovedMarker() error {
+	a, err := openApprovedKey(registry.CURRENT_USER, approvedKey, registry.SET_VALUE)
+	if err != nil {
+		if !errors.Is(err, registry.ErrNotExist) {
+			return err
+		}
+		return nil // no marker is nothing to clear
+	}
+	defer a.Close()
+	if err := a.DeleteValue(name); err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // the user's own Run value, which Windows starts at sign-in (and which
@@ -56,17 +88,16 @@ func enable(exe string) error {
 		return err
 	}
 	// switched on here after Task Manager switched it off: on again there
-	if a, err := registry.OpenKey(registry.CURRENT_USER, approvedKey, registry.SET_VALUE); err == nil {
-		a.DeleteValue(name)
-		a.Close()
-	}
-	return nil
+	return clearApprovedMarker()
 }
 
 func disable() error {
 	k, err := openRunKey(registry.CURRENT_USER, runKey, registry.SET_VALUE)
+	if err != nil && !errors.Is(err, registry.ErrNotExist) {
+		return err
+	}
 	if err != nil {
-		return nil
+		return nil // no Run key is nothing to turn off
 	}
 	defer k.Close()
 	if err := k.DeleteValue(name); err != nil && !errors.Is(err, registry.ErrNotExist) {
