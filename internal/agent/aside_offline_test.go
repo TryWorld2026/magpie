@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -122,6 +123,11 @@ func TestAsidePostReadFailuresNeverOfferOffline(t *testing.T) {
 			case "corrupt record":
 				writeFile(t, c.record, "{invalid")
 			case "save record":
+				// a folder made read-only refuses a write on Unix; Windows
+				// takes the read-only bit off a folder as no answer at all
+				if runtime.GOOS == "windows" {
+					t.Skip("a read-only folder refuses a write on Unix only")
+				}
 				if err := a.Native.Stage("model", "magpie/relay/glm-4.6"); err != nil {
 					t.Fatal(err)
 				}
@@ -211,9 +217,12 @@ func TestAsideOfflineRestoresCompleteSelectionsAndPreservesUserChanges(t *testin
 	if err != nil || len(r.Fields) != 0 {
 		t.Fatalf("record not cleared: %+v %v", r, err)
 	}
-	mode, err := os.Stat(c.record)
-	if err != nil || mode.Mode().Perm() != 0600 {
-		t.Fatalf("record mode: %v %v", mode, err)
+	// a file's mode is Unix's: Windows keeps the read-only bit and no more
+	if runtime.GOOS != "windows" {
+		mode, err := os.Stat(c.record)
+		if err != nil || mode.Mode().Perm() != 0600 {
+			t.Fatalf("record mode: %v %v", mode, err)
+		}
 	}
 }
 
@@ -287,13 +296,19 @@ func TestAsideOfflineLegacyRecordDoesNotResurrect(t *testing.T) {
 	if err != nil || len(r.Fields) != 0 {
 		t.Fatal("legacy restore points resurrected")
 	}
-	mode, err := os.Stat(c.record)
-	if err != nil || mode.Mode().Perm() != 0600 {
-		t.Fatalf("record mode: %v %v", mode, err)
+	if runtime.GOOS != "windows" {
+		mode, err := os.Stat(c.record)
+		if err != nil || mode.Mode().Perm() != 0600 {
+			t.Fatalf("record mode: %v %v", mode, err)
+		}
 	}
 }
 
 func TestAsideOfflineWriteFailureRollsBack(t *testing.T) {
+	// the refusal is a read-only folder, which Windows takes as no answer
+	if runtime.GOOS == "windows" {
+		t.Skip("a read-only folder refuses a write on Unix only")
+	}
 	settings, models := asideHome(t)
 	a := mustFindAside(t)
 	c := newAsideConnection(here(""))
@@ -335,6 +350,9 @@ func TestAsideDisconnectUnavailableOnlyAtInitialRead(t *testing.T) {
 			case "initial":
 				asideRead = func() (map[string]json.RawMessage, error) { return nil, errors.New("offline") }
 			case "record":
+				if runtime.GOOS == "windows" {
+					t.Skip("a read-only folder refuses a write on Unix only")
+				}
 				dir := filepath.Dir(newAsideConnection(here("")).record)
 				os.Chmod(dir, 0500)
 				t.Cleanup(func() { os.Chmod(dir, 0700) })
@@ -491,6 +509,11 @@ func TestAsideOfflineImageRestoresFullSavedObject(t *testing.T) {
 }
 
 func TestAsideOfflineProviderWriteFailureRollsBackAllFiles(t *testing.T) {
+	// the rollback is over hard links to a symlink, which needs a privilege
+	// Windows does not grant by default
+	if runtime.GOOS == "windows" {
+		t.Skip("a symlink needs a privilege Windows does not grant by default")
+	}
 	settings, models := asideHome(t)
 	a := mustFindAside(t)
 	if err := a.Native.Stage("model", "magpie/relay/glm-4.6"); err != nil {
