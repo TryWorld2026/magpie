@@ -4119,7 +4119,7 @@ function askLeave(a, field, value, opt) {
   head.append(icon(a.icon), el("b", "", t("Take {agent} off magpie?", { agent: a.name })));
   ed.append(head);
   ed.append(el("p", "lib-confirm", value === "" && a.id === "reasonix"
-    ? t("Restores {agent}'s previous {field} selection. Magpie's provider and private credential are removed when neither Executor nor Plan uses them.", { agent: a.name, field: t(field.label) })
+    ? t("Restores {agent}'s previous {field} selection. Magpie's provider and private credential are removed when neither executor nor planner uses them.", { agent: a.name, field: t(field.label) })
     : value === ""
     ? t("Default is {agent} as installed: magpie's endpoint and models come out, and {agent} starts on its own default model. What it had before magpie isn't put back; Disconnect and restore does that.", { agent: a.name })
     : t("{model} is {agent}'s own model: {agent} asks {vendor} for it itself, with its own sign-in, not through magpie. Picking it takes {agent} off magpie, and it starts on {model}.", { agent: a.name, model, vendor: opt.direct })));

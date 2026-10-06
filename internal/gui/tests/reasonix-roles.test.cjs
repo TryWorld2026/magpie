@@ -27,6 +27,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           { key: "model", label: "executor", value: "", options },
           { key: "planner", label: "planner", value: "", options: [{ value: "off", label: "off" }, ...options] },
         ];
+        // The role labels are field labels like any other: t(label) translates
+        // them, and both the picker note and the confirm fill {field} from it.
+        const roleText = { executor: "执行模型", planner: "规划模型" };
+        const labelText = (l) => (lang === "zh" ? roleText[l] : l);
         const posts = [];
         const state = () => ({ agents: [{ id: "reasonix", name: "Reasonix Studio", icon: "reasonix-color", path: "/fixture/config.toml", wired: fields.some((f) => f.value.startsWith("magpie/")), fields }], profiles: [], settings: { lang, theme: "light" } });
         await page.addInitScript(() => localStorage.setItem("magpie.modelFavorites", '["a/pro"]'));
@@ -75,7 +79,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           // connected; it does not read "Pick a model" (EZN7L2C3, #834).
           // The Executor is the model field here and is named "executor".
           const def = lang === "zh" ? "默认" : "default";
-          assert.equal((await row.locator(".ag-start").textContent()).trim(), `executor${def}`);
+          assert.equal((await row.locator(".ag-start").textContent()).trim(), `${labelText(fields[0].label)}${def}`);
         } else for (const f of fields) {
           assert.equal(await row.locator(`.field[data-key="${f.key}"] > .k`).count(), 1, "a default role must be labelled once");
         }
@@ -123,7 +127,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const defaults = async (key) => {
           await row.locator(`.field[data-key="${key}"]`).click();
           const label = fields.find((f) => f.key === key).label;
-          assert((await page.locator("#pop").innerText()).includes(lang === "zh" ? `还原原来的 ${label} 选择` : `restore the previous ${label} selection`));
+          assert((await page.locator("#pop").innerText()).includes(lang === "zh" ? `还原原来的 ${labelText(label)} 选择` : `restore the previous ${label} selection`));
           await page.locator("#pop").getByText(lang === "zh" ? "默认" : "Default", { exact: true }).first().click();
         };
         const first = mode === "panel" ? fields[1] : fields[0];
@@ -137,7 +141,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await defaults(last.key);
         const ask = page.locator(".leave-ask");
         await ask.waitFor();
-        assert((await ask.innerText()).includes(lang === "zh" ? `还原 Reasonix Studio 原来的 ${last.label} 选择` : `Restores Reasonix Studio's previous ${last.label} selection`));
+        assert((await ask.innerText()).includes(lang === "zh" ? `还原 Reasonix Studio 原来的 ${labelText(last.label)} 选择` : `Restores Reasonix Studio's previous ${last.label} selection`));
         assert.equal(posts.length, 1, "the last role waits for confirmation");
         await Promise.all([
           page.waitForResponse((r) => new URL(r.url()).pathname === "/api/set"),
