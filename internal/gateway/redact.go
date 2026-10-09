@@ -38,13 +38,20 @@ func redactedPrompt(w http.ResponseWriter, prompt string) (http.ResponseWriter, 
 func redactionOptions() redact.Options { return settings.Load().Redaction() }
 
 // scrubOptions is what the request archive and the OTLP bodies take out of
-// what they keep: what the user asked masked, and every secret beside it,
-// masking on or not — what they keep is sent nowhere, so a secret goes from
-// it either way, and a masking rule of the user's own goes with it (#195).
+// what they keep: what the user asked masked, and every secret beside it.
+// What they keep is sent nowhere — the user's own bucket, or their
+// collector — so a secret goes from it whether or not Mask secrets is on,
+// which is the archive's contract. Secrets forced this way are magpie's
+// own rules, and nothing else: a masking rule of the user's own stays
+// gated on Mask secrets as settings documents it, since forcing Secrets on
+// would switch those on with them (redact.mask gates the user's rules on
+// Secrets). Their words and personal data follow their own switches as
+// before.
 func scrubOptions() redact.Options {
 	o := redactionOptions()
-	o.Secrets = true
-	return o
+	// the user's rules are left out: they are gated on Mask secrets, which
+	// is settings' documented meaning of them
+	return redact.Options{Secrets: true, Personal: o.Personal, Words: o.Words}
 }
 
 // unredactedRoute says a request resolved to p, or to the group whose

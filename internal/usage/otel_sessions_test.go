@@ -63,7 +63,10 @@ func TestSessionTraceWirePrivacyAndTokenOwnership(t *testing.T) {
 // A masking rule of the user's own goes out of an exported session body as
 // it goes out of what the vendor is sent (#195): a relay key of a format
 // magpie's rules don't know, in a conversation the agent kept on disk, is
-// not what the collector receives.
+// not what the collector receives. It is gated on Mask secrets as settings
+// documents it, so the same rule takes nothing out with masking off — the
+// secrets magpie's own rules know go either way, since what the export
+// keeps is sent nowhere.
 func TestSessionBodyKeepsTheUsersRules(t *testing.T) {
 	const relay = "rz_RelayKey1234567"
 	body := `{"prompt":"send it to ` + relay + `"}`
@@ -75,13 +78,12 @@ func TestSessionBodyKeepsTheUsersRules(t *testing.T) {
 	if got := sessionBody(body, cfg); strings.Contains(got, relay) || !strings.Contains(got, "[REDACTED:RELAY]") {
 		t.Errorf("session body: %s", got)
 	}
-	// masking off for the vendor, what the export keeps is sent nowhere, so
-	// every secret goes from it as the request archive has it
+	// masking off, the user's rule is off with it, as the vendor side has it
 	if err := settings.Save(settings.Settings{RedactRules: rules}); err != nil {
 		t.Fatal(err)
 	}
-	if got := sessionBody(body, cfg); strings.Contains(got, relay) {
-		t.Errorf("session body with masking off: %s", got)
+	if got := sessionBody(body, cfg); !strings.Contains(got, relay) {
+		t.Errorf("session body with masking off took the rule's match out: %s", got)
 	}
 }
 

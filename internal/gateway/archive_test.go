@@ -292,11 +292,13 @@ func (relayVendor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, `{"id":"c1","object":"chat.completion","model":"m1","choices":[{"index":0,"message":{"role":"assistant","content":"using `+relayKey+`"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`)
 }
 
-// A masking rule of the user's own goes out of the archive as it goes out of
-// what the vendor is sent: the reply that names the relay key keeps
-// [REDACTED:RELAY] and not the key, and the request it was sent with has the
-// key taken out whether masking is on for the vendor or not — what the
-// archive keeps is sent nowhere, so every secret goes from it either way.
+// Every secret goes out of the archive whether masking is on for the vendor
+// or not: what the archive keeps is sent nowhere, so a magpie rule's match
+// goes from it either way. The reply that names the relay key keeps
+// [REDACTED:RELAY] and not the key. A masking rule of the user's own still
+// follows Mask secrets, as settings documents it: on, the vendor was sent a
+// placeholder and the archive keeps that one; off, no rule of magpie's
+// knows rz_, so the key is kept as the agent sent it.
 func TestArchiveKeepsTheUsersRules(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -327,17 +329,22 @@ func TestArchiveKeepsTheUsersRules(t *testing.T) {
 			if err := json.Unmarshal(data, &a); err != nil {
 				t.Fatal(err)
 			}
-			if strings.Contains(a.Request.Body, relayKey) {
-				t.Errorf("the relay key in the archived request:\n%s", a.Request.Body)
-			}
 			// masking on, the vendor was sent a placeholder and the archive
-			// keeps that one; masking off, the key goes for good
+			// keeps that one; off, the user's rule took nothing out of what
+			// the vendor was sent, and no rule of magpie's knows rz_, so the
+			// key is in the archived request as it was in the agent's
 			want := "[REDACTED:RELAY]"
 			if tc.redact {
 				want = "{{RELAY_"
 			}
 			if !strings.Contains(a.Request.Body, want) {
 				t.Errorf("want %s in the archived request:\n%s", want, a.Request.Body)
+			}
+			if tc.redact && strings.Contains(a.Request.Body, relayKey) {
+				t.Errorf("the relay key in the archived request:\n%s", a.Request.Body)
+			}
+			if !tc.redact && !strings.Contains(a.Request.Body, relayKey) {
+				t.Errorf("the relay key is not in the archived request, and no rule knows it:\n%s", a.Request.Body)
 			}
 			if !strings.Contains(a.Response.Body, "[REDACTED:RELAY]") || strings.Contains(a.Response.Body, relayKey) {
 				t.Errorf("the relay key in the archived reply:\n%s", a.Response.Body)
