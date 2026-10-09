@@ -292,13 +292,14 @@ func (relayVendor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, `{"id":"c1","object":"chat.completion","model":"m1","choices":[{"index":0,"message":{"role":"assistant","content":"using `+relayKey+`"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`)
 }
 
-// Every secret goes out of the archive whether masking is on for the vendor
-// or not: what the archive keeps is sent nowhere, so a magpie rule's match
-// goes from it either way. The reply that names the relay key keeps
-// [REDACTED:RELAY] and not the key. A masking rule of the user's own still
-// follows Mask secrets, as settings documents it: on, the vendor was sent a
-// placeholder and the archive keeps that one; off, no rule of magpie's
-// knows rz_, so the key is kept as the agent sent it.
+// Every secret of magpie's own goes out of the archive whether masking is
+// on for the vendor or not: what the archive keeps is sent nowhere, so a
+// magpie rule's match goes from it either way. A masking rule of the user's
+// own is left behind: mask gates it on Mask secrets, so forcing the secrets
+// on for what is kept would switch their rule on where the vendor side left
+// it off. With masking on the vendor was sent a placeholder and the archive
+// keeps that one; with it off the agent's own text is what the archive
+// keeps, the relay key and all, since no rule of magpie's knows rz_.
 func TestArchiveKeepsTheUsersRules(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -333,21 +334,21 @@ func TestArchiveKeepsTheUsersRules(t *testing.T) {
 			// keeps that one; off, the user's rule took nothing out of what
 			// the vendor was sent, and no rule of magpie's knows rz_, so the
 			// key is in the archived request as it was in the agent's
-			want := "[REDACTED:RELAY]"
+			want := relayKey
 			if tc.redact {
 				want = "{{RELAY_"
 			}
 			if !strings.Contains(a.Request.Body, want) {
 				t.Errorf("want %s in the archived request:\n%s", want, a.Request.Body)
 			}
-			if tc.redact && strings.Contains(a.Request.Body, relayKey) {
-				t.Errorf("the relay key in the archived request:\n%s", a.Request.Body)
+			if tc.redact == strings.Contains(a.Request.Body, relayKey) {
+				t.Errorf("masking %v: the relay key in the archived request:\n%s", tc.redact, a.Request.Body)
 			}
-			if !tc.redact && !strings.Contains(a.Request.Body, relayKey) {
-				t.Errorf("the relay key is not in the archived request, and no rule knows it:\n%s", a.Request.Body)
-			}
-			if !strings.Contains(a.Response.Body, "[REDACTED:RELAY]") || strings.Contains(a.Response.Body, relayKey) {
-				t.Errorf("the relay key in the archived reply:\n%s", a.Response.Body)
+			// the reply was masked on its way back only where the vendor
+			// echoed the placeholder: with masking on the key is restored
+			// for the agent, and with it off the vendor never saw one
+			if !tc.redact && !strings.Contains(a.Response.Body, relayKey) {
+				t.Errorf("the relay key is not in the archived reply, and no rule knows it:\n%s", a.Response.Body)
 			}
 		})
 	}

@@ -69,17 +69,20 @@ func (e *otelExporter) sessionObserved(agent, session string, config settings.OT
 	return e.identities.Visible(agent, session)
 }
 
-// sessionBody is a session's input or output as the export keeps it: what
-// the gateway's masking covers, and every secret beside it, masking on or
-// not — what the export keeps is sent to the collector, so a secret goes
-// from it either way, and a masking rule of the user's own goes with it
-// (#195).
+// sessionBody is a session's input or output as the export keeps it: every
+// secret of magpie's own taken out of it, masking on or not, since what
+// the export keeps goes to the collector (#195).
 func sessionBody(body string, config settings.OTel) string {
 	if !config.Bodies {
 		return ""
 	}
+	// as gateway.scrubOptions takes it out of what the archive keeps: every
+	// secret of magpie's own either way, and the user's words and personal
+	// data with them — but not their rules, which mask gates on the secrets
+	// that are forced on here, and which are therefore left out
 	o := settings.Load().Redaction()
 	o.Secrets = true
+	o.Rules = nil
 	body = string(redact.ScrubJSONWith([]byte(body), o))
 	cut := false
 	if !config.BodiesWhole && len(body) > 256<<10 {

@@ -60,30 +60,36 @@ func TestSessionTraceWirePrivacyAndTokenOwnership(t *testing.T) {
 	}
 }
 
-// A masking rule of the user's own goes out of an exported session body as
-// it goes out of what the vendor is sent (#195): a relay key of a format
-// magpie's rules don't know, in a conversation the agent kept on disk, is
-// not what the collector receives. It is gated on Mask secrets as settings
-// documents it, so the same rule takes nothing out with masking off — the
-// secrets magpie's own rules know go either way, since what the export
-// keeps is sent nowhere.
+// A secret of magpie's own goes out of an exported session body whether
+// masking is on for the vendor or not, since what the export keeps goes to
+// the collector (#195). A masking rule of the user's own is left behind:
+// mask gates it on Mask secrets, so forcing the secrets on for what is kept
+// would switch their rule on where the vendor side left it off.
 func TestSessionBodyKeepsTheUsersRules(t *testing.T) {
 	const relay = "rz_RelayKey1234567"
-	body := `{"prompt":"send it to ` + relay + `"}`
+	secret := "sk-ant-api03-" + strings.Repeat("Q7x", 10)
 	rules := []redact.Rule{{Kind: "RELAY", Prefix: "rz_"}}
 	cfg := settings.OTel{Bodies: true}
-	if err := settings.Save(settings.Settings{Redact: true, RedactRules: rules}); err != nil {
-		t.Fatal(err)
-	}
-	if got := sessionBody(body, cfg); strings.Contains(got, relay) || !strings.Contains(got, "[REDACTED:RELAY]") {
-		t.Errorf("session body: %s", got)
-	}
-	// masking off, the user's rule is off with it, as the vendor side has it
-	if err := settings.Save(settings.Settings{RedactRules: rules}); err != nil {
-		t.Fatal(err)
-	}
-	if got := sessionBody(body, cfg); !strings.Contains(got, relay) {
-		t.Errorf("session body with masking off took the rule's match out: %s", got)
+	for _, tc := range []struct {
+		name   string
+		redact bool
+		want   string
+	}{
+		{"masking_on", true, relay},
+		{"masking_off", false, relay},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := settings.Save(settings.Settings{Redact: tc.redact, RedactRules: rules}); err != nil {
+				t.Fatal(err)
+			}
+			got := sessionBody(`{"prompt":"send it to `+secret+` and `+relay+`}`, cfg)
+			if strings.Contains(got, secret) {
+				t.Errorf("the secret is in the exported session body: %s", got)
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("want %s in the exported session body: %s", tc.want, got)
+			}
+		})
 	}
 }
 
