@@ -60,7 +60,9 @@ func plist(exe string) []byte {
 `, label, html.EscapeString(exe), Arg))
 }
 
-var program = regexp.MustCompile(`<key>ProgramArguments</key>\s*<array><string>([^<]*)</string>`)
+// with a path in the first string: an empty one names nothing to run, and
+// launchd refuses the job
+var program = regexp.MustCompile(`<key>ProgramArguments</key>\s*<array><string>([^<]+)</string>`)
 
 // refresh writes a launch agent an older magpie wrote over as this one
 // would, for the program it names: the path stays the one the user turned

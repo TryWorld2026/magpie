@@ -44,4 +44,12 @@ func TestSetThenTruncatedRecordReadsAsOff(t *testing.T) {
 	if Enabled() {
 		t.Error("an empty desktop entry reads as on")
 	}
+	// an Exec key with nothing after it names nothing to run either, and the
+	// desktop starts no entry that names nothing
+	if err := os.WriteFile(p, []byte("[Desktop Entry]\nType=Application\nName=magpie\nExec=\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if Enabled() {
+		t.Error("a desktop entry with an empty Exec reads as on")
+	}
 }

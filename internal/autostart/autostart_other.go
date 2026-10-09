@@ -26,7 +26,9 @@ func record() string {
 // to run. A .desktop a write left short of either reads as off, not as on.
 var (
 	entryType = regexp.MustCompile(`(?m)^Type=Application$`)
-	entryExec = regexp.MustCompile(`(?m)^Exec=`)
+	// the Exec key with something to run after it: an empty one names
+	// nothing, and the desktop starts no entry that names nothing
+	entryExec = regexp.MustCompile(`(?m)^Exec=\s*\S`)
 )
 
 func enabled() bool {
