@@ -25,6 +25,13 @@ var openRunKey = registry.OpenKey
 // same reason: read to answer switchedOff, opened for writing to clear it.
 var openApprovedKey = registry.OpenKey
 
+// readRunValue is how the magpie Run value is read off a key that opened. A
+// test has no Run value to hand back, so it stands in for this too.
+var readRunValue = func(k registry.Key) (string, error) {
+	s, _, err := k.GetStringValue(name)
+	return s, err
+}
+
 func enabled() bool {
 	k, err := openRunKey(registry.CURRENT_USER, runKey, registry.QUERY_VALUE)
 	if err != nil {
@@ -34,23 +41,25 @@ func enabled() bool {
 		return !errors.Is(err, registry.ErrNotExist)
 	}
 	defer k.Close()
-	if _, _, err = k.GetStringValue(name); err != nil {
+	if _, err = readRunValue(k); err != nil {
 		return !errors.Is(err, registry.ErrNotExist)
 	}
 	return !switchedOff()
 }
 
 // switchedOff: turned off in Task Manager, which leaves the Run value be. A
-// marker that can't be read says nothing about it either way — the Run value
-// is what starts magpie, so an unreadable one is not taken for switched off.
+// marker that isn't there, or that can't be read, is not switched off: only a
+// marker that says so is, since the Run value is what starts magpie.
 func switchedOff() bool {
 	k, err := openApprovedKey(registry.CURRENT_USER, approvedKey, registry.QUERY_VALUE)
 	if err != nil {
-		// No marker at all is not switched off. One that can't be read is
-		// not taken for switched off either, and telling the two apart here
-		// is what keeps that from being a guess: the Run value is what
-		// starts magpie, so reporting switched off would hide it.
-		return errors.Is(err, registry.ErrNotExist)
+		// No marker at all is not switched off, and neither is one that
+		// can't be read: Windows writes this key the first time Startup
+		// apps lists an entry, so a machine whose user has never opened it
+		// has no key at all while every Run value it has is on. The Run
+		// value is what starts magpie, so reporting switched off here
+		// would hide a magpie that does start.
+		return false
 	}
 	defer k.Close()
 	b, _, err := k.GetBinaryValue(name)

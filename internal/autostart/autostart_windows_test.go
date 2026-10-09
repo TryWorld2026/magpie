@@ -85,8 +85,10 @@ func TestClearApprovedMarkerReportsOneItCannotReach(t *testing.T) {
 }
 
 // A marker that cannot be read is not read as switched off. No marker at all
-// is: there is nothing Task Manager switched off.
-func TestSwitchedOffUnreadableMarkerIsNotOff(t *testing.T) {
+// is not either: Startup apps writes this key the first time it lists an
+// entry, so a machine whose user has never opened it has no key while every
+// Run value it has is on, and only a marker that says so is switched off.
+func TestSwitchedOffUnreadableOrAbsentMarkerIsNotOff(t *testing.T) {
 	restore := openApprovedKey
 	t.Cleanup(func() { openApprovedKey = restore })
 	openApprovedKey = func(registry.Key, string, uint32) (registry.Key, error) {
@@ -98,7 +100,28 @@ func TestSwitchedOffUnreadableMarkerIsNotOff(t *testing.T) {
 	openApprovedKey = func(registry.Key, string, uint32) (registry.Key, error) {
 		return 0, registry.ErrNotExist
 	}
-	if !switchedOff() {
-		t.Fatal("no marker reads as not switched off")
+	if switchedOff() {
+		t.Fatal("no marker reads as switched off")
+	}
+}
+
+// The machine that has the Run value and no Startup apps marker at all is
+// the ordinary one: Startup apps writes the marker key the first time it
+// lists an entry, so a user who never opened it has no key, and Windows
+// still starts every Run value it has. Reading that as switched off told
+// Settings "login: off" for a magpie that does start.
+func TestEnabledWithNoMarkerIsOn(t *testing.T) {
+	restoreRun, restoreApproved := openRunKey, openApprovedKey
+	restoreRead := readRunValue
+	t.Cleanup(func() { openRunKey, openApprovedKey, readRunValue = restoreRun, restoreApproved, restoreRead })
+	openRunKey = func(registry.Key, string, uint32) (registry.Key, error) {
+		return 0, nil
+	}
+	readRunValue = func(registry.Key) (string, error) { return "C:\\magpie.exe", nil }
+	openApprovedKey = func(registry.Key, string, uint32) (registry.Key, error) {
+		return 0, registry.ErrNotExist
+	}
+	if !Enabled() {
+		t.Fatal("a Run value with no Startup apps marker reads as off")
 	}
 }
