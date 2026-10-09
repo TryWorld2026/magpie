@@ -106,15 +106,18 @@ func TestGrokPerHomeReadKeepsTheNewerReading(t *testing.T) {
 	reset()
 	t.Cleanup(reset)
 
-	used := 80 // what the CLI's own /usage says
-	refused := false
+	// what the CLI's own /usage says, and whether the vendor is refusing it:
+	// the httptest handler reads both off its own goroutine, while the test
+	// writes them here
+	used, refused := atomic.Int32{}, atomic.Bool{}
+	used.Store(80)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if refused {
+		if refused.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		fmt.Fprintf(w, `{"config":{"creditUsagePercent":%d,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY"}}}`, used)
+		fmt.Fprintf(w, `{"config":{"creditUsagePercent":%d,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY"}}}`, used.Load())
 	}))
 	t.Cleanup(srv.Close)
 	oldBase := GrokBase
@@ -124,13 +127,13 @@ func TestGrokPerHomeReadKeepsTheNewerReading(t *testing.T) {
 	// the page's read starts first
 	pageCtx, _ := quotaReading(context.Background())
 
-	used = 80 // the per-home read, started later, answers first
+	used.Store(80) // the per-home read, started later, answers first
 	u := grokLoginUsage(context.Background())
 	if got := u["grok@example.com"].Windows[0].Used; got != 80 {
 		t.Fatalf("per-home read %v%%, want 80", got)
 	}
 
-	used = 10 // the page's answer: started first, so the older reading
+	used.Store(10) // the page's answer: started first, so the older reading
 	keepReading(pageCtx, readNow(grokSubscriptionUsage(pageCtx)), "")
 
 	c := &lastQuotas
@@ -146,7 +149,7 @@ func TestGrokPerHomeReadKeepsTheNewerReading(t *testing.T) {
 	c.Lock()
 	c.m, c.loaded = nil, false
 	c.Unlock()
-	refused = true
+	refused.Store(true)
 	failCtx, _ := quotaReading(context.Background())
 	q := keepReading(failCtx, grokUsageAt(failCtx, GrokHome()), "grok@example.com")
 	if q.Error != "" || q.AsOf == nil || len(q.Windows) != 1 || q.Windows[0].Used != 80 {
