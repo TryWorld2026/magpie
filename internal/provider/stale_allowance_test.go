@@ -16,6 +16,17 @@ import (
 // and the routing trace went on showing until the reading came back, and a
 // reading asked before the refusal and still out came back with it and was
 // trusted for a minute.
+//
+// Upstream took the other side of this on main, in 20203164 (#1142), which
+// landed the same day this branch was opened and keeps a reading that was
+// already out when the account was refused: `usedCache.seen` holds it, and
+// `stale` marks the agent so the next ask reads again rather than trusting
+// it for a minute. Its reason is weigh: an account not in the map is counted
+// as one not known unused, so dropping it out of `Allowances` altogether
+// (as forgetAllowance does here) makes it weigh as though it had nothing
+// left, where #1142 would rather it kept the share it had and be read again.
+// The two cannot both hold, so this needs the maintainer's call before it
+// can merge; see the note on the PR.
 func TestStaleAllowanceForgetsTheReading(t *testing.T) {
 	home := signIn(t)
 	rememberLogins(true)
