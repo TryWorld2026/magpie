@@ -1060,7 +1060,13 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 		in.UpdateMirror = cur.UpdateMirror
 		// gateway mode, set on its own (gateway-mode)
 		in.GatewayMode = cur.GatewayMode
-		if v := strings.TrimSpace(in.Vision); v != "" && v != "off" {
+		// A pick whose provider stopped serving it is kept as it is here,
+		// not refused: prefsKeep sends the page's own picks with every save
+		// (a theme, a language, the tray), so refusing a stale one answers
+		// 400 to every setting the page has and the user can change nothing
+		// at all until they clear the pick they can no longer see. Only a
+		// pick just made is checked — the three below.
+		if v := strings.TrimSpace(in.Vision); v != "" && v != "off" && v != cur.Vision {
 			// Resolve intentionally accepts arbitrary names under a known
 			// provider. A model describing images has to be one magpie serves,
 			// as the page's picker lists them.
@@ -1069,7 +1075,7 @@ func Handler(w Windows, gw *gateway.Server) http.Handler {
 				return
 			}
 		}
-		if v := strings.TrimSpace(in.ImageGen); v != "" && v != "off" {
+		if v := strings.TrimSpace(in.ImageGen); v != "" && v != "off" && v != cur.ImageGen {
 			// what draws is the imageGens list the picker offers, which the
 			// served catalog doesn't hold: a plan draws with models it doesn't
 			// chat with (a ChatGPT account's gpt-image-2)
