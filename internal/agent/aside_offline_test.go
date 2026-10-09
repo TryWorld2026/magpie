@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"strings"
 	"testing"
 
 	"github.com/yetone/magpie/internal/edit"
@@ -123,19 +122,10 @@ func TestAsidePostReadFailuresNeverOfferOffline(t *testing.T) {
 			case "corrupt record":
 				writeFile(t, c.record, "{invalid")
 			case "save record":
-				// a folder made read-only refuses a write on Unix; Windows
-				// takes the read-only bit off a folder as no answer at all
-				if runtime.GOOS == "windows" {
-					t.Skip("a read-only folder refuses a write on Unix only")
-				}
 				if err := a.Native.Stage("model", "magpie/relay/glm-4.6"); err != nil {
 					t.Fatal(err)
 				}
-				dir := filepath.Dir(c.record)
-				if err := os.Chmod(dir, 0500); err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { os.Chmod(dir, 0700) })
+				refuseWrites(t, c.record)
 			case "set refusal":
 				asideSet = func(string, string) error { return errors.New("refused") }
 			case "readback mismatch":
@@ -305,10 +295,6 @@ func TestAsideOfflineLegacyRecordDoesNotResurrect(t *testing.T) {
 }
 
 func TestAsideOfflineWriteFailureRollsBack(t *testing.T) {
-	// the refusal is a read-only folder, which Windows takes as no answer
-	if runtime.GOOS == "windows" {
-		t.Skip("a read-only folder refuses a write on Unix only")
-	}
 	settings, models := asideHome(t)
 	a := mustFindAside(t)
 	c := newAsideConnection(here(""))
@@ -320,13 +306,13 @@ func TestAsideOfflineWriteFailureRollsBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := readFile(settings) + readFile(models) + readFile(c.record)
-	dir := filepath.Dir(c.record)
-	if err := os.Chmod(dir, 0500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.Chmod(dir, 0700) })
+	// the settings file refuses a write: the first of the three the plan
+	// restores, so nothing of them goes through
+	refuseWrites(t, settings)
 	err = a.Native.ExecuteOffline(plan)
-	if err == nil || !strings.Contains(err.Error(), "permission") {
+	// the refusal each platform names its own way: Unix "permission denied",
+	// Windows "Access is denied"
+	if err == nil || !refused(err) {
 		t.Fatalf("expected write refusal after settings restoration: %v", err)
 	}
 	if readFile(settings)+readFile(models)+readFile(c.record) != before {
@@ -350,12 +336,7 @@ func TestAsideDisconnectUnavailableOnlyAtInitialRead(t *testing.T) {
 			case "initial":
 				asideRead = func() (map[string]json.RawMessage, error) { return nil, errors.New("offline") }
 			case "record":
-				if runtime.GOOS == "windows" {
-					t.Skip("a read-only folder refuses a write on Unix only")
-				}
-				dir := filepath.Dir(newAsideConnection(here("")).record)
-				os.Chmod(dir, 0500)
-				t.Cleanup(func() { os.Chmod(dir, 0700) })
+				refuseWrites(t, newAsideConnection(here("")).record)
 			case "refusal":
 				asideSet = func(string, string) error { return errors.New("refused") }
 			case "mismatch":
