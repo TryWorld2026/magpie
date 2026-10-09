@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"path/filepath"
 	"testing"
 
 	"golang.org/x/sys/windows"
@@ -13,6 +14,9 @@ import (
 // that may take the attribute off is not answered by it.
 func refuseWritesWindows(t *testing.T, path string) {
 	t.Helper()
+	if refusesNoWrite(filepath.Dir(path)) {
+		t.Skipf("%s's folder takes no new file, so the write was refused before the attribute", filepath.Dir(path))
+	}
 	p, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		t.Fatal(err)
@@ -30,7 +34,4 @@ func refuseWritesWindows(t *testing.T, path string) {
 			windows.SetFileAttributes(p, open&^windows.FILE_ATTRIBUTE_READONLY)
 		}
 	})
-	if !refusesNoWrite(path) {
-		t.Skipf("%s marked read-only still takes a write", path)
-	}
 }
