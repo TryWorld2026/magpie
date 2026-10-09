@@ -129,12 +129,3 @@ func TestSetThenTruncatedRecordReadsAsOff(t *testing.T) {
 		t.Errorf("a launch agent with no program reads as on:\n%s", empty)
 	}
 }
-	// a program named as nothing is no program to run either, and launchd
-	// refuses the job: the first string of the array is the one that names it
-	empty := strings.Replace(string(b), "<array><string>", "<array><string></string><string>", 1)
-	if err := os.WriteFile(p, []byte(empty), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if Enabled() {
-		t.Errorf("a launch agent with no program reads as on:\n%s", empty)
-	}
