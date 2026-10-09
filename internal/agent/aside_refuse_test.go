@@ -2,7 +2,6 @@ package agent
 
 import (
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -47,5 +46,3 @@ func refused(err error) bool {
 	s := err.Error()
 	return strings.Contains(s, "permission denied") || strings.Contains(s, "Access is denied")
 }
-
-var _ = filepath.Join
