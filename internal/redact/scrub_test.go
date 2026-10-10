@@ -70,6 +70,20 @@ func TestScrubWithOptions(t *testing.T) {
 	body := `{"prompt":"send it to ` + relay + `","note":"keep this"}`
 	o := Options{Secrets: true, Rules: rules}
 
+	// before any of them has masked this key: without the options each of
+	// them takes only the secrets magpie's own rules know out, and nothing
+	// knows rz_, as they always have. Asked after the ones below, a value
+	// once masked is masked again wherever a request has it (known.go), so
+	// the question has to be asked of a key nothing has masked yet.
+	if got := string(ScrubJSON([]byte(body))); !strings.Contains(got, relay) {
+		t.Errorf("ScrubJSON: %s", got)
+	}
+	if got := Scrub("send it to " + relay); got != "send it to "+relay {
+		t.Errorf("Scrub: %q", got)
+	}
+	if got := ScrubHeader("X-Note", "key "+relay); got != "key "+relay {
+		t.Errorf("ScrubHeader: %q", got)
+	}
 	if masked, n := MaskJSON([]byte(body), o); n != 1 || strings.Contains(string(masked), relay) || !strings.Contains(string(masked), "{{RELAY_") {
 		t.Errorf("MaskJSON %d: %s", n, masked)
 	}
@@ -80,14 +94,6 @@ func TestScrubWithOptions(t *testing.T) {
 	if strings.Contains(kept, "{{") {
 		t.Errorf("a placeholder made: %s", kept)
 	}
-	// without the options each of them takes only the secrets magpie knows
-	// out, as they always have
-	if got := string(ScrubJSON([]byte(body))); !strings.Contains(got, relay) {
-		t.Errorf("ScrubJSON: %s", got)
-	}
-	if got := Scrub("send it to " + relay); got != "send it to "+relay {
-		t.Errorf("Scrub: %q", got)
-	}
 	// text and headers too, the user's words and their personal data with
 	// the rules
 	if got := ScrubWith("send it to "+relay, o); got != "send it to [REDACTED:RELAY]" {
@@ -95,9 +101,6 @@ func TestScrubWithOptions(t *testing.T) {
 	}
 	if got := ScrubHeaderWith("X-Note", "key "+relay, o); got != "key [REDACTED:RELAY]" {
 		t.Errorf("ScrubHeaderWith: %q", got)
-	}
-	if got := ScrubHeader("X-Note", "key "+relay); got != "key "+relay {
-		t.Errorf("ScrubHeader: %q", got)
 	}
 	if got := ScrubWith("Project Nightjar ships", Options{Secrets: true, Words: []string{"Nightjar"}}); got != "Project [REDACTED:TERM] ships" {
 		t.Errorf("words: %q", got)

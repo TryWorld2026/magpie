@@ -287,9 +287,18 @@ const relayKey = "rz_RelayKey1234567"
 type relayVendor struct{}
 
 func (relayVendor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	io.ReadAll(r.Body)
+	req, _ := io.ReadAll(r.Body)
+	key := relayKey
+	// echo the key the agent sent, so a check using one of its own reads it
+	// back: masking off, the vendor saw the user's rule take nothing out
+	if i := strings.Index(string(req), "rz_"); i >= 0 {
+		rest := string(req)[i:]
+		if j := strings.IndexAny(rest, `"`); j > 0 {
+			key = rest[:j]
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
-	io.WriteString(w, `{"id":"c1","object":"chat.completion","model":"m1","choices":[{"index":0,"message":{"role":"assistant","content":"using `+relayKey+`"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`)
+	io.WriteString(w, `{"id":"c1","object":"chat.completion","model":"m1","choices":[{"index":0,"message":{"role":"assistant","content":"using `+key+`"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`)
 }
 
 // Every secret of magpie's own goes out of the archive whether masking is
@@ -304,7 +313,8 @@ func TestArchiveKeepsTheUsersRules(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		redact bool
-	}{{"masking_on", true}, {"masking_off", false}} {
+		key    string
+	}{{"masking_on", true, "rz_RelayKey1234567"}, {"masking_off", false, "rz_RelayKey7654321"}} {
 		t.Run(tc.name, func(t *testing.T) {
 			fresh(t)
 			serveOn(t, "fake", "k", []string{"m1"}, relayVendor{})
@@ -315,11 +325,11 @@ func TestArchiveKeepsTheUsersRules(t *testing.T) {
 			b := &memBucket{objs: map[string][]byte{}}
 			archiveTo(t, b)
 			s := New()
-			body := `{"model":"fake/m1","messages":[{"role":"user","content":"send it to ` + relayKey + `"}]}`
+			body := `{"model":"fake/m1","messages":[{"role":"user","content":"send it to ` + tc.key + `"}]}`
 			rec := httptest.NewRecorder()
 			s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
 			archivePending.Wait()
-			if rec.Code != 200 || !strings.Contains(rec.Body.String(), relayKey) {
+			if rec.Code != 200 || !strings.Contains(rec.Body.String(), tc.key) {
 				t.Fatalf("%d %s", rec.Code, rec.Body)
 			}
 			data, ok := b.objs["archive/"+s.Recent()[0].Archive+".json"]
@@ -334,20 +344,20 @@ func TestArchiveKeepsTheUsersRules(t *testing.T) {
 			// keeps that one; off, the user's rule took nothing out of what
 			// the vendor was sent, and no rule of magpie's knows rz_, so the
 			// key is in the archived request as it was in the agent's
-			want := relayKey
+			want := tc.key
 			if tc.redact {
 				want = "{{RELAY_"
 			}
 			if !strings.Contains(a.Request.Body, want) {
 				t.Errorf("want %s in the archived request:\n%s", want, a.Request.Body)
 			}
-			if tc.redact == strings.Contains(a.Request.Body, relayKey) {
+			if tc.redact == strings.Contains(a.Request.Body, tc.key) {
 				t.Errorf("masking %v: the relay key in the archived request:\n%s", tc.redact, a.Request.Body)
 			}
 			// the reply was masked on its way back only where the vendor
 			// echoed the placeholder: with masking on the key is restored
 			// for the agent, and with it off the vendor never saw one
-			if !tc.redact && !strings.Contains(a.Response.Body, relayKey) {
+			if !tc.redact && !strings.Contains(a.Response.Body, tc.key) {
 				t.Errorf("the relay key is not in the archived reply, and no rule knows it:\n%s", a.Response.Body)
 			}
 		})

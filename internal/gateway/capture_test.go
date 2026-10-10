@@ -40,8 +40,12 @@ func TestBodyForExportKeepsTheUsersRules(t *testing.T) {
 		RedactRules: []redact.Rule{{Kind: "RELAY", Prefix: "rz_"}}}); err != nil {
 		t.Fatal(err)
 	}
-	body := `{"choices":[{"message":{"content":"using ` + relayKey + `"}}]}`
-	if got := bodyForExport(body, false); !strings.Contains(got, relayKey) {
+	// a key of this test's own: another test's, or another case's, may
+	// already have masked its own, and a value masked once is masked again
+	// wherever a request has it (known.go), whatever the options say
+	const key = "rz_ExportKey1234567"
+	body := `{"choices":[{"message":{"content":"using ` + key + `"}}]}`
+	if got := bodyForExport(body, false); !strings.Contains(got, key) {
 		t.Errorf("exported body: %s", got)
 	}
 	// masking off, the user's rule is off with it, as the vendor side has it,
@@ -50,7 +54,7 @@ func TestBodyForExportKeepsTheUsersRules(t *testing.T) {
 		RedactRules: []redact.Rule{{Kind: "RELAY", Prefix: "rz_"}}}); err != nil {
 		t.Fatal(err)
 	}
-	if got := bodyForExport(body, false); !strings.Contains(got, relayKey) {
+	if got := bodyForExport(body, false); !strings.Contains(got, key) {
 		t.Errorf("exported body with masking off took the rule's match out: %s", got)
 	}
 }
