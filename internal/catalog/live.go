@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -52,6 +53,18 @@ func Live(provider string) (models []Model, fetched time.Time, ok bool) {
 		return nil, time.Time{}, false
 	}
 	return ms, f.Fetched, true
+}
+
+// LiveAll is the whole model list last fetched from the provider, the
+// models that draw or make videos among them, with each one's keys: what
+// tells which of the provider's keys serves an image model (#1657), which
+// Live, the models to talk to, leaves out.
+func LiveAll(provider string) (models []Model, ok bool) {
+	f, err := readLive(provider)
+	if err != nil || len(f.Models) == 0 {
+		return nil, false
+	}
+	return f.Models, true
 }
 
 // LiveDrawers are the models in the provider's fetched list that make
@@ -236,30 +249,52 @@ func FetchURL(ctx context.Context, url, key string, anthropic bool, headers map[
 func fetchOne(ctx context.Context, url, key string, anthropic bool, headers map[string]string) ([]Model, error) {
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	auth := listAuthOf(ctx)
+	ask := func(only string) (*http.Response, []byte, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", "magpie")
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+			req.Header.Set("x-api-key", key)
+			// a vendor that takes one of the two alone
+			OneAuth(req.Header, only)
+		}
+		if anthropic {
+			req.Header.Set("anthropic-version", "2023-06-01")
+		}
+		// The user's own headers, after the defaults so a private auth scheme
+		// wins. Written directly so the name keeps the exact case the user typed.
+		for k, v := range headers {
+			PutUserHeader(req.Header, k, v)
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer res.Body.Close()
+		b, _ := io.ReadAll(io.LimitReader(res.Body, 8<<20))
+		return res, b, nil
+	}
+	res, b, err := ask(auth.only)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "magpie")
-	if key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
-		req.Header.Set("x-api-key", key)
+	if auth.learned != nil && auth.only == "" && key != "" && BothAuthRefused(res.StatusCode, b) {
+		// refused for sending both: each alone, the one taken kept
+		for _, only := range OneAuthOrder {
+			if res, b, err = ask(only); err != nil {
+				return nil, err
+			}
+			if res.StatusCode != http.StatusUnauthorized && res.StatusCode != http.StatusForbidden {
+				auth.learned(only)
+				break
+			}
+		}
 	}
-	if anthropic {
-		req.Header.Set("anthropic-version", "2023-06-01")
-	}
-	// The user's own headers, after the defaults so a private auth scheme
-	// wins. Written directly so the name keeps the exact case the user typed.
-	for k, v := range headers {
-		req.Header[k] = []string{v}
-	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(res.Body, 8<<20))
 	if res.StatusCode != http.StatusOK {
 		if msg := errorMessage(b); msg != "" {
 			return nil, fmt.Errorf("%s: %s (%s)", url, res.Status, msg)
@@ -286,16 +321,26 @@ func fetchOne(ctx context.Context, url, key string, anthropic bool, headers map[
 		if id == "" {
 			continue
 		}
-		// a model that draws is kept, marked, for Settings → Images; any
-		// other that isn't for text (embeddings, speech) is left out
+		// Another magpie's list is already what its user exposed. Keep
+		// its retrieval models too; a vendor's general list still leaves
+		// out models agents can't chat with.
+		decision := r.Kind == "decision"
 		films := r.Kind == "video"
-		drawer := !films && (DrawsID(id) && !strings.Contains(strings.ToLower(id), "deep-research") || r.Kind == "image")
-		if !drawer && !films && !textModel(mdModel{ID: id}) {
+		drawer := !films && !decision && (DrawsID(id) && !strings.Contains(strings.ToLower(id), "deep-research") || r.Kind == "image")
+		if !drawer && !films && !decision && headers["X-Magpie-Drawers"] == "" && !textModel(mdModel{ID: id}) {
 			continue
 		}
-		name := r.DisplayName
+		name, plain := r.DisplayName, ""
+		// OpenRouter's "Anthropic: Claude …" is a vendor-prefixed name;
+		// leave it to the catalog rather than changing every display name.
+		if name == "" && !strings.Contains(r.Name, ": ") {
+			name = r.Name
+		}
 		if r.Label != "" {
 			name = r.Label
+			if r.DisplayName != "" && r.DisplayName != r.Label {
+				plain = r.DisplayName
+			}
 		}
 		if name == "" {
 			name = id
@@ -308,7 +353,8 @@ func fetchOne(ctx context.Context, url, key string, anthropic bool, headers map[
 		if len(apis) == 0 {
 			apis = targetAPIs(r.TypeTarget)
 		}
-		m := Model{ID: id, Name: name, ImageInput: input, APIs: apis, Draws: drawer, Films: films}
+		m := Model{ID: id, Name: name, Plain: plain, ImageInput: input, APIs: apis, Draws: drawer, Films: films, Decides: decision,
+			InputModalities: r.Modalities.Input, OutputModalities: r.Modalities.Output}
 		if n, ok := r.ContextLength.(float64); ok && n > 0 {
 			m.Context = int(n)
 		}
@@ -321,6 +367,11 @@ func fetchOne(ctx context.Context, url, key string, anthropic bool, headers map[
 		}
 		if input != nil {
 			m.Images = *input
+		}
+		m.Tiers = tiersOf(r.Tiers)
+		var pr *Price
+		if len(r.Price) > 0 && json.Unmarshal(r.Price, &pr) == nil && pr != nil && pr.sane() {
+			m.Price = pr
 		}
 		out = append(out, m)
 	}
@@ -359,7 +410,8 @@ type liveModel struct {
 	Name        string `json:"name"`
 	DisplayName string `json:"display_name"`
 	Modalities  struct {
-		Input []string `json:"input"`
+		Input  []string `json:"input"`
+		Output []string `json:"output"`
 	} `json:"modalities"`
 	// the paths the model is served on, where the vendor says: Command
 	// Code's Claude models on /messages alone, its open ones on
@@ -377,16 +429,41 @@ type liveModel struct {
 	Output any      `json:"max_output_tokens"`
 	Levels any      `json:"supported_reasoning_levels"`
 	// another magpie's name for the model with its provider there after
-	// it, and "image" on one it draws with, "video" on one it makes videos
-	// with
+	// it, and "image", "video" or "decision" for its other models
 	Label string `json:"magpie_label"`
 	Kind  string `json:"kind"`
 	// how another magpie searches the web for the model: "native" or
 	// "magpie" (Model.WebSearch)
 	WebSearch string `json:"web_search"`
+	// the service tiers another magpie offers its Codex on the model
+	// (Fast's "priority"), as Codex's catalog writes them ({"id":…}) or
+	// as plain ids: kept as Model.Tiers (#1234). any, as an odd value
+	// mustn't lose the whole list
+	Tiers any `json:"service_tiers"`
+	// what another magpie counts a call to the model at, asked for with
+	// its X-Magpie-Prices header: the price its user set, else its list
+	// price. Raw, as an odd value mustn't lose the whole list
+	Price json.RawMessage `json:"magpie_price"`
 	// the protocol family PipeLLM routes the model by: openai, anthropic
 	// or gemini
 	TypeTarget string `json:"type_target"`
+}
+
+// tiersOf are the ids of a list's service_tiers, as Codex's catalog
+// writes them ([{"id":"priority","name":"Fast"}]) or as plain ids.
+func tiersOf(v any) []string {
+	xs, _ := v.([]any)
+	var out []string
+	for _, x := range xs {
+		id, _ := x.(string)
+		if o, ok := x.(map[string]any); ok {
+			id, _ = o["id"].(string)
+		}
+		if id != "" && !slices.Contains(out, id) {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // levelsOf are the efforts of a list's supported_reasoning_levels, as
@@ -453,20 +530,25 @@ func Decorate(live []Model, known []Model) []Model {
 		byID[m.ID] = m
 	}
 	out := make([]Model, 0, len(live))
-	for _, m := range live {
+	fallback := make([]string, len(live))
+	for i, m := range live {
 		k, ok := byID[m.ID]
 		if i := strings.LastIndexByte(m.ID, '/'); !ok && i >= 0 {
 			k, ok = byID[m.ID[i+1:]] // a gateway's "deepseek/deepseek-chat"
 		}
 		if ok {
 			if m.Name == "" || m.Name == m.ID {
-				m.Name = k.Name
+				fallback[i] = k.Name
 			}
 			m.Efforts, m.Released, m.Provider = k.Efforts, k.Released, k.Provider
 			m.Reasoning = m.Reasoning || k.Reasoning
 			if m.ImageInput == nil {
 				m.ImageInput = k.ImageInput
 				m.Images = m.Images || k.Images
+				m.InputModalities = k.InputModalities
+			}
+			if m.OutputModalities == nil {
+				m.OutputModalities = k.OutputModalities
 			}
 			if m.Context == 0 {
 				m.Context = k.Context
@@ -480,5 +562,28 @@ func Decorate(live []Model, known []Model) []Model {
 		}
 		out = append(out, m)
 	}
+	fillNames(out, fallback)
 	return out
+}
+
+// sane reports whether a price another magpie sent is one a vendor could
+// charge: no part below zero or out of range, and tiers of a size.
+func (p Price) sane() bool {
+	ok := func(vs ...float64) bool {
+		for _, v := range vs {
+			if math.IsNaN(v) || v < 0 || v > 1e6 {
+				return false
+			}
+		}
+		return true
+	}
+	if !ok(p.Input, p.Output, p.CacheRead, p.CacheWrite, p.CacheWrite1h) {
+		return false
+	}
+	for _, t := range p.Tiers {
+		if t.Above <= 0 || !ok(t.Input, t.Output, t.CacheRead, t.CacheWrite, t.CacheWrite1h) {
+			return false
+		}
+	}
+	return true
 }

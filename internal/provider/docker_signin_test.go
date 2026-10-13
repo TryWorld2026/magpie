@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -208,10 +209,7 @@ func TestCommandCodeSignInPastedKey(t *testing.T) {
 // bash" in Docker, where there's no shell to run it: the CLI is installed
 // first, as it is for a moved one.
 func TestGrokPluginSignInInstallsCLI(t *testing.T) {
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
-	}
+	bun := testenv.Bun(t)
 	home := claudeHome(t)
 	t.Setenv("MAGPIE_BUN", bun)
 	t.Cleanup(plugin.Settle)
@@ -264,8 +262,15 @@ export const P = async () => ({
 	}
 	t.Cleanup(func() { GrokExecutable = oldExe })
 	var ran string
+	// the install waits for the test to see it under way: a fake that
+	// finished at once let the sign-in reach "waiting" before
+	// StartPluginSignIn read its own state back
+	seen := make(chan struct{})
+	release := sync.OnceFunc(func() { close(seen) })
+	t.Cleanup(release)
 	oldRun := runInstaller
 	runInstaller = func(ctx context.Context, c agentCLI) ([]byte, error) {
+		<-seen
 		ran = c.Name
 		os.MkdirAll(filepath.Dir(exe), 0o755)
 		return nil, testenv.WriteProgram(exe, "#!/bin/sh\n")
@@ -279,6 +284,7 @@ export const P = async () => ({
 	if st.State != "installing" || st.Installing != "Grok Build" {
 		t.Fatalf("started %+v", st)
 	}
+	release()
 	st = waitPast(t, st.ID, "installing")
 	if st.State == "waiting" {
 		st = waitPast(t, st.ID, "waiting")

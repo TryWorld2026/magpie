@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"cmp"
 	"net"
 	"net/http"
 	"net/url"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/wslrun"
 )
 
 // An agent pointed at magpie by an address other than this machine's
@@ -54,24 +57,50 @@ type reachAnswer struct {
 // (known); a probe older than reachAge, or none, is started in the
 // background and never waited for, so Drift stays quick.
 func reachable(base string) (ok, known bool) {
+	probe := reachProbe
+	return probed(base, func() bool { return probe(base) })
+}
+
+// probed is reachable for any probe, kept under key: its last answer, and
+// whether there is one, with a new one started in the background when
+// that is older than reachAge.
+func probed(key string, probe func() bool) (ok, known bool) {
 	reach.Lock()
 	defer reach.Unlock()
 	if reach.m == nil {
 		reach.m = map[string]reachAnswer{}
 	}
-	a := reach.m[base]
+	a := reach.m[key]
 	if !a.busy && time.Since(a.at) > reachAge {
 		a.busy = true
-		reach.m[base] = a
-		probe := reachProbe
+		reach.m[key] = a
 		go func() {
-			ok := probe(base)
+			ok := probe()
 			reach.Lock()
-			reach.m[base] = reachAnswer{at: time.Now(), ok: ok}
+			reach.m[key] = reachAnswer{at: time.Now(), ok: ok}
 			reach.Unlock()
 		}()
 	}
 	return a.ok, !a.at.IsZero()
+}
+
+// probedNow is probed waited for: the last answer while it is fresh, else
+// one asked now, which the next probed of key gets too.
+func probedNow(key string, probe func() bool) bool {
+	reach.Lock()
+	a := reach.m[key]
+	reach.Unlock()
+	if !a.at.IsZero() && time.Since(a.at) <= reachAge {
+		return a.ok
+	}
+	ok := probe()
+	reach.Lock()
+	if reach.m == nil {
+		reach.m = map[string]reachAnswer{}
+	}
+	reach.m[key] = reachAnswer{at: time.Now(), ok: ok}
+	reach.Unlock()
+	return ok
 }
 
 // offLoopback: base is an http address on a host other than this
@@ -137,8 +166,9 @@ func (a *Agent) unreachable(on Field, now string) *Drift {
 
 // wslMovedFrom is the address a WSL distro reaches Windows at now, when
 // base is on one it reached Windows at before (its networking's address
-// changed since), and that distro's name; "" otherwise. A host no distro
-// was seen at is the user's own, and is never offered to be moved.
+// changed since, or it is in mirrored or consomme networking now, where
+// that is 127.0.0.1), and that distro's name; "" otherwise. A host no
+// distro was seen at is the user's own, and is never offered to be moved.
 func wslMovedFrom(base string) (to, name string) {
 	u, err := url.Parse(base)
 	if err != nil {
@@ -148,17 +178,46 @@ func wslMovedFrom(base string) (to, name string) {
 	wsl.Lock()
 	defer wsl.Unlock()
 	for n, d := range wsl.seen {
-		if d == nil || d.Gateway == "" || d.Gateway == h {
+		if d == nil {
+			continue
+		}
+		loopback := wslrun.HostLoopback(d.Net)
+		if !loopback && (d.Gateway == "" || d.Gateway == h) {
 			continue
 		}
 		for _, w := range d.Was {
-			if w == h {
-				if port == "" {
-					port = gateway.Port()
-				}
-				return "http://" + net.JoinHostPort(d.Gateway, port), n
+			if w != h {
+				continue
 			}
+			if loopback {
+				return gateway.URL(), n
+			}
+			if port == "" {
+				port = gateway.Port()
+			}
+			return "http://" + net.JoinHostPort(d.Gateway, port), n
 		}
 	}
 	return "", ""
+}
+
+// proxied is the drift of an agent whose requests for the gateway go
+// through a proxy that doesn't pass them on to it, while the gateway
+// answers here; nil when they get there, or it isn't known yet.
+func (a *Agent) proxied(on Field, now string) *Drift {
+	if a.viaProxy == nil {
+		return nil
+	}
+	// with no proxy in the way, nothing is tried; with one, both are asked
+	// at once, so one round of probes settles it
+	ok, known, proxy, from := a.viaProxy()
+	if proxy == "" {
+		return nil
+	}
+	up, upKnown := reachable(gateway.URL())
+	if ok || !known || !up || !upKnown {
+		return nil
+	}
+	base := cmp.Or(a.pointedAt(), gateway.URL())
+	return &Drift{Kind: "proxied", Field: on.Key, Now: now, Want: now, Addr: netproxy.Redact(proxy), Detail: codexProxiedDetail(base, proxy, from)}
 }

@@ -26,6 +26,9 @@ type Library struct {
 	Skills       []*Skill     `json:"skills"`
 	// Projects are folders whose agents get some of the skills there
 	Projects []*Project `json:"projects,omitempty"`
+	// Hooks are commands the agents ticked for each run at a point of
+	// their turn (hooks.go, #1790)
+	Hooks []*Hook `json:"hooks,omitempty"`
 	// Applied is what magpie wrote into each agent, so that what it takes
 	// away is only ever its own.
 	Applied map[string]*Applied `json:"applied,omitempty"`
@@ -79,6 +82,15 @@ type Applied struct {
 	InstrHash    string   `json:"instrHash,omitempty"` // of the part last written
 	MCP          []string `json:"mcp,omitempty"`
 	Skills       []string `json:"skills,omitempty"`
+	// ToolsOff are, for each server, the tools magpie put in the list its
+	// entry has of those the agent leaves out; ToolRules the rules beside
+	// the servers magpie added to leave tools out (Claude Code's deny
+	// rules, OpenCode's tools keys). Neither holds one the user had.
+	ToolsOff  map[string][]string `json:"toolsOff,omitempty"`
+	ToolRules []string            `json:"toolRules,omitempty"`
+	// Hooks are the entries magpie wrote into the agent's hooks, each
+	// exactly as written: one changed since is the user's (hooks.go)
+	Hooks []HookEntry `json:"hooks,omitempty"`
 }
 
 var mu sync.Mutex // one change at a time, from the page or the CLI's process
@@ -102,6 +114,7 @@ func load() (*Library, error) {
 	if l.Applied == nil {
 		l.Applied = map[string]*Applied{}
 	}
+	l.heal() // magpie's own servers run this computer's magpie (self_here.go)
 	return l, nil
 }
 
@@ -109,10 +122,23 @@ func (l *Library) save() error {
 	sort.Slice(l.MCP, func(i, j int) bool { return l.MCP[i].Name < l.MCP[j].Name })
 	sort.Slice(l.Skills, func(i, j int) bool { return l.Skills[i].Name < l.Skills[j].Name })
 	sort.Slice(l.Projects, func(i, j int) bool { return l.Projects[i].Dir < l.Projects[j].Dir })
+	sort.Slice(l.Hooks, func(i, j int) bool { return l.Hooks[i].Name < l.Hooks[j].Name })
+	for _, h := range l.Hooks {
+		h.Agents = orNone(h.Agents)
+	}
 	for _, a := range l.Applied {
 		sort.Strings(a.MCP)
 		sort.Strings(a.Skills)
 	}
+	// a skill or server on no agent is on none, [] not null: a list sorted
+	// with slices.Sorted, or cloned, from an empty one is nil (#1217)
+	for _, s := range l.Skills {
+		s.Agents = orNone(s.Agents)
+	}
+	for _, s := range l.MCP {
+		s.Agents = orNone(s.Agents)
+	}
+	l.Instructions.Agents = orNone(l.Instructions.Agents)
 	b, err := json.MarshalIndent(l, "", "  ")
 	if err != nil {
 		return err
@@ -201,6 +227,7 @@ func change(f func(l *Library) error) (*Result, error) {
 	if err := f(l); err != nil {
 		return nil, err
 	}
+	l.heal() // a server f brought in, from another computer too
 	if err := l.save(); err != nil {
 		return nil, err
 	}
