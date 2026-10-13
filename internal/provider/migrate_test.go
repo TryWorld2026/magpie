@@ -489,23 +489,50 @@ func TestInstallPluginKeepsTheUsersPin(t *testing.T) {
 	}
 	writeList(`{"plugins":[{"spec":"fake@0.1.5"}]}`)
 	writeInstalled("0.1.5")
-	old := addPlugin
-	t.Cleanup(func() { addPlugin = old })
+	oldAdd, oldUp := addPlugin, upgradePlugin
+	t.Cleanup(func() { addPlugin, upgradePlugin = oldAdd, oldUp })
 	var asked []string
 	addPlugin = func(_ context.Context, spec string) (plugin.Entry, error) {
-		asked = append(asked, spec)
+		asked = append(asked, "add "+spec)
 		return plugin.Entry{}, nil
 	}
-
-	// what is installed is still the pin, and the move needs newer, so the
-	// spec handed over is the pin and the move says so — rather than Add
-	// quietly installing <pkg>@latest and the check finding nothing wrong
-	err := installPlugin(context.Background(), "fake", "0.2.0")
-	if strings.Join(asked, " ") != "fake@0.1.5" {
-		t.Fatalf("asked Add for %v, want the pinned fake@0.1.5", asked)
+	upgradePlugin = func(_ context.Context, name string) error {
+		asked = append(asked, "upgrade "+name)
+		return nil
 	}
-	if err == nil || !strings.Contains(err.Error(), "0.2.0 or newer") {
-		t.Fatalf("a pin older than the move needs: %v, want the version it needs named", err)
+
+	// what is installed is the user's pin, and the move needs newer: the
+	// pin stays, and the move says why it can't go on — rather than Add
+	// quietly installing <pkg>@latest over it
+	err := installPlugin(context.Background(), "fake", "0.2.0")
+	if len(asked) != 0 {
+		t.Fatalf("a pinned plugin was reinstalled: %v", asked)
+	}
+	if err == nil || !strings.Contains(err.Error(), "pinned at fake@0.1.5") || !strings.Contains(err.Error(), "0.2.0 or newer") {
+		t.Fatalf("a pin older than the move needs: %v, want the pin and the version it needs named", err)
+	}
+
+	// one the user didn't pin still goes to npm's newest through Upgrade,
+	// not bun's latest, which a minimumReleaseAge holds back without a
+	// word (sweanng424 on Discord)
+	writeList(`{"plugins":[{"spec":"fake@latest"}]}`)
+	asked = nil
+	_ = installPlugin(context.Background(), "fake", "0.2.0")
+	if strings.Join(asked, " ") != "upgrade fake" {
+		t.Fatalf("an unpinned plugin below the move's min: asked %v, want upgrade fake", asked)
+	}
+
+	// a git one is reinstalled from its own repository, not swapped for
+	// npm's; the plugins folder's package.json is what names it
+	writeList(`{"plugins":[{"spec":"github:someone/fake"}]}`)
+	deps := `{"dependencies":{"fake":"github:someone/fake"}}`
+	if err := os.WriteFile(filepath.Join(plugin.Dir(), "package.json"), []byte(deps), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	asked = nil
+	_ = installPlugin(context.Background(), "fake", "0.2.0")
+	if strings.Join(asked, " ") != "add github:someone/fake" {
+		t.Fatalf("a git plugin below the move's min: asked %v, want its own spec added", asked)
 	}
 
 	// a plugin the user turned off is not switched back on either
